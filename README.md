@@ -161,9 +161,11 @@ The browser interface has four coordinated panes:
 3. **Exact state** shows the reconstructed state without historical replacement text.
 4. **Updates** lists changes chronologically and never rewrites earlier update cards.
 
-Input, input-parameter, and output labels are visually separate from model content. Clicking a
-scope or update focuses and highlights the corresponding items in the other panes. The exact
-pane also exposes parameter, raw-response, and metadata tabs.
+Input, input-parameter, thoughts, and output labels are visually separate from model content.
+Message fields are rendered as semantic UI blocks instead of exposed YAML keys. Provider
+reasoning is shown in its own **Thoughts** scope; **Output** contains only the final assistant
+answer. Clicking a scope or update focuses and highlights the corresponding items in the other
+panes. The exact pane also exposes parameter, raw-response, and metadata tabs.
 
 The complete interaction and visual contract is documented in the
 [`UI/UX specification`](ui-ux-specification.md).
@@ -173,13 +175,19 @@ The complete interaction and visual contract is documented in the
 Start the proxy, then run:
 
 ```bash
+.venv/bin/python examples/sequential_live_history.py
 .venv/bin/python examples/summarize_scenario.py
 .venv/bin/python examples/notebook_v18_scenario.py --windows 2
 ```
 
-The first example traces a main conversation, a side summarization call, compression, and a
-return to the main branch. The second records a small mixture of LLM and application-state
-events based on the notebook v18 workflow.
+The sequential-history example makes three real model calls and appends each returned
+assistant message to the next request. Its final trace contains the sequence system, user,
+assistant, user, assistant, user, assistant. It prints the generated session ID and every
+exact live response.
+
+The summarization example traces a main conversation, a side summarization call, compression,
+and a return to the main branch. The notebook example records a small mixture of LLM and
+application-state events based on the notebook v18 workflow.
 
 ## Notebook integration
 

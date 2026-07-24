@@ -96,6 +96,12 @@ function responseValue(detail) {
   }
 }
 
+function displayValue(value) {
+  return typeof value === "string"
+    ? value
+    : JSON.stringify(value, null, 2);
+}
+
 function requestParameters(request) {
   return Object.fromEntries(
     Object.entries(request || {}).filter(([key]) => key !== "messages" && key !== "prompt"),
@@ -120,8 +126,11 @@ function stateDisplayParts(detail) {
     parameters,
     topParameterText,
     parameterText,
-    contentText: yaml(requestContent(detail.request), 2),
-    outputText: yaml({ output: responseValue(detail) }),
+    contentText: Object.hasOwn(detail.request || {}, "prompt")
+      ? `  prompt:\n${displayValue(detail.request.prompt)}`
+      : yaml(requestContent(detail.request), 2),
+    thoughtsText: `thoughts:\n${detail.thoughts || ""}`,
+    outputText: `output:\n${displayValue(responseValue(detail))}`,
   };
 }
 
@@ -129,11 +138,13 @@ function stateScopeHtml(kind, html, nested = false) {
   const labels = {
     input: "Input",
     "input-params": "Input parameters",
+    thoughts: "Thoughts",
     output: "Output",
   };
   const sourceLabels = {
     input: "input",
     "input-params": "input_params",
+    thoughts: "thoughts",
     output: "output",
   };
   const sourceLabel = sourceLabels[kind];
@@ -142,17 +153,50 @@ function stateScopeHtml(kind, html, nested = false) {
   return `<span class="state-scope ${nested ? "state-subscope " : ""}trace-kind-${kind}" data-state-scope="${kind}"><span class="state-scope-label" role="button" tabindex="0" aria-label="${labels[kind]} scope">${labels[kind]}</span><span class="state-scope-content">${content}</span></span>`;
 }
 
+function messageStructureHtml(html, includeListLabel = true) {
+  let content = String(html);
+  if (includeListLabel) {
+    content = content.replace(
+      /^[ \t]*messages:\n?/,
+      '<span class="message-list-label">Messages</span>\n',
+    );
+  }
+  content = content
+    .replace(
+      /^[ \t]*-[ \t]+content:(?: )?/gm,
+      '<span class="message-field-label">Content</span> ',
+    )
+    .replace(
+      /^[ \t]*role:(?: )?/gm,
+      '<span class="message-field-label message-role-label">Role</span> ',
+    )
+    .replace(
+      /(<span class="message-field-label[^"]*">[^<]+<\/span>) &quot;/g,
+      "$1 ",
+    )
+    .replace(/&quot;(?=\n|$)/gm, "");
+  return content;
+}
+
 function inputContentHtml(detail, html) {
-  if (!Object.hasOwn(detail?.request || {}, "prompt")) return html;
-  const content = String(html).replace(/^\s*prompt:(?: |\n)?/, "");
-  return `<span class="state-field state-prompt" data-input-field="prompt"><span class="state-field-label">Prompt</span><span class="state-field-content">${content}</span></span>`;
+  if (Object.hasOwn(detail?.request || {}, "prompt")) {
+    const content = String(html).replace(/^\s*prompt:(?: |\n)?/, "");
+    return `<span class="state-field state-prompt" data-input-field="prompt"><span class="state-field-label">Prompt</span><span class="state-field-content">${content}</span></span>`;
+  }
+  if (Array.isArray(detail?.request?.messages)) {
+    return `<span class="message-list">${messageStructureHtml(html)}</span>`;
+  }
+  return html;
 }
 
 function checkpointInputHtml(detail, input) {
-  if (!Object.hasOwn(detail?.request || {}, "prompt")) {
-    return `<pre>${escapeHtml(yaml(input))}</pre>`;
+  if (Array.isArray(detail?.request?.messages)) {
+    return `<span class="message-list checkpoint-message-list">${messageStructureHtml(escapeHtml(yaml(input)))}</span>`;
   }
-  return `<span class="state-field checkpoint-field state-prompt" data-input-field="prompt"><span class="state-field-label">Prompt</span><pre class="state-field-content">${escapeHtml(yaml(detail.request.prompt))}</pre></span>`;
+  if (!Object.hasOwn(detail?.request || {}, "prompt")) {
+    return `<pre>${escapeHtml(displayValue(input))}</pre>`;
+  }
+  return `<span class="state-field checkpoint-field state-prompt" data-input-field="prompt"><span class="state-field-label">Prompt</span><pre class="state-field-content">${escapeHtml(displayValue(detail.request.prompt))}</pre></span>`;
 }
 
 function firstUsefulLine(value) {
@@ -201,7 +245,8 @@ function operationName(operation) {
 }
 
 function traceKind(category) {
-  return category === "parameter" ? "input-params" : category || "content";
+  if (category === "parameter") return "input-params";
+  return category || "content";
 }
 
 function traceOperation(operation) {
@@ -247,6 +292,43 @@ function collectParameterUpdates(changes, path = []) {
     });
   }
   return entries;
+}
+
+function appendResponseUpdate(entries, detail, {
+  value,
+  diff,
+  scope,
+  category,
+  noun,
+}) {
+  if (value && diff.mode === "diff" && diff.changes?.length) {
+    const fragments = diff.changes.filter(fragment => fragment.old || fragment.new);
+    entries.push({
+      label: `Changed ${noun} · from call #${diff.base_call_id}`,
+      text: "",
+      oldText: "",
+      newText: "",
+      fragments,
+      needles: fragments.flatMap(fragment => searchableLines(fragment.new)),
+      needle: "",
+      scope,
+      category,
+      operation: "~",
+    });
+  } else if (value && diff.mode !== "unchanged") {
+    const renderedValue = displayValue(value);
+    entries.push({
+      label: `Added ${noun}`,
+      text: `+ ${renderedValue}`,
+      oldText: "",
+      newText: renderedValue,
+      needle: firstSearchableValue(value),
+      wholeScope: true,
+      scope,
+      category,
+      operation: "+",
+    });
+  }
 }
 
 function updateEntries(detail) {
@@ -377,42 +459,20 @@ function updateEntries(detail) {
       operation,
     });
   }
-  const outputDiff = detail.output_diff || { mode: "snapshot" };
-  if (detail.response && outputDiff.mode === "diff" && outputDiff.changes?.length) {
-    const fragments = outputDiff.changes.filter(
-      fragment => fragment.old || fragment.new,
-    );
-    entries.push({
-      label: `Changed output · from call #${outputDiff.base_call_id}`,
-      text: "",
-      oldText: "",
-      newText: "",
-      fragments,
-      needles: fragments.flatMap(fragment => (
-        fragment.new
-          .split("\n")
-          .map(line => line.trim())
-          .filter(Boolean)
-      )),
-      needle: "",
-      scope: "output",
-      category: "output",
-      operation: "~",
-    });
-  } else if (detail.response && outputDiff.mode !== "unchanged") {
-    const output = responseValue(detail);
-    entries.push({
-      label: "Added output",
-      text: markedValue("+", output),
-      oldText: "",
-      newText: yaml(output),
-      needle: firstSearchableValue(output),
-      wholeOutput: true,
-      scope: "output",
-      category: "output",
-      operation: "+",
-    });
-  }
+  appendResponseUpdate(entries, detail, {
+    value: detail.thoughts || "",
+    diff: detail.thoughts_diff || { mode: "snapshot" },
+    scope: "thoughts",
+    category: "thoughts",
+    noun: "thoughts",
+  });
+  appendResponseUpdate(entries, detail, {
+    value: responseValue(detail),
+    diff: detail.output_diff || { mode: "snapshot" },
+    scope: "output",
+    category: "output",
+    noun: "output",
+  });
   const occurrences = new Map();
   return entries.map((entry, entryIndex) => {
     const identity = {
@@ -535,12 +595,13 @@ function requestsAreSimilar(previous, current) {
 }
 
 function entryRange(text, entry) {
-  if (entry.wholeOutput) {
-    const boundary = text.startsWith("output:") ? 0 : text.indexOf("\noutput:");
+  if (entry.wholeScope) {
+    const label = `${entry.scope}:`;
+    const boundary = text.startsWith(label) ? 0 : text.indexOf(`\n${label}`);
     if (boundary < 0) return null;
     const labelStart = boundary + (boundary ? 1 : 0);
-    const valueStart = labelStart + "output:".length
-      + (text[labelStart + "output:".length] === " " ? 1 : 0);
+    const valueStart = labelStart + label.length
+      + (text[labelStart + label.length] === " " ? 1 : 0);
     return [valueStart, text.length];
   }
   if (!entry.needle) return null;
@@ -654,6 +715,11 @@ function updateEntryHtml(entry) {
     ? entry.oldText || entry.text
     : entry.newText || entry.text;
   return `<div class="single-change">${changePartHtml(kind, text, category)}</div>`;
+}
+
+function updateEntryBodyHtml(entry) {
+  const html = updateEntryHtml(entry);
+  return entry.scope === "input" ? messageStructureHtml(html, false) : html;
 }
 
 function unchangedOutputNoticeHtml(detail) {
@@ -1284,9 +1350,14 @@ async function loadUpdateCard(card) {
             <strong>Parameters</strong>
             <pre>${escapeHtml(yaml(parameters))}</pre>
           </section>` : ""}
+        ${detail.thoughts ? `
+          <section class="checkpoint-section checkpoint-thoughts trace-kind-thoughts" role="button" tabindex="0" data-checkpoint-scope="thoughts">
+            <strong>Thoughts</strong>
+            <pre>${escapeHtml(detail.thoughts)}</pre>
+          </section>` : ""}
         <section class="checkpoint-section checkpoint-output trace-kind-output" role="button" tabindex="0" data-checkpoint-scope="output">
           <strong>Output</strong>
-          <pre>${escapeHtml(yaml(output))}</pre>
+          <pre>${escapeHtml(displayValue(output))}</pre>
         </section>
       </div>`;
     const openScope = async scope => {
@@ -1329,7 +1400,7 @@ async function loadUpdateCard(card) {
       ${entries.map((entry, index) => `
         <div class="update-jump ${escapeHtml(entry.category || "content")}-update-card trace-kind-${traceKind(entry.category)} trace-op-${traceOperation(entry.operation)} op-${escapeHtml(entry.operation || "change")}" data-update-index="${index}" role="button" tabindex="0">
           <strong>${escapeHtml(entry.label)}</strong>
-          ${updateEntryHtml(entry)}
+          ${updateEntryBodyHtml(entry)}
         </div>`).join("") || '<div class="no-update">No textual update</div>'}
       ${unchangedOutputNoticeHtml(detail)}
     </div>`;
@@ -1449,6 +1520,9 @@ function renderMixed(previousDetail = null) {
   const outputEntries = mixedOutputEntries(
     entries.filter(entry => entry.scope === "output"),
   );
+  const thoughtsEntries = mixedOutputEntries(
+    entries.filter(entry => entry.scope === "thoughts"),
+  );
   const parameterHtml = mixedStateHtml(parts.parameterText, parameterEntries);
   const contentHtml = inputContentHtml(
     state.detail,
@@ -1464,6 +1538,14 @@ function renderMixed(previousDetail = null) {
       ? escapeHtml(parts.outputText)
       : mixedStateHtml(parts.outputText, outputEntries),
   );
+  const thoughtsHtml = state.detail.thoughts
+    ? stateScopeHtml(
+        "thoughts",
+        checkpoint
+          ? escapeHtml(parts.thoughtsText)
+          : mixedStateHtml(parts.thoughtsText, thoughtsEntries),
+      )
+    : "";
   $("mixed-status").textContent = checkpoint
     ? "◆ new current state"
     : identicalTo
@@ -1471,7 +1553,7 @@ function renderMixed(previousDetail = null) {
       : `Δ ${entries.length} accumulated update${entries.length === 1 ? "" : "s"}`;
   $("mixed-status").className = checkpoint ? "mixed-legend checkpoint" : "mixed-legend delta";
   $("mixed").classList.remove("empty");
-  $("mixed").innerHTML = `${inputHtml}\n${outputHtml}`;
+  $("mixed").innerHTML = `${inputHtml}\n${thoughtsHtml}\n${outputHtml}`;
   $("mixed").scrollTop = preserveScroll ? previousScroll : 0;
 }
 
@@ -1557,10 +1639,19 @@ function renderExact(focusEntry = null) {
       entries.filter(entry => entry.scope === "output"),
       focusEntry,
     );
+    const thoughtsHtml = state.detail.thoughts
+      ? exactStateHtml(
+          parts.thoughtsText,
+          entries.filter(entry => entry.scope === "thoughts"),
+          focusEntry,
+        )
+      : "";
     $("exact").innerHTML = `${
       stateScopeHtml("input-params", parameterHtml)
     }\n${
       stateScopeHtml("input", `input:\n${contentHtml}`)
+    }\n${
+      thoughtsHtml ? stateScopeHtml("thoughts", thoughtsHtml) : ""
     }\n${stateScopeHtml("output", outputHtml)}`;
     if (focusEntry) {
       requestAnimationFrame(() => {
@@ -1616,9 +1707,15 @@ function focusTimelineSelection(detail, preferredScope = "input") {
   }
 
   const entries = updateEntries(detail);
-  const scopedEntries = entries.filter(entry => entry.scope === preferredScope);
+  const scopedEntries = entries.filter(entry => (
+    preferredScope === "output"
+      ? entry.scope === "output" || entry.scope === "thoughts"
+      : entry.scope === preferredScope
+  ));
   const scopedEntryKeys = new Set(scopedEntries.map(entry => entry.entryKey));
-  const primaryEntry = scopedEntries[0] || null;
+  const primaryEntry = preferredScope === "output"
+    ? scopedEntries.find(entry => entry.scope === "output") || scopedEntries[0] || null
+    : scopedEntries[0] || null;
   const entryPrefix = `${detail.id}:`;
   const mixedTargets = [...$("mixed").querySelectorAll("[data-update-entry]")].filter(
     node => (
@@ -1773,8 +1870,9 @@ async function focusUpdateFromState(element) {
       : Number(updateElement.dataset.outputFragment);
     focusStateUpdateEntry(updateElement.dataset.updateEntry, fragmentIndex);
     const scope = updateElement.closest("[data-state-scope]")?.dataset.stateScope;
-    const phase = scope === "output"
+    const phase = scope === "output" || scope === "thoughts"
       || updateElement.classList.contains("output-update")
+      || updateElement.classList.contains("thoughts-update")
       ? "output"
       : "input";
     state.selectedPhase = phase;
@@ -1806,7 +1904,7 @@ async function focusUpdateFromState(element) {
   await loadUpdateCard(card);
   const scope = element.closest("[data-state-scope]")?.dataset.stateScope;
   if (!scope) return;
-  const phase = scope === "output" ? "output" : "input";
+  const phase = scope === "output" || scope === "thoughts" ? "output" : "input";
   state.selectedPhase = phase;
   document.querySelectorAll(".timeline-item.active").forEach(node => {
     node.classList.remove("active");

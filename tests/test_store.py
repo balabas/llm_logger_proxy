@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 from insequent_logger import TraceStore
 
@@ -147,6 +148,75 @@ def test_legacy_stream_envelope_is_migrated_on_open(tmp_path):
     detail = reopened.get_call(call)
     assert detail["response"] == "actual text"
     assert detail["raw_response"] == raw
+    reopened.close()
+
+
+def test_thoughts_are_stored_separately_from_final_output(tmp_path):
+    store = TraceStore(tmp_path / "thoughts.llmtrace")
+    call = store.start_call(
+        {"model": "local", "messages": [{"role": "user", "content": "answer"}]},
+        session_id="thoughts",
+    )
+    raw = json.dumps(
+        {
+            "choices": [{
+                "message": {
+                    "reasoning_content": "consider the evidence",
+                    "content": "the final answer",
+                }
+            }]
+        }
+    )
+    store.finish_call(
+        call,
+        "the final answer",
+        thoughts="consider the evidence",
+        raw_response=raw,
+    )
+
+    detail = store.get_call(call)
+    assert detail["thoughts"] == "consider the evidence"
+    assert detail["response"] == "the final answer"
+    assert detail["thoughts_diff"]["mode"] == "snapshot"
+    assert detail["output_diff"]["mode"] == "snapshot"
+    store.close()
+
+
+def test_legacy_combined_reasoning_is_split_from_raw_response(tmp_path):
+    path = tmp_path / "legacy-reasoning.llmtrace"
+    store = TraceStore(path)
+    call = store.start_call(
+        {"model": "local", "messages": [{"role": "user", "content": "answer"}]},
+        session_id="legacy-thoughts",
+    )
+    raw = json.dumps(
+        {
+            "choices": [{
+                "message": {
+                    "reasoning_content": "old thoughts",
+                    "content": "old answer",
+                }
+            }]
+        }
+    )
+    response_hash = store.put_text("old thoughtsold answer")
+    raw_hash = store.put_text(raw)
+    with store._db:
+        store._db.execute(
+            """
+            UPDATE calls
+            SET response_blob_hash=?, raw_response_blob_hash=?,
+                thoughts_blob_hash=NULL, status='ok'
+            WHERE id=?
+            """,
+            (response_hash, raw_hash, call),
+        )
+    store.close()
+
+    reopened = TraceStore(path)
+    detail = reopened.get_call(call)
+    assert detail["thoughts"] == "old thoughts"
+    assert detail["response"] == "old answer"
     reopened.close()
 
 

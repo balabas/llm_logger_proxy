@@ -777,6 +777,12 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   --trace-kind-hover: #39304f;
   --trace-kind-text: #e4c7ff;
 }
+.trace-kind-thoughts {
+  --trace-kind-accent: #c58bd6;
+  --trace-kind-surface: #30283a;
+  --trace-kind-hover: #3c3048;
+  --trace-kind-text: #efd4f7;
+}
 .trace-kind-output {
   --trace-kind-accent: #d4ae55;
   --trace-kind-surface: #29352c;
@@ -887,6 +893,43 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   display: block;
   min-height: 1em;
   white-space: pre-wrap;
+}
+.message-list {
+  display: block;
+  padding: 0 7px 7px;
+  background: color-mix(in srgb, var(--trace-kind-accent) 8%, #17201d);
+  border: 1px solid color-mix(in srgb, var(--trace-kind-accent) 48%, transparent);
+  border-radius: 4px;
+}
+.message-list-label {
+  display: table;
+  margin: 0 0 8px -7px;
+  padding: 3px 8px 3px 7px;
+  color: var(--trace-kind-text);
+  background: var(--trace-kind-surface);
+  border-right: 1px solid var(--trace-kind-accent);
+  border-bottom: 1px solid var(--trace-kind-accent);
+  border-radius: 0 0 4px;
+  font: 700 9px/1.25 system-ui, sans-serif;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.message-field-label {
+  display: inline-block;
+  margin: 3px 5px 3px 0;
+  padding: 2px 5px;
+  color: var(--trace-kind-text);
+  background: var(--trace-kind-surface);
+  border: 1px solid color-mix(in srgb, var(--trace-kind-accent) 70%, transparent);
+  border-radius: 3px;
+  font: 700 8px/1.2 system-ui, sans-serif;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.message-role-label {
+  margin-top: 6px;
 }
 .checkpoint-field {
   margin: 8px;

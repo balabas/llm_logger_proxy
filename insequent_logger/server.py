@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
-from .protocol import extract_model_output
+from .protocol import extract_model_response
 from .store import TraceStore
 
 
@@ -227,9 +227,11 @@ class TraceHandler(BaseHTTPRequestHandler):
             else:
                 raw = response.content
                 raw_text = raw.decode("utf-8", errors="replace")
+                model_response = extract_model_response(raw_text, streaming=False)
                 self.server.store.finish_call(
                     call_id,
-                    extract_model_output(raw_text, streaming=False),
+                    model_response.content,
+                    thoughts=model_response.thoughts,
                     raw_response=raw_text,
                     status="ok" if response.ok else "error",
                     metadata={
@@ -338,9 +340,11 @@ class TraceHandler(BaseHTTPRequestHandler):
         finally:
             self.close_connection = True
             raw_text = b"".join(captured).decode("utf-8", errors="replace")
+            model_response = extract_model_response(raw_text, streaming=True)
             self.server.store.finish_call(
                 call_id,
-                extract_model_output(raw_text, streaming=True),
+                model_response.content,
+                thoughts=model_response.thoughts,
                 raw_response=raw_text,
                 status=status,
                 metadata={

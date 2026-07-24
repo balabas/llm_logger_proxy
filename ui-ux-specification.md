@@ -209,11 +209,12 @@ The Follow toggle has one meaning:
 
 Mixed Trace is the historical working surface for the active checkpoint segment.
 
-It contains three semantic scopes:
+It contains four semantic scopes, with Thoughts omitted when the provider returns none:
 
 1. input parameters;
 2. input content;
-3. output.
+3. thoughts;
+4. output.
 
 All updates from the segment are retained. The renderer resolves their current status against
 the selected exact value:
@@ -233,16 +234,23 @@ because Exact State contains only the selected call’s short response.
 
 The pane should look like state first and history second:
 
-- structural labels establish Input parameters, Input, Prompt when applicable, and Output;
+- structural labels establish Input parameters, Input, Prompt when applicable, Thoughts when
+  present, and Output;
 - unchanged payload remains quiet monospaced text;
 - present additions remain embedded at their current location;
 - replacements show an old-to-new transition;
 - removed history remains available without pretending to belong to Exact State;
 - focus decoration is applied only after kind, operation, and presence are resolved.
 
-Labels such as Input, Output, Input parameters, and Prompt are interface structure. They use a
-separate UI font, surface, and border treatment and must not resemble or become part of model
-input/output text.
+Labels such as Input, Output, Input parameters, Prompt, Messages, Content, Role, and Thoughts
+are interface structure. They use a separate UI font, surface, and border treatment and must
+not resemble or become part of model input/output text. Provider response structure is
+rendered semantically rather than exposed as YAML keys.
+
+Thoughts and Output are separate response scopes. Thoughts contains provider reasoning fields
+such as `reasoning_content` or `thinking`; Output contains only the assistant answer delivered
+to the application. Each scope has independent history, update cards, highlighting, and
+back-reference navigation. The Raw tab may still show the unmodified provider envelope.
 
 #### Identity and provenance
 
@@ -331,6 +339,7 @@ Data-kind color answers **what type of data is this?**
 | --- | --- | --- |
 | Input content | `.trace-kind-input` | Cyan/blue |
 | Input parameters | `.trace-kind-input-params` | Violet |
+| Thoughts | `.trace-kind-thoughts` | Purple |
 | Output | `.trace-kind-output` | Gold/olive |
 
 Each kind defines:
@@ -429,7 +438,7 @@ The hit target determines the semantic action:
 | Click target | Result |
 | --- | --- |
 | Marked fragment with an update identity | Focus only that update in Mixed, Exact, Updates, and its Timeline phase |
-| Input, Output, or Input parameters label | Focus the corresponding whole scope and its mapped updates |
+| Input, Thoughts, Output, or Input parameters label | Focus the corresponding whole scope and its mapped updates |
 | Plain `.state-scope-content` payload | No navigation; leave it available for caret placement and text selection |
 | Checkpoint snapshot content | Focus the owning checkpoint scope because the full snapshot is one update section |
 
@@ -541,8 +550,8 @@ Copied trace text must represent stored data.
 - CSS pseudo-elements, borders, and labels may communicate status without contaminating
   copied content.
 - Metadata such as fragment locations and repeat counts must remain outside payload elements.
-- Structural Input, Output, Input parameters, and Prompt labels must remain outside payload
-  elements and must not appear in copied model text.
+- Structural Input, Output, Thoughts, Input parameters, Prompt, Messages, Content, and Role
+  labels must remain outside payload elements and must not appear in copied model text.
 
 ## 12. Loading, error, and empty states
 

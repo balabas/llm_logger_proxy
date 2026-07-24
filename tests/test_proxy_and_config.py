@@ -10,7 +10,7 @@ import requests
 
 from insequent_logger.config import load_config
 from insequent_logger.notebook import NotebookRecorder
-from insequent_logger.protocol import extract_model_output
+from insequent_logger.protocol import extract_model_output, extract_model_response
 from insequent_logger.server import TraceServer
 from insequent_logger.store import TraceStore
 
@@ -108,6 +108,22 @@ def test_provider_envelopes_are_normalized_to_model_text():
         {"choices": [{"message": {"content": "actual answer"}, "finish_reason": "stop"}]}
     )
     assert extract_model_output(raw_json, streaming=False) == "actual answer"
+
+    raw_reasoning = json.dumps(
+        {
+            "choices": [{
+                "message": {
+                    "reasoning_content": "private reasoning",
+                    "content": "final answer",
+                },
+                "finish_reason": "stop",
+            }]
+        }
+    )
+    separated = extract_model_response(raw_reasoning, streaming=False)
+    assert separated.thoughts == "private reasoning"
+    assert separated.content == "final answer"
+    assert extract_model_output(raw_reasoning, streaming=False) == "final answer"
 
 
 def test_copied_notebook_uses_session_headers_without_remote_event_logging():

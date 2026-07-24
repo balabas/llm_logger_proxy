@@ -56,7 +56,11 @@ def viewer_url(tmp_path):
         branch_id="main",
         explicit_parent_state=state,
     )
-    store.finish_call(continuation, "continuing\nnext")
+    store.finish_call(
+        continuation,
+        "continuing\nnext",
+        thoughts="I should preserve the conversation and continue carefully.",
+    )
     continuation_state = store.get_call(continuation)["request_state_id"]
     summary = store.start_call(
         {
@@ -611,6 +615,13 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
         """() => {
           const detail = {
             ...state.detail,
+            thoughts: "",
+            thoughts_diff: {
+              mode: "unchanged",
+              similarity: 1,
+              changes: [],
+              base_call_id: 2,
+            },
             output_diff: {
               mode: "unchanged",
               similarity: 1,
@@ -825,8 +836,28 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(added_user).to_have_class(re.compile("trace-kind-input"))
     expect(added_user).to_have_class(re.compile("trace-op-added"))
     expect(page.locator("#exact > .state-scope > .state-scope-label")).to_have_text(
-        ["Input parameters", "Input", "Output"]
+        ["Input parameters", "Input", "Thoughts", "Output"]
     )
+    expect(
+        page.locator('#exact [data-state-scope="thoughts"]')
+    ).to_contain_text("I should preserve the conversation")
+    expect(
+        page.locator('#exact [data-state-scope="output"]')
+    ).not_to_contain_text("I should preserve the conversation")
+    expect(
+        page.locator('.update-card[data-key="call:3"] .thoughts-update-card')
+    ).to_contain_text("Added thoughts")
+    expect(
+        page.locator(
+            '.update-card[data-key="call:3"] .thoughts-update-card .added-part'
+        )
+    ).to_have_text("I should preserve the conversation and continue carefully.")
+    expect(page.locator("#exact .message-list-label")).to_have_text("Messages")
+    expect(page.locator("#exact .message-field-label", has_text="Content")).not_to_have_count(0)
+    expect(page.locator("#exact .message-field-label", has_text="Role")).not_to_have_count(0)
+    expect(page.locator("#exact .message-list")).not_to_contain_text("messages:")
+    expect(page.locator("#exact .message-list")).not_to_contain_text("content:")
+    expect(page.locator("#exact .message-list")).not_to_contain_text("role:")
     assert page.locator("#exact .state-scope-content").evaluate_all(
         """nodes => nodes.every(node => (
           !/^\\s*(input_params|input|output):/.test(node.textContent)
@@ -956,7 +987,7 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.locator("#exact")).not_to_contain_text("obsolete")
     expect(page.locator("#exact")).not_to_contain_text("0.1")
     expect(page.locator("#exact > .state-scope > .state-scope-label")).to_have_text(
-        ["Input parameters", "Input", "Output"]
+        ["Input parameters", "Input", "Thoughts", "Output"]
     )
     expect(
         page.locator("#exact > .state-scope.trace-kind-input-params")

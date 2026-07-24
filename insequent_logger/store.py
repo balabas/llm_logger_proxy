@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .diffing import compact_text_diff, compact_token_diff, diff_manifests, diff_values
-from .protocol import extract_model_output
+from .protocol import extract_model_response
 
 
 def _now() -> str:
@@ -82,6 +82,7 @@ class TraceStore:
                     chronological_parent_id INTEGER REFERENCES calls(id),
                     request_state_id INTEGER NOT NULL REFERENCES states(id),
                     response_blob_hash TEXT REFERENCES blobs(hash),
+                    thoughts_blob_hash TEXT REFERENCES blobs(hash),
                     raw_response_blob_hash TEXT REFERENCES blobs(hash),
                     status TEXT NOT NULL,
                     metadata_json TEXT NOT NULL
@@ -156,6 +157,10 @@ class TraceStore:
                 self._db.execute(
                     "ALTER TABLE calls ADD COLUMN raw_response_blob_hash TEXT REFERENCES blobs(hash)"
                 )
+            if "thoughts_blob_hash" not in call_columns:
+                self._db.execute(
+                    "ALTER TABLE calls ADD COLUMN thoughts_blob_hash TEXT REFERENCES blobs(hash)"
+                )
             self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_states_branch_root "
                 "ON states(session_id, branch_root_id, id DESC)"
@@ -165,6 +170,7 @@ class TraceStore:
                 "ON calls(session_id, branch_root_id, id DESC)"
             )
         self._migrate_legacy_responses()
+        self._migrate_response_parts()
 
     def _recover_interrupted_calls(self) -> None:
         """A new store process cannot own calls left running by an old one."""
@@ -185,16 +191,22 @@ class TraceStore:
             streaming = any(
                 line.lstrip().startswith("data:") for line in raw.splitlines()[:5]
             )
-            normalized = extract_model_output(raw, streaming=streaming)
-            normalized_hash = self.put_text(normalized)
+            response = extract_model_response(raw, streaming=streaming)
+            normalized_hash = self.put_text(response.content)
+            thoughts_hash = self.put_text(response.thoughts)
             with self._db:
                 self._db.execute(
                     """
                     UPDATE calls
-                    SET response_blob_hash=?, raw_response_blob_hash=?
+                    SET response_blob_hash=?, thoughts_blob_hash=?, raw_response_blob_hash=?
                     WHERE id=?
                     """,
-                    (normalized_hash, row["response_blob_hash"], row["id"]),
+                    (
+                        normalized_hash,
+                        thoughts_hash,
+                        row["response_blob_hash"],
+                        row["id"],
+                    ),
                 )
                 self._db.execute(
                     "DELETE FROM search_documents "
@@ -203,8 +215,53 @@ class TraceStore:
                 )
                 self._db.execute(
                     "INSERT INTO search_documents VALUES ('call', ?, 'output', ?)",
-                    (row["id"], normalized),
+                    (row["id"], response.content),
                 )
+
+    def _migrate_response_parts(self) -> None:
+        rows = self._db.execute(
+            """
+            SELECT id, response_blob_hash, raw_response_blob_hash
+            FROM calls
+            WHERE response_blob_hash IS NOT NULL
+              AND raw_response_blob_hash IS NOT NULL
+              AND thoughts_blob_hash IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            raw = self.get_text(row["raw_response_blob_hash"])
+            streaming = any(
+                line.lstrip().startswith("data:") for line in raw.splitlines()[:5]
+            )
+            parsed = extract_model_response(raw, streaming=streaming)
+            current = self.get_text(row["response_blob_hash"])
+            provider_envelope = parsed.content != raw or bool(parsed.thoughts)
+            content = parsed.content if provider_envelope else current
+            content_hash = self.put_text(content)
+            thoughts_hash = self.put_text(parsed.thoughts if provider_envelope else "")
+            with self._db:
+                self._db.execute(
+                    """
+                    UPDATE calls
+                    SET response_blob_hash=?, thoughts_blob_hash=?
+                    WHERE id=?
+                    """,
+                    (content_hash, thoughts_hash, row["id"]),
+                )
+                self._db.execute(
+                    "DELETE FROM search_documents "
+                    "WHERE owner_type='call' AND owner_id=? AND field IN ('output', 'thoughts')",
+                    (row["id"],),
+                )
+                self._db.execute(
+                    "INSERT INTO search_documents VALUES ('call', ?, 'output', ?)",
+                    (row["id"], content),
+                )
+                if parsed.thoughts:
+                    self._db.execute(
+                        "INSERT INTO search_documents VALUES ('call', ?, 'thoughts', ?)",
+                        (row["id"], parsed.thoughts),
+                    )
 
     def close(self) -> None:
         with self._lock:
@@ -633,12 +690,14 @@ class TraceStore:
         call_id: int,
         response: str,
         *,
+        thoughts: str = "",
         raw_response: str | None = None,
         status: str = "ok",
         metadata: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
             digest = self.put_text(response)
+            thoughts_digest = self.put_text(thoughts)
             raw_digest = (
                 self.put_text(raw_response)
                 if raw_response is not None and raw_response != response
@@ -655,15 +714,28 @@ class TraceStore:
                 self._db.execute(
                     """
                     UPDATE calls
-                    SET response_blob_hash=?, raw_response_blob_hash=?, status=?, metadata_json=?
+                    SET response_blob_hash=?, thoughts_blob_hash=?,
+                        raw_response_blob_hash=?, status=?, metadata_json=?
                     WHERE id=?
                     """,
-                    (digest, raw_digest, status, _json(merged), call_id),
+                    (
+                        digest,
+                        thoughts_digest,
+                        raw_digest,
+                        status,
+                        _json(merged),
+                        call_id,
+                    ),
                 )
                 self._db.execute(
                     "INSERT INTO search_documents VALUES ('call', ?, 'output', ?)",
                     (call_id, response),
                 )
+                if thoughts:
+                    self._db.execute(
+                        "INSERT INTO search_documents VALUES ('call', ?, 'thoughts', ?)",
+                        (call_id, thoughts),
+                    )
             self.enforce_size_limit()
 
     def add_stream_event(
@@ -888,6 +960,7 @@ class TraceStore:
         for table, column in (
             ("states", "request_blob_hash"),
             ("calls", "response_blob_hash"),
+            ("calls", "thoughts_blob_hash"),
             ("calls", "raw_response_blob_hash"),
             ("events", "payload_blob_hash"),
             ("stream_events", "data_blob_hash"),
@@ -1007,6 +1080,11 @@ class TraceStore:
                 new_prompt = self.get_text(manifest["prompt"]["$blob"])
                 call_diff["prompt"] = compact_text_diff(old_prompt, new_prompt)
             response = self.get_text(row["response_blob_hash"]) if row["response_blob_hash"] else ""
+            thoughts = (
+                self.get_text(row["thoughts_blob_hash"])
+                if row["thoughts_blob_hash"]
+                else ""
+            )
             raw_response = (
                 self.get_text(row["raw_response_blob_hash"])
                 if row["raw_response_blob_hash"]
@@ -1014,7 +1092,7 @@ class TraceStore:
             )
             output_parent = self._db.execute(
                 """
-                SELECT id, request_state_id, response_blob_hash
+                SELECT id, request_state_id, response_blob_hash, thoughts_blob_hash
                 FROM calls
                 WHERE id<? AND session_id=? AND branch_id=? AND purpose=?
                   AND response_blob_hash IS NOT NULL
@@ -1042,11 +1120,31 @@ class TraceStore:
                 previous_response = self.get_text(output_parent["response_blob_hash"])
                 output_diff = compact_token_diff(previous_response, response)
                 output_diff["base_call_id"] = output_parent["id"]
+                previous_thoughts = (
+                    self.get_text(output_parent["thoughts_blob_hash"])
+                    if output_parent["thoughts_blob_hash"]
+                    else ""
+                )
+                if not previous_thoughts and thoughts:
+                    thoughts_diff = {
+                        "mode": "snapshot",
+                        "similarity": None,
+                        "changes": [],
+                    }
+                else:
+                    thoughts_diff = compact_token_diff(previous_thoughts, thoughts)
+                thoughts_diff["base_call_id"] = output_parent["id"]
                 output_parent_same_request = (
                     output_parent["request_state_id"] == row["request_state_id"]
                 )
             else:
                 output_diff = {
+                    "mode": "snapshot",
+                    "base_call_id": None,
+                    "similarity": None,
+                    "changes": [],
+                }
+                thoughts_diff = {
                     "mode": "snapshot",
                     "base_call_id": None,
                     "similarity": None,
@@ -1075,6 +1173,8 @@ class TraceStore:
                 "output_parent_same_request": output_parent_same_request,
                 "request": json.loads(self.get_text(row["request_blob_hash"])),
                 "response": response,
+                "thoughts": thoughts,
+                "thoughts_diff": thoughts_diff,
                 "raw_response": raw_response,
                 "metadata": json.loads(row["metadata_json"]),
             }
