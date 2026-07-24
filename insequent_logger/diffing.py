@@ -99,9 +99,14 @@ def compact_text_diff(old: str, new: str) -> dict[str, Any]:
         hunk: dict[str, Any] = {"at_old": i1 + 1, "at_new": j1 + 1}
         if tag in ("delete", "replace"):
             removed = old_lines[i1:i2]
+            # `preview` stays a compact one-line label; `text` is the full removed
+            # content so Mixed can show what was removed in full, attributed to
+            # the call that removed it, instead of borrowing it from the call that
+            # added it. The diff is computed on read, so this costs no storage.
             hunk["-"] = {
                 "lines": len(removed),
                 "preview": removed[0][:180] if removed else "",
+                "text": "\n".join(removed),
             }
         if tag in ("insert", "replace"):
             hunk["+"] = "\n".join(new_lines[j1:j2])

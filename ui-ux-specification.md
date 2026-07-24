@@ -17,7 +17,7 @@ The four panes deliberately provide different views of the same trace:
 | Timeline | What happened, and in what order? | Chronological input/output events | Live, preserves viewport |
 | Mixed Trace | How did the current segment grow? | From checkpoint through selected call | Grow until checkpoint, then flush |
 | Exact State | What did this one selected call contain? | Selected call only | Reconstructed exact value |
-| Updates | What changed at each call? | Chronological cards | Append-only |
+| Updates | What changed at each call? | Chronological input/output cards | Append-only per event |
 
 The panes are linked, but they are not interchangeable. Exact State is a current-value
 projection. Mixed Trace is a **mixed projection**: selected-call truth combined with retained
@@ -139,6 +139,26 @@ Within one checkpoint segment, Mixed Trace must never lose previously observed d
 Trace while being absent from Exact State. In that case it must be red and struck through,
 not green.
 
+Removed text is owned by the call that removed it. When a call removes text, that removal
+carries the full removed text and links it back to the removing call, so clicking a removed
+mark in Mixed lands on a removed side in Updates — removed points to removed, added to added.
+An earlier call's addition that is now gone is retained as removed history, but only when no
+real removal already covers that exact text; where a removal does cover it, that removal owns
+it, and re-drawing the same text linked to the call that *added* it — which would point a
+removed mark at an added side — is not done. Nothing is lost either way: the text stays
+visible, once, attributed to the call that removed it.
+
+A flat text can carry only one mark per character, so spans compete. Competition is resolved,
+never silently dropped:
+
+- the selected call's own change claims its span first — an earlier call's retained span,
+  above all a whole-scope one, must never swallow the fragments of the call being looked at
+  and leave them with no mark and no focus target;
+- whatever loses is kept as retained history rather than discarded;
+- a removal is an anchor, not a span: it collides with nothing, and if its position falls
+  inside an already-marked span it moves to the end of that span. Removed text cannot vanish
+  from Mixed Trace — being marked as removed is what it means to be there.
+
 Mixed Trace must preserve semantic placement. Input history stays in Input, parameter history
 stays in Input parameters, and output history stays in Output. The renderer must never move a
 fragment into another scope merely because the same text occurs there.
@@ -155,10 +175,36 @@ content.
 - Exact State must not silently hide stored prompt protocol tokens.
 - Temporary focus marks may decorate exact text, but must not alter copied text.
 
+### 3.2.1 Changes are placed by recorded position
+
+The store records where every change sits: prompt hunks carry their line, message hunks their
+index, response fragments their character offsets. Those positions place the fragment in Mixed
+and Exact. Searching the state for a change's text cannot tell two identical lines apart, and
+cannot place removed text at all — the first match wins and every later twin silently loses
+its focus target.
+
+Two cases fall back to content matching, and both are visible in the code:
+
+- **A payload the pane reformats for display.** Recorded offsets index the stored payload;
+  when a structured value is re-serialised for reading, they no longer describe what is on
+  screen. Placement verifies the payload is rendered verbatim before trusting an offset.
+- **An entry replayed from an earlier call in the segment.** Its positions describe that
+  call's text, and every later insertion has shifted them, so whether its text is still
+  present is a content question. Such an entry must never be placed at its recorded position:
+  that position now belongs to whatever was inserted since. Repeated text on this path is
+  disambiguated by occurrence so twins do not collapse onto one mark.
+
 ### 3.3 Updates is append-only
 
-Each call owns one card in chronological order. Existing cards are preserved when live calls
-arrive. Lazy loading may fill a placeholder, but must not reorder or replace unrelated cards.
+Each call owns one card per phase — what it sent, and what came back — and the two are placed
+independently in the same chronological event sequence the Timeline uses. Overlapping calls
+therefore interleave: an earlier call's response lands after a later call's request when that
+is the order in which they happened.
+
+Existing cards are preserved and moved, never rebuilt, when live calls arrive. A completing
+call inserts its output card into the sequence without disturbing the viewport or the loaded
+content of any other card. Lazy loading may fill a placeholder, but must not reorder or
+replace unrelated cards.
 
 ### 3.4 Visual marks are not payload
 
@@ -200,10 +246,15 @@ concurrency, not semantic parenthood.
 Checkpoint inputs use a diamond marker and “new state input” label. Running calls use a
 continuous pulse only while waiting.
 
-The Follow toggle has one meaning:
+The Follow toggle owns every movement caused by arrival:
 
-- off: live arrivals do not replace the current selection;
-- on: select the latest appended call.
+- off: live arrivals neither replace the current selection nor move any pane. A viewport that
+  happens to rest at the newest end stays there while new events accumulate below it;
+- on: the latest appended call becomes selected and is scrolled into view, even when the
+  viewport had drifted away from the newest end.
+
+Opening a session is not an arrival: the first render selects the newest call and opens at
+that end whatever Follow says.
 
 ### 4.3 Mixed Trace
 
@@ -298,18 +349,33 @@ plain exact content is still payload, not a navigation control.
 
 ### 4.5 Updates
 
+A card is scoped to one phase of one call and is headed by that phase (`→ input`,
+`← output`) so a card answers "input or output?" before "which call?". An input card carries
+parameter and input entries; an output card carries thoughts and output entries. Neither
+phase ever shows the other's updates.
+
 An Updates card can be one of four forms:
 
-- checkpoint snapshot;
-- identical call;
-- a list of change entries;
+- checkpoint snapshot — input and parameters on the input card, thoughts and output on the
+  output card;
+- identical call — one compact card at the input moment, since the identity statement covers
+  the whole call;
+- a list of change entries for its phase;
 - load error with retry.
 
 Change entries are grouped by data kind and operation. Output token changes may be grouped
 when identical fragments repeat; location and repeat-count labels are metadata outside the
 payload.
 
-When output is identical to its comparison call but input changed, the card includes a
+Every prompt entry carries the line the differ recorded for it (`old 117`, `new 174`,
+`line 12`). Identical text inserted at two places is two entries, and the label is what tells
+them apart. The same holds for the other payloads: a message hunk records the message indexes
+it touches, and a response fragment records its character offsets. Entries are never merged on proximity: a removal followed by a nearby insertion
+stays two changes, because pairing them would invent a transition between unrelated lines and
+give both one identity, so focusing the addition would light up the removal. Only a hunk the
+differ itself recorded as a replacement renders as an old-to-new transition.
+
+When output is identical to its comparison call but input changed, the output card includes a
 dedicated “Unchanged output” row. This row is the focus target for the output timeline event.
 
 ## 5. Style layers
@@ -386,6 +452,13 @@ the selected state. Both must remain available at once.
 Interaction styling answers **what is the user currently following?**
 
 - Yellow is reserved for navigation focus and active cross-pane linkage.
+- Interaction is the last layer, so its decoration must win over kind and operation
+  decoration rather than lose to it. Kind styling carries its own outline; a focus outline
+  stated earlier or at lower weight silently disappears, and the pane then scrolls to a
+  fragment that is not visibly marked.
+- Focus decoration applies to any focused fragment, whatever its kind or operation. Retained
+  removed text and history parked out of line need it most: they are what the reader has to
+  be led to.
 - `.timeline-update-focus` is a persistent focused Updates target.
 - `.fragment-focus` identifies linked Mixed fragments.
 - `.exact-focus` identifies linked Exact fragments.
@@ -397,6 +470,13 @@ Interaction styling answers **what is the user currently following?**
 Interaction styling must be additive. It may add an outline or pulse, but it must preserve
 the underlying kind and operation colors.
 
+Mixed and Exact stack many marked fragments on adjacent wrapped lines. An outline drawn
+outside the box, pushed further out by a positive offset, bleeds into the lines above and
+below; a dense stack then reads as one overlapping web instead of separate marks. Kind and
+operation edges therefore sit inside their own box (non-positive offset), the change panes
+carry enough leading to separate stacked marks, and the focus outline stays only slightly
+proud — visible over the inset kind edge without merging into its neighbours.
+
 ## 6. Selection and cross-pane focus rules
 
 ### 6.1 Timeline input click
@@ -406,8 +486,12 @@ the underlying kind and operation colors.
 3. Build Mixed Trace through the selected call.
 4. Render Exact State I/O.
 5. Focus all mapped input updates belonging to the selected call.
-6. Focus the first corresponding Updates entry for navigation.
-7. Replay the Updates pulse even if the same event was clicked twice.
+6. Focus every Updates entry of the input phase, not only the first — a call that changed both
+   its parameters and its prompt lights both. The entry's data kind decides its phase, so all
+   input and parameter entries are considered, not just the primary one.
+7. If no input or parameter update changed, focus and pulse the “Unchanged input” row in
+   Updates, never an output update and never the card as a whole.
+8. Replay the Updates pulse even if the same event was clicked twice.
 
 Parameter changes may focus the parameter scope when no exact fragment mapping exists.
 
@@ -422,11 +506,36 @@ Parameter changes may focus the parameter scope when no exact fragment mapping e
 ### 6.3 Update-entry click
 
 1. Select the owning call without losing the chosen entry.
-2. Activate I/O unless the target is a parameter checkpoint.
-3. Focus the matching Mixed and Exact fragments.
-4. Mark the clicked entry active.
+2. Activate the timeline event of the entry's own phase — an output entry never activates its
+   call's input event.
+3. Activate I/O unless the target is a parameter checkpoint.
+4. Focus the matching Mixed and Exact fragments.
+5. Mark the clicked entry active.
+
+Clicking one half of a transition asks about that half: the removed text focuses only removed
+text, the present text only present text, and clicking the entry outside either half focuses
+the change as a whole. A click on removed text flashes nothing in Exact State, which by
+definition does not contain it.
+
+Selecting the same call twice is one selection. A second click must join the load the first
+started rather than cancel it, and must not rebuild panes that already show that call —
+otherwise the focus the first click was about to apply is silently lost, which is most likely
+exactly when the segment is long enough to have made the user click again.
+
+Reusing already-rendered panes must not leave the previous focus behind. Applying focus clears
+the prior focus decoration from Mixed and Exact first, so switching phase on one call — input
+then output — moves the highlight rather than adding to it. Stale marks left in the other scope
+would be what the pane rests on, and the click the user just made would read as doing nothing.
 
 Text selection takes precedence. Dragging to select text must not trigger navigation.
+
+### 6.3.1 Update-card click
+
+Entries, fragments, and checkpoint sections own their more specific navigation. Everywhere
+else on a card — its head, its scope notice, its padding — the card itself is the control and
+selects its own phase, exactly as clicking that phase’s timeline event would. A card is never
+inert: one whose body holds only an “Unchanged input”, “Parallel lane input”, or “Unchanged
+output” row still has a call and a moment to select.
 
 ### 6.4 Mixed/Exact back-reference click
 
@@ -471,6 +580,12 @@ Animation communicates a new action, not a permanent state.
 A second click on the same timeline event is still an action. Its animation must restart.
 Implementations may remove the animation class, force layout, and re-add it.
 
+A pulse replays only on a user action, never on a live refresh. A refresh reconciles Updates
+card order in place: a card that has not moved keeps its DOM node. Re-inserting a node — even
+into the same position — restarts every CSS animation on it and its descendants, so a blanket
+rebuild of the card list would replay every focused entry's pulse on every poll, and the
+outline would appear to flash without end. Only genuinely new or reordered cards are moved.
+
 ### 7.2 No competing motion
 
 One user action may issue at most one scroll command per pane.
@@ -497,8 +612,10 @@ Each pane owns its scroll position.
 - An output completion inserted above the viewport must not move the user’s anchor.
 - Updates preserves its viewport while lazy cards above expand.
 - User wheel, touch, pointer, or keyboard scrolling cancels automatic following.
-- With Follow off, appended calls do not change selection.
-- With Follow on, only the latest appended call becomes selected.
+- With Follow off, appended calls do not change selection and do not scroll any pane —
+  sticking to the newest end is following, and belongs to the toggle.
+- With Follow on, only the latest appended call becomes selected, and the timeline brings it
+  into view.
 - Repeat clicks must not cause a jump-and-return cycle.
 - Mixed may preserve scroll between structurally similar requests; a checkpoint starts at the
   beginning of the new state.
@@ -528,6 +645,35 @@ Output can be unchanged relative to its comparison call even when input changed.
 - Focus the exact output scope.
 - Show and pulse the “Unchanged output” row in Updates.
 - Retain earlier output history in Mixed Trace according to grow-or-flush rules.
+
+### 9.4 Unchanged input
+
+Input can be unchanged relative to its comparison call even when output changed, so a call
+can carry no input update at all.
+
+- Do not invent an input diff.
+- Do not leave the input event without a focus target of its own.
+- Focus the exact input scope.
+- Show and pulse the “Unchanged input” row in Updates, naming the compared call.
+- An input event never focuses an output update, and never falls back to the whole card,
+  because a card whose only entry is an output change would read as an output focus.
+
+### 9.5 Parallel lanes
+
+A parallel lane is a concurrent fork, not a continuation. Its state records no parent state,
+so the lane has no baseline it could have changed from; the input diff falls back to whichever
+same-purpose call arrived before it, which is a sibling lane.
+
+- Never present a sibling lane as an ancestor, and never call a lane input “unchanged”.
+- The lane’s input row states that there is no previous state, and names no call at all: a
+  reference would contradict the absence it reports. The sibling is an implementation detail
+  of the diff, not a relationship the trace records.
+- Because nothing the lane sent is a change, its input card shows the request itself —
+  input and parameters — as a snapshot beneath that row. A lane moment is never represented
+  by an empty card, and lanes read the same whether or not a sibling happened to precede them.
+- The snapshot does not make the lane a checkpoint: Mixed Trace still grows rather than
+  flushing, and the timeline keeps the plain input marker.
+- Lane identity stays visible in the timeline (`main · p3`) and in the lineage line.
 
 ## 10. Accessibility and input behavior
 
@@ -569,10 +715,23 @@ Every UI change should verify:
 
 - Does history grow until checkpoint?
 - Is superseded text retained but red?
+- Does removed text reference the call that removed it, so a click lands on a removed side in
+  Updates rather than the added side of the call that first introduced it?
 - Is current text green?
 - Does a checkpoint flush prior history?
 - Does each retained fragment remain in its correct semantic scope?
 - Does update identity, rather than equal text, drive cross-pane linking?
+- Does every change of the selected call have a mark in Mixed, including when an earlier call
+  in the segment covers the same text?
+- Does every update entry, including a removal, focus something in Mixed when clicked?
+- Does a rapid second click on the same call still end with its focus applied?
+- Does switching phase on one call move the highlight to the clicked phase and clear the
+  other, with the new focus scrolled into view?
+- Is a fragment placed by its recorded position — prompt line, message index, response
+  offsets — so repeated identical payload keeps a focus target per occurrence and removed
+  text stays where it was?
+- Do earlier-call entries fall back to content matching rather than trusting positions that
+  later insertions have shifted?
 
 ### Exact State
 
@@ -585,20 +744,36 @@ Every UI change should verify:
 ### Updates
 
 - Does the correct entry pulse on every click, including a second click?
+- Does a phase click focus every entry of that phase, not only the first?
+- Does the focus pulse stay put across live refreshes instead of replaying every poll?
+- Does clicking a card with no entries — head, notice, or padding — still select its call and
+  activate the matching timeline event?
+- Does every click inside an output card leave the output event active, never the input one?
+- Does a parallel lane show its request rather than an empty card?
 - Does the persistent focus remain after the pulse?
 - Is unchanged output represented by a real focus target?
+- Is unchanged input represented by a real focus target, so an input click never pulses an
+  output update?
+- Does a parallel lane say it has no previous state instead of claiming an unchanged input?
 - Are cards append-only and stable during live refresh?
+- Do input and output cards follow the same event order as the Timeline, including when
+  overlapping calls interleave?
 
 ### Motion and scrolling
 
 - Is there at most one automatic scroll per pane per action?
 - Does a new action cancel the old scroll animation?
 - Is viewport position stable during live insertion and lazy loading?
+- With Follow off, does a timeline resting at the newest end stay put as events arrive?
 
 ### Semantics
 
 - Does data-kind color still mean input, parameters, or output?
 - Does green/red still mean present/removed?
 - Is yellow used only for interaction focus?
+- Does focus decoration stay visible on top of kind and operation decoration, including on
+  retained removed text and on fragments parked out of line?
+- Do stacked inline marks keep their outlines inside their own line, so a dense stack does not
+  overlap into an unreadable web?
 - Are real stored protocol symbols preserved and UI-generated `+`/`−` symbols absent?
 - Are structural labels visually and textually separate from model payload?

@@ -274,7 +274,9 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   padding: 16px;
   color: #dbe5df;
   background: #1e2724;
-  font: 12px/1.6 "SFMono-Regular", Consolas, monospace;
+  /* Marked lines carry a left bar and an inset edge; a little extra leading
+     keeps stacked marks from touching top to bottom. */
+  font: 12px/1.85 "SFMono-Regular", Consolas, monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   tab-size: 2;
@@ -334,12 +336,26 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 }
 .update-card.loading { min-height: 64px; opacity: .65; }
 .update-card-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
   padding: 7px 9px;
   color: #78c49d;
   background: #26312d;
   font: 700 9px/1.3 monospace;
   letter-spacing: .05em;
   text-transform: uppercase;
+}
+/* The phase reads first: a card answers "input or output?" before "which call?" */
+.update-card-head .update-card-phase {
+  color: var(--trace-kind-text, #78c49d);
+}
+.update-card-head span:not(.update-card-phase) { color: #8fa39a; }
+.update-card[data-phase] {
+  border-left: 3px solid var(--trace-kind-accent, #42534d);
+}
+.update-card[data-phase] > .update-card-head {
+  background: var(--trace-kind-surface, #26312d);
 }
 .update-card-body { padding: 8px; }
 .checkpoint-jump {
@@ -391,6 +407,34 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   overflow-wrap: anywhere;
 }
 
+/* A lane snapshot is the request itself, not a change, so it borrows the
+   snapshot look without the checkpoint's own scope navigation. */
+.lane-snapshot { margin-top: 8px; }
+.lane-snapshot-section {
+  margin-bottom: 7px;
+  overflow: hidden;
+  border: 1px solid var(--trace-kind-accent, #42534d);
+  border-radius: 5px;
+}
+.lane-snapshot-section:last-child { margin-bottom: 0; }
+.lane-snapshot-section > strong {
+  display: block;
+  padding: 6px 8px;
+  color: var(--trace-kind-text, #8ce8ae);
+  background: var(--trace-kind-surface, #26322e);
+  font: 700 10px/1.3 system-ui, sans-serif;
+  text-transform: uppercase;
+}
+.lane-snapshot-section pre {
+  margin: 0;
+  padding: 8px;
+  color: #d8eee0;
+  background: #203229;
+  font: 10px/1.5 "SFMono-Regular", Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .code,
 .state-scope,
 .updates,
@@ -398,6 +442,8 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .update-jump,
 .checkpoint-section,
 .checkpoint-section pre,
+.lane-snapshot-section,
+.lane-snapshot-section pre,
 .fragment-change,
 .trace-part,
 .exact-update {
@@ -511,19 +557,15 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   background: #592d31;
   box-shadow: inset 3px 0 #e66f6a;
 }
+/* Inline marks stack on adjacent wrapped lines. An outline drawn outside the
+   box, and pushed further out by a positive offset, bleeds into the lines above
+   and below, so tight stacks of marks collide into an unreadable web. The left
+   bar (box-shadow) and background already carry kind and operation; the outline
+   is a thin edge that must stay inside its own line. */
 .inline-part { display: inline; }
-.inline-part.parameter-update {
-  outline: 1px solid #ad7cdb;
-  outline-offset: 1px;
-}
-.inline-part.input-update {
-  outline: 1px solid #65a9c4;
-  outline-offset: 1px;
-}
-.inline-part.output-update {
-  outline: 1px solid #d0a550;
-  outline-offset: 1px;
-}
+.inline-part.parameter-update { outline: 1px solid #ad7cdb; outline-offset: -1px; }
+.inline-part.input-update { outline: 1px solid #65a9c4; outline-offset: -1px; }
+.inline-part.output-update { outline: 1px solid #d0a550; outline-offset: -1px; }
 .exact-focus.input-update {
   color: #d9f4ff;
   background: #315f73;
@@ -583,11 +625,14 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   font: 700 9px/1.2 system-ui, sans-serif;
   text-align: right;
 }
-.inline-update.added-part.flash { animation: added-flash 1.5s ease-out; }
-.inline-update.removed-part.flash { animation: removed-flash 1.5s ease-out; }
-.inline-update.fragment-focus {
+/* Focus decoration belongs to the focused fragment, whatever kind it is. Text
+   retained as removed, and history parked out of line, are the fragments most
+   in need of it: they are the ones the reader has to be led to. */
+.added-part.flash { animation: added-flash 1.5s ease-out; }
+.removed-part.flash { animation: removed-flash 1.5s ease-out; }
+.fragment-focus {
   outline: 2px solid #fff0a6;
-  outline-offset: 2px;
+  outline-offset: 1px;
 }
 .trace-part[data-update-entry],
 .exact-update[data-update-entry] {
@@ -606,7 +651,7 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   background: color-mix(in srgb, var(--trace-kind-surface) 72%, transparent);
   border-radius: 2px;
   outline: 1px dotted var(--trace-kind-accent);
-  outline-offset: 1px;
+  outline-offset: -1px;
 }
 .update-jump.active,
 .fragment-change.active,
@@ -746,7 +791,8 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 }
 .update-jump.output-update-card:hover { background: #2b3a2f; }
 .update-jump.output-update-card strong { color: #9addad; }
-.update-unchanged-output {
+.update-unchanged-output,
+.update-unchanged-input {
   display: grid;
   gap: 2px;
   padding: 8px 9px;
@@ -755,12 +801,24 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   border: 1px dashed var(--trace-kind-accent);
   border-radius: 5px;
 }
-.update-unchanged-output strong {
+.update-unchanged-output strong,
+.update-unchanged-input strong {
   font: 650 11px/1.35 system-ui, sans-serif;
 }
-.update-unchanged-output small {
+.update-unchanged-output small,
+.update-unchanged-input small {
   color: #aab8b0;
   font: 10px/1.35 "SFMono-Regular", Consolas, monospace;
+}
+/* The card navigates, so it must read as clickable everywhere, not only on
+   entries that happen to be present. */
+.update-card[data-phase] { cursor: pointer; }
+.update-card[data-phase]:hover > .update-card-head {
+  background: var(--trace-kind-hover, #2b3a34);
+}
+.update-unchanged-output:hover,
+.update-unchanged-input:hover {
+  background: var(--trace-kind-hover);
 }
 
 /* Two-axis trace styling:
@@ -805,7 +863,7 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .update-jump.trace-op-changed { border-left: 4px solid #d0a550; }
 .trace-part[class*="trace-kind-"] {
   outline: 1px solid var(--trace-kind-accent);
-  outline-offset: 1px;
+  outline-offset: -1px;
 }
 .trace-part.trace-op-added {
   color: #c9f8dc;
@@ -828,6 +886,17 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .exact-focus.trace-op-added { box-shadow: inset 3px 0 #59c98a; }
 .exact-focus.trace-op-removed { box-shadow: inset 3px 0 #e66f6a; }
 .exact-focus.trace-op-changed { box-shadow: inset 3px 0 #d0a550; }
+/* Interaction is the last layer: kind and operation decoration describe the
+   data, focus says where the user just went, and it must stay visible on top of
+   both. Kind decoration carries its own 1px outline, so the focus outline has to
+   be stated after it and at matching weight or the highlight never appears. */
+.trace-part.fragment-focus,
+.trace-part.exact-focus,
+.exact-update.fragment-focus,
+.exact-update.exact-focus {
+  outline: 2px solid #fff0a6;
+  outline-offset: 1px;
+}
 .checkpoint-section[class*="trace-kind-"] {
   border-color: var(--trace-kind-accent);
 }

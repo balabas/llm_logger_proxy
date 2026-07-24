@@ -1042,15 +1042,36 @@ class TraceStore:
                         json.loads(chronological_state["manifest_json"]), manifest
                     )
             parent_manifest = None
+            # Where the input diff's baseline came from, so the viewer can tell a
+            # real ancestor ("state") from a chronological stand-in ("sibling"
+            # for a concurrent lane, "previous" otherwise). A parallel lane forks
+            # with parent_state_id NULL: it has no previous state at all.
+            input_parent_call_id = None
+            input_parent_source = None
             if row["parent_state_id"]:
                 parent = self._db.execute(
                     "SELECT manifest_json FROM states WHERE id=?", (row["parent_state_id"],)
                 ).fetchone()
                 parent_manifest = json.loads(parent["manifest_json"]) if parent else None
+                if parent_manifest is not None:
+                    # The input diff compares against a state; name the call that
+                    # last used it so an unchanged input can cite its ancestor.
+                    parent_call = self._db.execute(
+                        """
+                        SELECT id FROM calls
+                        WHERE id<? AND session_id=? AND request_state_id=?
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (call_id, row["session_id"], row["parent_state_id"]),
+                    ).fetchone()
+                    input_parent_call_id = parent_call["id"] if parent_call else None
+                    input_parent_source = "state"
             if parent_manifest is None:
                 previous_same = self._db.execute(
                     """
-                    SELECT s.manifest_json, s.id AS state_id
+                    SELECT s.manifest_json, s.id AS state_id, previous.id AS call_id,
+                           previous.branch_id AS call_branch_id
                     FROM calls previous
                     JOIN states s ON s.id=previous.request_state_id
                     WHERE previous.id<? AND previous.session_id=?
@@ -1070,6 +1091,12 @@ class TraceStore:
                 ).fetchone()
                 if previous_same:
                     parent_manifest = json.loads(previous_same["manifest_json"])
+                    input_parent_call_id = previous_same["call_id"]
+                    input_parent_source = (
+                        "sibling"
+                        if previous_same["call_branch_id"] != row["branch_id"]
+                        else "previous"
+                    )
             call_diff = diff_manifests(parent_manifest, manifest)
             if (
                 parent_manifest
@@ -1168,6 +1195,8 @@ class TraceStore:
                 "parent_source": row["parent_source"],
                 "similarity": row["similarity"],
                 "diff": self._resolve(call_diff),
+                "input_parent_call_id": input_parent_call_id,
+                "input_parent_source": input_parent_source,
                 "output_diff": output_diff,
                 "output_parent_call_id": output_diff["base_call_id"],
                 "output_parent_same_request": output_parent_same_request,

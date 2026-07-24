@@ -115,6 +115,18 @@ def test_completion_prompts_use_compact_sequence_diff(tmp_path):
     assert "WINDOW: two" in rendered_diff
     assert "shared instruction line 050" not in rendered_diff
     assert detail["raw_response"] == "second"
+
+    # The removed side carries the full removed text (so Mixed can show what was
+    # removed in full, attributed to the removing call) alongside a compact
+    # preview label. The full text never repeats the unchanged shared lines.
+    removed_hunk = next(
+        hunk["-"]
+        for hunk in detail["diff"]["prompt"]["hunks"]
+        if isinstance(hunk, dict) and "-" in hunk
+    )
+    assert removed_hunk["preview"].startswith("WINDOW: one")
+    assert removed_hunk["text"] == "WINDOW: one\ncandidate A"
+    assert "shared instruction line 050" not in removed_hunk["text"]
     store.close()
 
 

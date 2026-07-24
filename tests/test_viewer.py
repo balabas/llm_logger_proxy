@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 
 import pytest
 import requests
@@ -159,25 +160,55 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
           chronological_parent_state_id: 11
         })"""
     ) is False
+    # A removal and a later insertion are two changes, however close they sit:
+    # pairing them would invent a transition and bind both to one identity.
     assert page.evaluate(
         """() => {
           const entries = updateEntries({
             id: 3632,
             diff: {
               prompt: {hunks: [
-                {"-": {lines: 1, preview: "removed source line"}},
+                {at_old: 30, at_new: 30, "-": {lines: 1, preview: "removed source line"}},
                 {"=": "1 unchanged lines"},
-                {"+": "replacement source line"}
+                {at_old: 32, at_new: 31, "+": "replacement source line"}
+              ]}
+            },
+            output_diff: {mode: "unchanged"},
+            response: ""
+          });
+          return entries.length === 2
+            && entries[0].operation === "-"
+            && entries[0].oldText === "removed source line"
+            && entries[0].location === "old 30"
+            && entries[1].operation === "+"
+            && entries[1].newText === "replacement source line"
+            && entries[1].location === "new 31"
+            && entries[1].promptLine === 31;
+        }"""
+    ) is True
+    # A hunk the differ itself recorded as a replacement still reads as one.
+    assert page.evaluate(
+        """() => {
+          const entries = updateEntries({
+            id: 3633,
+            diff: {
+              prompt: {hunks: [
+                {
+                  at_old: 12,
+                  at_new: 12,
+                  "-": {lines: 1, preview: "old source line"},
+                  "+": "new source line"
+                }
               ]}
             },
             output_diff: {mode: "unchanged"},
             response: ""
           });
           return entries.length === 1
-            && entries[0].entryKey === "3632:0"
             && entries[0].operation === "~"
-            && entries[0].oldText === "removed source line"
-            && entries[0].newText === "replacement source line";
+            && entries[0].oldText === "old source line"
+            && entries[0].newText === "new source line"
+            && entries[0].location === "line 12";
         }"""
     ) is True
     assert page.evaluate(
@@ -367,8 +398,8 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
           return Math.abs(after - before) < 1;
         }"""
     ) is True
-    expect(page.locator(".update-card")).to_have_count(3)
-    expect(page.locator(".update-card.checkpoint .checkpoint-state")).to_have_count(2)
+    expect(page.locator(".update-card")).to_have_count(6)
+    expect(page.locator(".update-card.checkpoint .checkpoint-state")).to_have_count(4)
     expect(page.locator(".timeline-item.checkpoint-call")).to_have_count(2)
     expect(page.locator('.timeline-item[data-key="call:2"]')).to_have_class(
         re.compile("checkpoint-call")
@@ -377,27 +408,32 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
         re.compile("checkpoint-call")
     )
     expect(
-        page.locator('.update-card[data-key="call:4"] .checkpoint-input')
+        page.locator('.update-card[data-key="call:4"][data-phase="input"] .checkpoint-input')
     ).to_contain_text("Summarize the cobalt blue project conversation.")
     expect(
         page.locator(
-            '.update-card[data-key="call:4"] '
+            '.update-card[data-key="call:4"][data-phase="input"] '
             '[data-input-field="prompt"] > .state-field-label'
         )
     ).to_have_text("Prompt")
     expect(
         page.locator(
-            '.update-card[data-key="call:4"] '
+            '.update-card[data-key="call:4"][data-phase="input"] '
             '[data-input-field="prompt"] > .state-field-content'
         )
     ).not_to_contain_text("prompt:")
     expect(
-        page.locator('.update-card[data-key="call:4"] .checkpoint-output')
+        page.locator('.update-card[data-key="call:4"][data-phase="output"] .checkpoint-output')
     ).to_contain_text("cobalt blue summary")
     expect(
-        page.locator('.update-card[data-key="call:2"] .checkpoint-parameters')
+        page.locator('.update-card[data-key="call:2"][data-phase="input"] .checkpoint-parameters')
     ).to_contain_text("temperature: 0.1")
-    summary_checkpoint = page.locator('.update-card[data-key="call:4"]')
+    summary_checkpoint = page.locator(
+        '.update-card[data-key="call:4"][data-phase="input"]'
+    )
+    summary_checkpoint_output = page.locator(
+        '.update-card[data-key="call:4"][data-phase="output"]'
+    )
     page.locator(
         '.timeline-input[data-key="call:4"] .item-label',
         has_text="new state input",
@@ -411,7 +447,7 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     )
     expect(page.locator("#mixed .checkpoint-pane-focus.trace-kind-input")).to_be_visible()
     expect(page.locator("#exact .checkpoint-pane-focus.trace-kind-input")).to_be_visible()
-    summary_checkpoint.locator(".checkpoint-output").click()
+    summary_checkpoint_output.locator(".checkpoint-output").click()
     expect(page.locator("#mixed .checkpoint-pane-focus.trace-kind-output")).to_be_visible()
     expect(page.locator("#exact .checkpoint-pane-focus.trace-kind-output")).to_be_visible()
     summary_checkpoint.locator(".checkpoint-parameters").click()
@@ -434,10 +470,10 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.locator("#exact")).to_contain_text("cobalt blue summary")
     expect(page.locator("#mixed-status")).to_contain_text("new current state")
     page.locator('#exact [data-state-scope="output"]').click()
-    expect(summary_checkpoint.locator(".checkpoint-output")).to_have_class(
+    expect(summary_checkpoint_output.locator(".checkpoint-output")).to_have_class(
         re.compile("active")
     )
-    expect(summary_checkpoint.locator(".checkpoint-output")).to_have_class(
+    expect(summary_checkpoint_output.locator(".checkpoint-output")).to_have_class(
         re.compile("update-back-focus")
     )
 
@@ -449,7 +485,7 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
         times=1,
     )
     page.evaluate("loadTimeline()")
-    expect(page.locator(".update-card")).to_have_count(3)
+    expect(page.locator(".update-card")).to_have_count(6)
     expect(retained_card).to_have_attribute("data-retention-sentinel", "keep")
     page.route(
         "**/api/sessions",
@@ -461,11 +497,11 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.get_by_label("Session")).to_contain_text("retained in viewer")
     page.evaluate("loadSessions()")
     page.evaluate("loadTimeline()")
-    expect(page.locator(".update-card")).to_have_count(3)
+    expect(page.locator(".update-card")).to_have_count(6)
 
     page.locator('.timeline-item[data-key="call:2"]').click()
     expect(
-        page.locator('.update-card[data-key="call:2"] .checkpoint-input')
+        page.locator('.update-card[data-key="call:2"][data-phase="input"] .checkpoint-input')
     ).to_have_class(re.compile("timeline-update-focus"))
     expect(
         page.locator('.timeline-item[data-key="call:3"]')
@@ -568,16 +604,18 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     ).to_be_in_viewport()
     expect(
         page.locator(
-            '.update-card[data-key="call:3"] .update-jump[data-update-index="0"]'
+            '.update-card[data-key="call:3"][data-phase="input"] '
+            '.update-jump[data-update-index="0"]'
         )
     ).to_have_class(re.compile("timeline-update-focus"))
     expect(
         page.locator(
-            '.update-card[data-key="call:3"] .update-jump[data-update-index="0"]'
+            '.update-card[data-key="call:3"][data-phase="input"] '
+            '.update-jump[data-update-index="0"]'
         )
     ).to_have_class(re.compile("timeline-update-flash"))
     expect(
-        page.locator('.update-card[data-key="call:2"] .checkpoint-input')
+        page.locator('.update-card[data-key="call:2"][data-phase="input"] .checkpoint-input')
     ).not_to_have_class(re.compile("timeline-update-focus"))
     expect(
         page.locator('.update-card[data-key="call:3"] .update-jump.active')
@@ -590,11 +628,11 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.locator("#mixed .checkpoint-pane-focus")).not_to_have_count(0)
     expect(page.locator("#exact .checkpoint-pane-focus")).not_to_have_count(0)
     expect(
-        page.locator('.update-card[data-key="call:4"] .checkpoint-input')
+        page.locator('.update-card[data-key="call:4"][data-phase="input"] .checkpoint-input')
     ).to_have_class(re.compile("timeline-update-focus"))
     page.locator('.timeline-output[data-call-key="call:4"]').click()
     expect(
-        page.locator('.update-card[data-key="call:4"] .checkpoint-output')
+        page.locator('.update-card[data-key="call:4"][data-phase="output"] .checkpoint-output')
     ).to_have_class(re.compile("timeline-update-focus"))
     expect(
         page.locator("#mixed .checkpoint-pane-focus.trace-kind-output")
@@ -609,7 +647,7 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.locator("#mixed .fragment-focus.output-update")).not_to_have_count(0)
     expect(page.locator("#exact .exact-focus.output-update")).not_to_have_count(0)
     expect(
-        page.locator('.update-card[data-key="call:3"] .output-update-card')
+        page.locator('.update-card[data-key="call:3"][data-phase="output"] .output-update-card')
     ).to_have_class(re.compile("timeline-update-focus"))
     assert page.evaluate(
         """() => {
@@ -705,8 +743,23 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(
         page.locator("#exact .exact-focus, #exact .timeline-scope-focus")
     ).not_to_have_count(0)
-    expect(page.locator("#updates .timeline-update-focus")).to_have_count(1)
-    expect(page.locator("#updates .timeline-update-flash")).to_have_count(1)
+    # A phase click focuses every entry of that phase, not only the first, and
+    # each of them pulses once.
+    input_updates = page.locator(
+        '.update-card[data-key="call:3"][data-phase="input"] .update-jump'
+    )
+    input_focus = page.locator(
+        '.update-card[data-key="call:3"][data-phase="input"] '
+        ".update-jump.timeline-update-focus"
+    )
+    expect(input_focus).not_to_have_count(0)
+    expect(input_focus).to_have_count(input_updates.count())
+    expect(page.locator("#updates .timeline-update-focus")).to_have_count(
+        input_updates.count()
+    )
+    expect(page.locator("#updates .timeline-update-flash")).to_have_count(
+        input_updates.count()
+    )
     page.wait_for_timeout(250)
     focused_scrolls = page.evaluate(
         """() => [
@@ -813,9 +866,9 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
 
     page.locator('.timeline-item[data-key="call:3"]').click()
     expect(page.get_by_role("button", name="I/O")).to_have_class(re.compile("active"))
-    expect(page.locator('.update-card[data-key="call:3"]')).to_have_class(
-        re.compile("active")
-    )
+    expect(
+        page.locator('.update-card[data-key="call:3"][data-phase="input"]')
+    ).to_have_class(re.compile("active"))
     expect(
         page.locator('#mixed [data-update-entry^="3:"].fragment-focus')
     ).not_to_have_count(0)
@@ -829,7 +882,7 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.locator("#mixed")).to_contain_text("continuing")
     expect(page.locator("#mixed")).not_to_contain_text("output: |")
     added_user = page.locator(
-        '.update-card[data-key="call:3"] .update-jump',
+        '.update-card[data-key="call:3"][data-phase="input"] .update-jump',
         has_text="Added input · user",
     )
     expect(added_user).to_contain_text("Continue with the next section.")
@@ -845,11 +898,11 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
         page.locator('#exact [data-state-scope="output"]')
     ).not_to_contain_text("I should preserve the conversation")
     expect(
-        page.locator('.update-card[data-key="call:3"] .thoughts-update-card')
+        page.locator('.update-card[data-key="call:3"][data-phase="output"] .thoughts-update-card')
     ).to_contain_text("Added thoughts")
     expect(
         page.locator(
-            '.update-card[data-key="call:3"] .thoughts-update-card .added-part'
+            '.update-card[data-key="call:3"][data-phase="output"] .thoughts-update-card .added-part'
         )
     ).to_have_text("I should preserve the conversation and continue carefully.")
     expect(page.locator("#exact .message-list-label")).to_have_text("Messages")
@@ -890,7 +943,7 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     ).not_to_have_count(0)
     expect(
         page.locator(
-            '.update-card[data-key="call:3"] '
+            '.update-card[data-key="call:3"][data-phase="input"] '
             ".input-update-card.trace-op-changed"
         )
     ).to_have_class(re.compile(r"\bactive\b"))
@@ -904,7 +957,7 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
         re.compile("active")
     )
     expect(
-        page.locator('.update-card[data-key="call:3"] .output-update-card')
+        page.locator('.update-card[data-key="call:3"][data-phase="output"] .output-update-card')
     ).to_have_class(re.compile("timeline-update-focus"))
     expect(page.locator("#mixed .fragment-focus.output-update")).not_to_have_count(0)
     expect(page.locator("#exact .exact-focus.output-update")).not_to_have_count(0)
@@ -962,14 +1015,14 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     ).click()
     expect(added_user).to_have_class(re.compile("active"))
     changed_temperature = page.locator(
-        '.update-card[data-key="call:3"] .parameter-update-card',
+        '.update-card[data-key="call:3"][data-phase="input"] .parameter-update-card',
         has_text="Changed parameter · temperature",
     )
     expect(changed_temperature).to_contain_text("0.1 → 0.2")
     expect(changed_temperature).to_have_class(re.compile("trace-kind-input-params"))
     expect(changed_temperature).to_have_class(re.compile("trace-op-changed"))
     removed_parameter = page.locator(
-        '.update-card[data-key="call:3"] .parameter-update-card',
+        '.update-card[data-key="call:3"][data-phase="input"] .parameter-update-card',
         has_text="Removed parameter · obsolete",
     )
     expect(removed_parameter.locator(".removed-part")).to_have_text("true")
@@ -992,11 +1045,11 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(
         page.locator("#exact > .state-scope.trace-kind-input-params")
     ).to_contain_text("temperature: 0.2")
-    expect(page.locator('.update-card[data-key="call:3"]')).not_to_contain_text(
-        "New current state"
-    )
+    expect(
+        page.locator('.update-card[data-key="call:3"][data-phase="input"]')
+    ).not_to_contain_text("New current state")
     output_fragment = page.locator(
-        '.update-card[data-key="call:3"] .output-update-card .fragment-change',
+        '.update-card[data-key="call:3"][data-phase="output"] .output-update-card .fragment-change',
         has=page.locator(".added-part"),
     ).first
     expect(
@@ -1020,7 +1073,12 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     )
     expect(page.locator("#mixed .fragment-focus.input-update")).not_to_have_count(0)
     expect(page.get_by_role("button", name="I/O")).to_have_class(re.compile("active"))
-    expect(page.locator("#exact .exact-focus")).to_have_text("Continue with the next section.")
+    # A message change is recorded at message granularity, so the mark covers
+    # the whole message the hunk names, not a line found by searching for text.
+    expect(page.locator("#exact .exact-focus")).to_contain_text(
+        "Continue with the next section."
+    )
+    expect(page.locator("#exact .exact-focus")).not_to_contain_text('"')
 
     page.evaluate(
         """() => {
@@ -1069,7 +1127,9 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
             state.liveBusy = saved.liveBusy;
                 document.querySelector('.timeline-input[data-key="call:999999"]')?.remove();
                 document.querySelector('.timeline-output[data-call-key="call:999999"]')?.remove();
-            document.querySelector('.update-card[data-key="call:999999"]')?.remove();
+            document.querySelectorAll(
+              '.update-card[data-key="call:999999"]'
+            ).forEach(node => node.remove());
             window.__delayedAppendDone = true;
           });
         }"""
@@ -1107,7 +1167,7 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.locator(".timeline-item")).to_have_count(before + 2, timeout=4000)
     expect(page.locator(".timeline-input").last).to_contain_text("input")
     expect(page.locator(".timeline-output").last).to_contain_text("← output")
-    expect(page.locator(".update-card")).to_have_count(4)
+    expect(page.locator(".update-card")).to_have_count(8)
     assert page.evaluate("itemKey(state.selected)") == selected_before_live
     expect(first_card).to_have_attribute("data-live-sentinel", "preserve-me")
     scroll_after = page.locator("#updates").evaluate("(element) => element.scrollTop")
@@ -1265,9 +1325,13 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
           renderMixed();
         }"""
     )
-    expect(page.locator('#mixed [data-update-entry="901:0"]')).to_contain_text(
-        "first accumulated addition"
-    )
+    # 901 added this text; 902 removed it. Mixed shows it as removed history
+    # owned by the removing call (902), so a click lands on a removed side — not
+    # the call that added it. It is still present (grow-never-lose), just red.
+    expect(
+        page.locator('#mixed [data-update-entry="902:0"].removed-part')
+    ).to_contain_text("first accumulated addition")
+    expect(page.locator("#mixed")).to_contain_text("first accumulated addition")
     expect(
         page.locator('#mixed [data-update-entry="902:0"].added-part')
     ).to_contain_text("second accumulated addition")
@@ -1312,3 +1376,924 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(unavailable).not_to_have_class(re.compile(r"\bloading\b"))
     unavailable.scroll_into_view_if_needed()
     page.screenshot(path="/tmp/insequent_regression_898.png", full_page=True)
+
+
+@pytest.fixture
+def parallel_viewer_url(tmp_path):
+    """A branch-root call plus two parallel lanes that share its exact input.
+
+    The lanes differ only in their output, so their input event has no input
+    update of its own to focus. The later lane answers first, so the history
+    interleaves: both requests leave before either response lands.
+    """
+    store = TraceStore(tmp_path / "parallel.llmtrace")
+    shared_request = {
+        "model": "local",
+        "messages": [
+            {"role": "user", "content": "Outline the mining report."},
+            {"role": "user", "content": "Expand every section."},
+        ],
+    }
+    root = store.start_call(
+        dict(shared_request), session_id="parallel", branch_id="main"
+    )
+    store.finish_call(root, "root outline", metadata={"duration_ms": 10})
+    # Separate the root from the lanes in wall-clock time, then let the lanes
+    # overlap: both requests leave together and the second one answers first.
+    time.sleep(0.05)
+    lane_one = store.start_call(
+        dict(shared_request), session_id="parallel", branch_id="main"
+    )
+    lane_two = store.start_call(
+        dict(shared_request), session_id="parallel", branch_id="main"
+    )
+    store.finish_call(lane_two, "lane two expansion", metadata={"duration_ms": 100})
+    store.finish_call(lane_one, "lane one expansion", metadata={"duration_ms": 400})
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", root, lane_one, lane_two
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_input_click_never_focuses_output_update_when_input_is_unchanged(
+    page: Page, parallel_viewer_url
+):
+    url, root, lane_one, lane_two = parallel_viewer_url
+    page.goto(f"{url}/")
+    expect(page.locator(".timeline-item")).not_to_have_count(0)
+
+    card = page.locator(
+        f'.update-card[data-key="call:{lane_two}"][data-phase="input"]'
+    )
+    output_card = page.locator(
+        f'.update-card[data-key="call:{lane_two}"][data-phase="output"]'
+    )
+    page.locator(f'.timeline-input[data-key="call:{lane_two}"]').click()
+    lane_input = card.locator('[data-update-scope="input"]')
+    # A parallel lane forks with no parent state, so its baseline is the
+    # concurrent sibling, not an ancestor it could have changed from.
+    expect(lane_input).to_contain_text("Parallel lane input")
+    expect(lane_input).to_contain_text("No previous state to compare")
+    expect(lane_input).not_to_contain_text("Unchanged input")
+    # With no previous state there is nothing to point at: naming a call would
+    # contradict the absence the row reports.
+    expect(lane_input).not_to_contain_text("#")
+    expect(lane_input).to_have_class(re.compile("timeline-update-focus"))
+    expect(lane_input).to_have_class(re.compile("timeline-update-flash"))
+    # Nothing it sent is a change, so the card shows the request itself.
+    expect(card.locator('.lane-snapshot-section[data-lane-scope="input"]')).to_contain_text(
+        "Expand every section."
+    )
+    expect(
+        card.locator('.lane-snapshot-section[data-lane-scope="input-params"]')
+    ).to_contain_text('model: "local"')
+    # The call's only update is an output one, on its own card; the input event
+    # must not borrow it, directly or by focusing a whole card.
+    expect(output_card.locator(".output-update-card")).not_to_have_class(
+        re.compile("timeline-update-focus")
+    )
+    expect(card).not_to_have_class(re.compile("timeline-update-focus"))
+
+    page.locator(f'.timeline-output[data-call-key="call:{lane_two}"]').click()
+    expect(output_card.locator(".output-update-card")).to_have_class(
+        re.compile("timeline-update-focus")
+    )
+    expect(lane_input).not_to_have_class(re.compile("timeline-update-focus"))
+
+    # A call that does continue its own branch keeps the unchanged wording.
+    sequential_card = page.locator(
+        f'.update-card[data-key="call:{lane_one}"][data-phase="input"]'
+    )
+    page.locator(f'.timeline-input[data-key="call:{lane_one}"]').click()
+    sequential_input = sequential_card.locator('[data-update-scope="input"]')
+    expect(sequential_input).to_contain_text("Unchanged input")
+    expect(sequential_input).to_contain_text(f"Same input as call #{root}")
+    expect(sequential_input).to_have_class(re.compile("timeline-update-focus"))
+
+
+def test_updates_separate_input_and_output_in_timeline_order(
+    page: Page, parallel_viewer_url
+):
+    url, root, lane_one, lane_two = parallel_viewer_url
+    page.goto(f"{url}/")
+    expect(page.locator(".update-card")).to_have_count(6)
+
+    timeline_order = page.evaluate(
+        """() => [...document.querySelectorAll("#timeline .timeline-item")].map(
+          node => `${node.dataset.key || node.dataset.callKey}:${node.dataset.phase}`
+        )"""
+    )
+    updates_order = page.evaluate(
+        """() => [...document.querySelectorAll("#updates .update-card")].map(
+          node => `${node.dataset.key}:${node.dataset.phase}`
+        )"""
+    )
+    # Both requests leave before either response lands, and the later lane
+    # answers first, so the sequence interleaves rather than pairing per call.
+    assert updates_order == [
+        f"call:{root}:input",
+        f"call:{root}:output",
+        f"call:{lane_one}:input",
+        f"call:{lane_two}:input",
+        f"call:{lane_two}:output",
+        f"call:{lane_one}:output",
+    ]
+    assert updates_order == timeline_order
+
+    input_card = page.locator(
+        f'.update-card[data-key="call:{lane_two}"][data-phase="input"]'
+    )
+    output_card = page.locator(
+        f'.update-card[data-key="call:{lane_two}"][data-phase="output"]'
+    )
+    expect(input_card).to_contain_text("→ input")
+    expect(output_card).to_contain_text("← output")
+    # Neither phase shows the other's updates.
+    expect(input_card.locator(".output-update-card")).to_have_count(0)
+    expect(output_card.locator(".output-update-card")).to_have_count(1)
+    expect(output_card.locator('[data-update-scope="input"]')).to_have_count(0)
+
+
+def test_update_card_click_activates_its_timeline_event(page: Page, parallel_viewer_url):
+    url, root, lane_one, lane_two = parallel_viewer_url
+    page.goto(f"{url}/")
+    expect(page.locator(".update-card")).to_have_count(6)
+
+    # A card whose body is only a scope notice still navigates: it has no
+    # update entry to click, but it is the input moment of its call.
+    lane_card = page.locator(
+        f'.update-card[data-key="call:{lane_two}"][data-phase="input"]'
+    )
+    lane_card.locator(".update-unchanged-input").click()
+    expect(
+        page.locator(f'.timeline-input[data-key="call:{lane_two}"]')
+    ).to_have_class(re.compile("active"))
+    expect(lane_card).to_have_class(re.compile("active"))
+    expect(lane_card.locator(".update-unchanged-input")).to_have_class(
+        re.compile("timeline-update-focus")
+    )
+
+    # The head is part of the same control.
+    output_card = page.locator(
+        f'.update-card[data-key="call:{root}"][data-phase="output"]'
+    )
+    output_card.locator(".update-card-head").click()
+    expect(
+        page.locator(f'.timeline-output[data-call-key="call:{root}"]')
+    ).to_have_class(re.compile("active"))
+    expect(output_card).to_have_class(re.compile("active"))
+    expect(
+        page.locator(f'.timeline-input[data-key="call:{lane_two}"]')
+    ).not_to_have_class(re.compile("active"))
+
+    # Keyboard reaches the same target.
+    lane_card.locator(".update-unchanged-input").press("Enter")
+    expect(
+        page.locator(f'.timeline-input[data-key="call:{lane_two}"]')
+    ).to_have_class(re.compile("active"))
+
+    # An update entry activates its own phase's event, not the call's input:
+    # only input events carry data-key, so the phase must be handed over.
+    output_card = page.locator(
+        f'.update-card[data-key="call:{lane_two}"][data-phase="output"]'
+    )
+    output_card.locator(".update-jump").first.click()
+    expect(
+        page.locator(f'.timeline-output[data-call-key="call:{lane_two}"]')
+    ).to_have_class(re.compile("active"))
+    expect(
+        page.locator(f'.timeline-input[data-key="call:{lane_two}"]')
+    ).not_to_have_class(re.compile("active"))
+    assert page.evaluate("state.selectedPhase") == "output"
+
+
+
+@pytest.fixture
+def live_viewer_url(tmp_path):
+    """A timeline long enough to scroll, with the store kept open for appends."""
+    store = TraceStore(tmp_path / "live.llmtrace")
+    messages = [{"role": "user", "content": "Step 0"}]
+    for step in range(1, 15):
+        call = store.start_call(
+            {"model": "local", "messages": list(messages)},
+            session_id="live",
+            branch_id="main",
+        )
+        store.finish_call(call, f"answer {step}", metadata={"duration_ms": 5})
+        messages = messages + [
+            {"role": "assistant", "content": f"answer {step}"},
+            {"role": "user", "content": f"Step {step}"},
+        ]
+
+    def append(step):
+        call = store.start_call(
+            {"model": "local", "messages": list(messages) + [
+                {"role": "user", "content": f"Appended {step}"},
+            ]},
+            session_id="live",
+            branch_id="main",
+        )
+        store.finish_call(call, f"appended answer {step}", metadata={"duration_ms": 5})
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", append
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_timeline_follows_new_events_only_when_follow_is_enabled(
+    page: Page, live_viewer_url
+):
+    url, append_call = live_viewer_url
+    page.goto(f"{url}/")
+    expect(page.locator(".timeline-item")).to_have_count(28)
+    expect(page.get_by_label("Follow")).not_to_be_checked()
+
+    # Sitting at the newest end is not a request to be dragged along by it.
+    page.locator("#timeline").evaluate(
+        "element => { element.scrollTop = element.scrollHeight; }"
+    )
+    page.wait_for_timeout(100)
+    resting_scroll = page.locator("#timeline").evaluate("element => element.scrollTop")
+    assert resting_scroll > 0
+
+    append_call(1)
+    page.evaluate("loadTimeline()")
+    expect(page.locator(".timeline-item")).to_have_count(30)
+    page.wait_for_timeout(300)
+    assert page.locator("#timeline").evaluate("element => element.scrollTop") == (
+        resting_scroll
+    )
+    assert page.locator("#timeline").evaluate(
+        "element => element.scrollHeight - element.scrollTop - element.clientHeight"
+    ) > 80
+
+    # With Follow on, the newest event is what the pane is for.
+    page.get_by_label("Follow").check()
+    append_call(2)
+    page.evaluate("loadTimeline()")
+    expect(page.locator(".timeline-item")).to_have_count(32)
+    page.wait_for_timeout(300)
+    assert page.locator("#timeline").evaluate(
+        "element => element.scrollHeight - element.scrollTop - element.clientHeight"
+    ) < 80
+
+
+@pytest.fixture
+def repeated_prompt_viewer_url(tmp_path):
+    """A prompt that gains the same line twice, in two different places.
+
+    Identical text at different positions is exactly what text matching cannot
+    tell apart, so each entry must be placed by its recorded line.
+    """
+    store = TraceStore(tmp_path / "prompt.llmtrace")
+    repeated = "[L000322] The section was prepared under regulation 87."
+    old_lines = [f"[L{index:06d}] Source paragraph {index}." for index in range(1, 40)]
+    old_lines[20] = repeated
+    first = store.start_call(
+        {"model": "local", "prompt": "\n".join(old_lines)},
+        session_id="prompt",
+        branch_id="main",
+    )
+    store.finish_call(first, "first answer", metadata={"duration_ms": 5})
+    new_lines = list(old_lines)
+    new_lines[4] = repeated          # replaces a line: one recorded replacement
+    new_lines.insert(30, repeated)   # a second, separate insertion
+    second = store.start_call(
+        {"model": "local", "prompt": "\n".join(new_lines)},
+        session_id="prompt",
+        branch_id="main",
+    )
+    store.finish_call(second, "second answer", metadata={"duration_ms": 5})
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", second, repeated
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_repeated_prompt_lines_are_placed_by_recorded_position(
+    page: Page, repeated_prompt_viewer_url
+):
+    url, call_id, repeated = repeated_prompt_viewer_url
+    page.goto(f"{url}/")
+    page.locator(f'.timeline-input[data-key="call:{call_id}"]').click()
+    card = page.locator(f'.update-card[data-key="call:{call_id}"][data-phase="input"]')
+
+    # Every prompt entry says where it is, so identical text is distinguishable.
+    entries = card.locator(".update-jump")
+    expect(entries).not_to_have_count(0)
+    locations = card.locator(".update-jump .fragment-location")
+    assert locations.count() == entries.count()
+    assert len(set(locations.all_inner_texts())) == entries.count()
+
+    repeating = [
+        index for index in range(entries.count())
+        if repeated in entries.nth(index).inner_text()
+    ]
+    assert len(repeating) >= 2
+
+    # Each of them focuses its own fragment; none is left unfocusable, and none
+    # borrows another entry's text.
+    seen = set()
+    for index in repeating:
+        entries.nth(index).click()
+        page.wait_for_timeout(200)
+        focused = page.evaluate(
+            """() => [...document.querySelectorAll('#mixed .fragment-focus')]
+                 .map(node => node.dataset.updateEntry)"""
+        )
+        # A recorded replacement legitimately lights both of its halves, but
+        # never a second entry's text, and never nothing at all.
+        keys = set(focused)
+        assert len(keys) == 1, focused
+        key = keys.pop()
+        assert key not in seen
+        seen.add(key)
+
+
+@pytest.fixture
+def positional_viewer_url(tmp_path):
+    """Identical payload text at several recorded positions.
+
+    Repeated messages, repeated response fragments, and a later call that shifts
+    everything an earlier call added.
+    """
+    store = TraceStore(tmp_path / "positions.llmtrace")
+    same = "IDENTICAL PARAGRAPH"
+    base = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "first ask"},
+    ]
+    first = store.start_call(
+        {"model": "local", "messages": list(base)},
+        session_id="pos",
+        branch_id="main",
+    )
+    store.finish_call(first, "line a\nline b", metadata={"duration_ms": 5})
+
+    # The same message added twice, at index 1 and index 3; and the response
+    # gains the same line twice, at two different offsets.
+    repeated = [
+        base[0],
+        {"role": "user", "content": same},
+        base[1],
+        {"role": "user", "content": same},
+    ]
+    second = store.start_call(
+        {"model": "local", "messages": list(repeated)},
+        session_id="pos",
+        branch_id="main",
+    )
+    store.finish_call(
+        second,
+        "line a\nREPEATED CLAUSE\nline b\nREPEATED CLAUSE",
+        metadata={"duration_ms": 5},
+    )
+
+    # A wedge inserted at index 1 shifts every position the second call recorded.
+    wedged = [
+        base[0],
+        {"role": "user", "content": "WEDGE"},
+        repeated[1],
+        base[1],
+        repeated[3],
+    ]
+    third = store.start_call(
+        {"model": "local", "messages": list(wedged)},
+        session_id="pos",
+        branch_id="main",
+    )
+    store.finish_call(third, "line a\nline b\nline c", metadata={"duration_ms": 5})
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", first, second, third
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def marked_entries(page, pane):
+    return page.evaluate(
+        """(id) => [...document.querySelectorAll('#' + id + ' [data-update-entry]')].map(
+             node => node.dataset.updateEntry
+               + (node.dataset.outputFragment ? '/f' + node.dataset.outputFragment : ''))""",
+        pane,
+    )
+
+
+def test_repeated_payload_is_placed_by_recorded_position(
+    page: Page, positional_viewer_url
+):
+    url, _first, second, third = positional_viewer_url
+    page.goto(f"{url}/")
+    expect(page.locator(".timeline-item")).to_have_count(6)
+    page.locator(f'.timeline-input[data-key="call:{second}"]').click()
+    page.wait_for_timeout(400)
+
+    # Two identical messages were added at two recorded indexes, and the same
+    # response line at two recorded offsets: each keeps its own mark.
+    assert page.evaluate(
+        f"""async () => {{
+          const entries = updateEntries(await detailFor('call', {second}));
+          const messages = entries.filter(entry => entry.messageIndex != null);
+          return messages.length === 2
+            && messages[0].messageIndex === 1
+            && messages[1].messageIndex === 3;
+        }}"""
+    ) is True
+    for pane in ("exact", "mixed"):
+        marks = marked_entries(page, pane)
+        assert marks.count(f"{second}:0") == 1, (pane, marks)
+        assert marks.count(f"{second}:1") == 1, (pane, marks)
+        assert f"{second}:2/f0" in marks and f"{second}:2/f1" in marks, (pane, marks)
+
+    # Each message entry marks its own message, not the first matching text.
+    order = page.evaluate(
+        """() => [...document.querySelectorAll('#exact [data-update-entry]')]
+             .map(node => node.dataset.updateEntry)"""
+    )
+    assert order.index(f"{second}:0") < order.index(f"{second}:1")
+
+
+def test_earlier_call_history_survives_shifted_positions(
+    page: Page, positional_viewer_url
+):
+    url, _first, second, third = positional_viewer_url
+    page.goto(f"{url}/")
+    expect(page.locator(".timeline-item")).to_have_count(6)
+    page.locator(f'.timeline-input[data-key="call:{third}"]').click()
+    page.wait_for_timeout(400)
+
+    # The wedge moved every index the second call recorded, so its entries are
+    # resolved by content in Mixed — and still both of them, not one collapsed.
+    mixed = marked_entries(page, "mixed")
+    assert f"{third}:0" in mixed
+    assert mixed.count(f"{second}:0") == 1, mixed
+    assert mixed.count(f"{second}:1") == 1, mixed
+
+    # The later call's own addition is marked as its own, never attributed to
+    # whatever now occupies the earlier call's recorded index.
+    assert page.evaluate(
+        f"""() => {{
+          const node = document.querySelector('#exact [data-update-entry="{third}:0"]');
+          return node ? node.textContent.includes("WEDGE") : false;
+        }}"""
+    ) is True
+    assert page.evaluate(
+        f"""() => [...document.querySelectorAll('#mixed [data-update-entry="{second}:0"]')]
+             .every(node => node.textContent.includes("IDENTICAL PARAGRAPH"))"""
+    ) is True
+
+
+@pytest.fixture
+def swallowing_segment_viewer_url(tmp_path):
+    """A segment where an earlier call's retained span covers the whole output.
+
+    The later call's fragments sit inside that span, so a flat text cannot mark
+    both — and the selected call's own change is the one that must win.
+    """
+    store = TraceStore(tmp_path / "swallow.llmtrace")
+    whole = "if line is meaningful and body contains substantive content, keep it"
+
+    def call(prompt, response):
+        made = store.start_call(
+            {"model": "local", "prompt": prompt}, session_id="swallow", branch_id="main"
+        )
+        store.finish_call(made, response, metadata={"duration_ms": 5})
+        return made
+
+    # A checkpoint opens the segment. A parallel lane then leaves the next call
+    # without an output comparison, so that call records its whole output as
+    # added — and the last call changes fragments inside that very text.
+    call("root prompt\nline", "root output")
+    lane_one = store.start_call(
+        {"model": "local", "prompt": "root prompt\nline two"},
+        session_id="swallow",
+        branch_id="main",
+    )
+    lane_two = store.start_call(
+        {"model": "local", "prompt": "root prompt\nline three"},
+        session_id="swallow",
+        branch_id="main",
+    )
+    store.finish_call(lane_one, "lane one output", metadata={"duration_ms": 5})
+    store.finish_call(lane_two, whole, metadata={"duration_ms": 5})
+    second = call("root prompt\nline four", whole)
+    third = call("root prompt\nline five", whole.replace("if line is ", "when "))
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", second, third
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_mixed_never_loses_a_change_to_an_overlapping_span(
+    page: Page, swallowing_segment_viewer_url
+):
+    url, _second, third = swallowing_segment_viewer_url
+    page.goto(f"{url}/")
+    page.locator(f'.timeline-output[data-call-key="call:{third}"]').click()
+    page.wait_for_timeout(300)
+
+    card = page.locator(f'.update-card[data-key="call:{third}"][data-phase="output"]')
+    fragments = card.locator(".fragment-change")
+    count = fragments.count()
+    assert count > 0
+
+    # The situation this guards against must actually be present: an earlier
+    # call in the segment claims the whole output text.
+    assert page.evaluate(
+        f"""() => {{
+          const parts = stateDisplayParts(state.detail);
+          const earlier = state.mixedSegmentDetails
+            .slice(0, -1)
+            .filter(detail => !isCheckpoint(detail))
+            .flatMap(detail => updateEntries(detail))
+            .filter(entry => entry.scope === "output" && entry.wholeScope);
+          return earlier.some(entry => {{
+            const range = entryRanges(parts.outputText, entry, parts.outputAnchors)[0];
+            return range && range[1] - range[0] > parts.outputText.length / 2;
+          }});
+        }}"""
+    ) is True
+
+    # Every fragment of the selected call is present in Mixed, whatever an
+    # earlier call's retained span covers.
+    missing = page.evaluate(
+        f"""async () => {{
+          const entries = updateEntries(await detailFor('call', {third}));
+          const entry = entries.find(item => item.fragments);
+          return entry.fragments
+            .map((fragment, index) => index)
+            .filter(index => !document.querySelector(
+              `#mixed [data-update-entry="${{entry.entryKey}}"][data-output-fragment="${{index}}"]`,
+            ));
+        }}"""
+    )
+    assert missing == [], missing
+
+    # And every one of them focuses when clicked, including a pure removal.
+    for index in range(count):
+        fragments.nth(index).click()
+        page.wait_for_timeout(150)
+        focused = page.evaluate(
+            """() => [...document.querySelectorAll('#mixed .fragment-focus')]
+                 .map(node => node.dataset.outputFragment)"""
+        )
+        assert focused, f"fragment {index} focused nothing in Mixed"
+
+
+@pytest.fixture
+def transition_viewer_url(tmp_path):
+    """A response whose text is replaced, so an entry has both halves."""
+    store = TraceStore(tmp_path / "transition.llmtrace")
+    first = store.start_call(
+        {"model": "local", "prompt": "decide\nnow"},
+        session_id="transition",
+        branch_id="main",
+    )
+    store.finish_call(
+        first, "Consider next source line and keep it", metadata={"duration_ms": 5}
+    )
+    second = store.start_call(
+        {"model": "local", "prompt": "decide\nnow please"},
+        session_id="transition",
+        branch_id="main",
+    )
+    store.finish_call(
+        second, "Decide if source line and keep it", metadata={"duration_ms": 5}
+    )
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", second
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_clicking_one_half_of_a_transition_focuses_only_that_half(
+    page: Page, transition_viewer_url
+):
+    url, call_id = transition_viewer_url
+    page.goto(f"{url}/")
+    page.locator(f'.timeline-output[data-call-key="call:{call_id}"]').click()
+    card = page.locator(f'.update-card[data-key="call:{call_id}"][data-phase="output"]')
+    pair = card.locator(".fragment-change").filter(has=page.locator("del")).first
+    expect(pair.locator("del")).not_to_have_count(0)
+    expect(pair.locator("ins")).not_to_have_count(0)
+
+    def focused_tags():
+        return page.evaluate(
+            """() => [...document.querySelectorAll('#mixed .fragment-focus')]
+                 .map(node => node.tagName)"""
+        )
+
+    # Clicking the removed half asks about removed text, and Exact State holds
+    # no removed text, so nothing is flashed there either.
+    pair.locator("del").first.click()
+    page.wait_for_timeout(250)
+    assert set(focused_tags()) == {"DEL"}, focused_tags()
+    assert page.locator("#exact .exact-focus").count() == 0
+
+    # Focus is the last style layer: it has to be visible on top of the kind and
+    # operation decoration, which carry their own outline.
+    decoration = page.evaluate(
+        """() => {
+          const node = document.querySelector('#mixed .fragment-focus');
+          const style = getComputedStyle(node);
+          return [style.outlineWidth, style.outlineColor, style.animationName];
+        }"""
+    )
+    assert decoration[0] == "2px", decoration
+    assert decoration[1] == "rgb(255, 240, 166)", decoration
+    assert decoration[2] == "removed-flash", decoration
+
+    pair.locator("ins").first.click()
+    page.wait_for_timeout(250)
+    assert set(focused_tags()) == {"INS"}, focused_tags()
+
+    # Clicking the entry itself, away from either half, still focuses both.
+    pair.locator(".fragment-location").click()
+    page.wait_for_timeout(250)
+    assert set(focused_tags()) == {"DEL", "INS"}, focused_tags()
+
+    # Kind outlines on stacked inline marks must sit inside their own box, or a
+    # dense stack of marks bleeds its outlines into the neighbouring lines.
+    offsets = page.evaluate(
+        """() => [...document.querySelectorAll(
+             '#mixed .trace-part[class*=\"trace-kind-\"]'
+           )]
+             .filter(node => !node.classList.contains('fragment-focus')
+               && !node.classList.contains('exact-focus'))
+             .map(node => getComputedStyle(node).outlineOffset)"""
+    )
+    assert offsets, "expected inline kind marks in Mixed"
+    assert all(value.startswith("-") or value == "0px" for value in offsets), offsets
+
+
+def test_second_click_joins_the_first_selection_instead_of_cancelling_it(
+    page: Page, repeated_prompt_viewer_url
+):
+    url, call_id, _repeated = repeated_prompt_viewer_url
+    page.goto(f"{url}/")
+    card = page.locator(f'.update-card[data-key="call:{call_id}"][data-phase="input"]')
+    entries = card.locator(".update-jump")
+    expect(entries).not_to_have_count(0)
+    assert entries.count() >= 2
+
+    # Two clicks in a row on the same call, with no wait between them: the
+    # second must not cancel the load the first started, or the focus it was
+    # waiting to apply never arrives.
+    page.evaluate(
+        """(count) => {
+          const jumps = document.querySelectorAll(
+            '.update-card[data-phase="input"] .update-jump'
+          );
+          jumps[0].click();
+          jumps[count - 1].click();
+        }""",
+        arg=entries.count(),
+    )
+    last_index = entries.nth(entries.count() - 1).get_attribute("data-update-index")
+    page.wait_for_function(
+        """(key) => [...document.querySelectorAll('#mixed .fragment-focus')]
+             .some(node => node.dataset.updateEntry === key)""",
+        arg=f"{call_id}:{last_index}",
+        timeout=5000,
+    )
+
+
+def test_switching_phase_on_one_call_clears_the_other_phase_focus(
+    page: Page, transition_viewer_url
+):
+    url, call_id = transition_viewer_url
+    page.goto(f"{url}/")
+
+    # This call changed both its input and its output.
+    page.locator(f'.timeline-input[data-key="call:{call_id}"]').click()
+    page.wait_for_timeout(300)
+    assert page.evaluate(
+        """() => document.querySelectorAll(
+             '#mixed [data-state-scope="input"] .fragment-focus'
+           ).length"""
+    ) > 0
+
+    # Clicking the output event must move focus to output, not add to it: the
+    # input marks left behind would otherwise be what the pane rests on, so the
+    # output click reads as if nothing happened.
+    page.locator(f'.timeline-output[data-call-key="call:{call_id}"]').click()
+    page.wait_for_timeout(400)
+    state = page.evaluate(
+        """() => {
+          const inputFocus = document.querySelectorAll(
+            '#mixed [data-state-scope="input"] .fragment-focus'
+          ).length;
+          const outputFocus = document.querySelectorAll(
+            '#mixed [data-state-scope="output"] .fragment-focus'
+          );
+          const pane = document.querySelector('#mixed').getBoundingClientRect();
+          const rect = outputFocus[0] && outputFocus[0].getBoundingClientRect();
+          return {
+            inputFocus,
+            outputFocus: outputFocus.length,
+            outputInView: rect ? (rect.top < pane.bottom && rect.bottom > pane.top) : false,
+            exactStale: document.querySelectorAll(
+              '#exact [data-state-scope="input"] .exact-focus'
+            ).length,
+          };
+        }"""
+    )
+    assert state["inputFocus"] == 0, state
+    assert state["outputFocus"] > 0, state
+    assert state["outputInView"] is True, state
+    assert state["exactStale"] == 0, state
+
+
+@pytest.fixture
+def add_then_remove_viewer_url(tmp_path):
+    """A call adds a distinctive line; a later call removes it."""
+    store = TraceStore(tmp_path / "addremove.llmtrace")
+    marker = "DISTINCTIVE REMOVED PARAGRAPH ABOUT ENVIRONMENTAL PROTECTION"
+    base = [f"line {i}" for i in range(1, 20)]
+    c1 = store.start_call(
+        {"model": "local", "prompt": "\n".join(base)},
+        session_id="ar",
+        branch_id="main",
+    )
+    store.finish_call(c1, "out one", metadata={"duration_ms": 5})
+    added = base[:5] + [marker] + base[5:]
+    c2 = store.start_call(
+        {"model": "local", "prompt": "\n".join(added)},
+        session_id="ar",
+        branch_id="main",
+    )
+    store.finish_call(c2, "out two", metadata={"duration_ms": 5})
+    # c3 removes the marker again
+    c3 = store.start_call(
+        {"model": "local", "prompt": "\n".join(base)},
+        session_id="ar",
+        branch_id="main",
+    )
+    store.finish_call(c3, "out three", metadata={"duration_ms": 5})
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", c2, c3, marker
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_removed_text_in_mixed_references_the_call_that_removed_it(
+    page: Page, add_then_remove_viewer_url
+):
+    url, adder, remover, marker = add_then_remove_viewer_url
+    page.goto(f"{url}/")
+    page.locator(f'.timeline-input[data-key="call:{remover}"]').click()
+    page.wait_for_timeout(500)
+
+    # The removed marker is shown as removed history, in full, and every removed
+    # copy references the remover — never the call that added it.
+    refs = page.evaluate(
+        """(marker) => [...document.querySelectorAll('#mixed del.removed-part')]
+             .filter(node => node.textContent.includes(marker))
+             .map(node => ({entry: node.dataset.updateEntry, len: node.textContent.length}))""",
+        marker,
+    )
+    assert refs, "removed marker should appear in Mixed"
+    assert all(ref["entry"].startswith(f"{remover}:") for ref in refs), refs
+    assert all(f"{adder}:" not in ref["entry"] for ref in refs), refs
+    assert all(ref["len"] >= len(marker) for ref in refs), refs  # full text, not truncated
+
+    # Clicking it lands on the removing call's entry, on its REMOVED side — so
+    # the reference matches: removed text points to removed text.
+    page.locator("#mixed del.removed-part", has_text=marker).first.click()
+    page.wait_for_timeout(500)
+    landed = page.evaluate(
+        """(marker) => {
+          const active = document.querySelector('.update-jump.active, .update-back-focus');
+          if (!active) return {none: true};
+          const del = active.querySelector('del.removed-part, .removed-part');
+          return {
+            card: active.closest('.update-card')?.dataset.key,
+            removedHasMarker: !!del && del.textContent.includes(marker),
+          };
+        }""",
+        marker,
+    )
+    assert landed.get("card") == f"call:{remover}", landed
+    assert landed.get("removedHasMarker") is True, landed
+
+
+@pytest.fixture
+def multi_change_viewer_url(tmp_path):
+    """A call that changes both a parameter and its prompt in one step."""
+    store = TraceStore(tmp_path / "multi.llmtrace")
+    first = store.start_call(
+        {"model": "local", "prompt": "line one\nline two", "temperature": 0.1},
+        session_id="multi",
+        branch_id="main",
+    )
+    store.finish_call(first, "answer one", metadata={"duration_ms": 5})
+    second = store.start_call(
+        {"model": "local", "prompt": "line one\nline two changed", "temperature": 0.2},
+        session_id="multi",
+        branch_id="main",
+    )
+    store.finish_call(second, "answer two", metadata={"duration_ms": 5})
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", second
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_timeline_input_click_focuses_every_input_entry(
+    page: Page, multi_change_viewer_url
+):
+    url, call_id = multi_change_viewer_url
+    page.goto(f"{url}/")
+    page.locator(f'.timeline-input[data-key="call:{call_id}"]').click()
+    page.wait_for_timeout(400)
+
+    card = page.locator(f'.update-card[data-key="call:{call_id}"][data-phase="input"]')
+    updates = card.locator(".update-jump")
+    focused = card.locator(".update-jump.timeline-update-focus")
+    # The call changed a parameter and the prompt: both entries are input, so
+    # both are focused — not just the first.
+    assert updates.count() >= 2
+    expect(focused).to_have_count(updates.count())
+    labels = focused.locator("strong").all_inner_texts()
+    assert any("parameter" in label.lower() for label in labels), labels
+    assert any("prompt" in label.lower() for label in labels), labels
+
+
+def test_update_focus_flash_does_not_replay_on_live_refresh(
+    page: Page, multi_change_viewer_url
+):
+    url, call_id = multi_change_viewer_url
+    page.goto(f"{url}/")
+    page.evaluate(
+        """() => {
+          window.__flashStarts = 0;
+          document.querySelector("#updates").addEventListener(
+            "animationstart",
+            event => {
+              if (event.animationName === "timeline-update-flash") {
+                window.__flashStarts += 1;
+              }
+            },
+            true,
+          );
+        }"""
+    )
+    page.locator(f'.timeline-input[data-key="call:{call_id}"]').click()
+    page.wait_for_timeout(400)
+    starts_after_click = page.evaluate("() => window.__flashStarts")
+    assert starts_after_click > 0
+
+    # A refresh re-runs renderUpdateCards to reconcile card order. Reconciling
+    # must not re-insert a card that has not moved, or every refresh replays the
+    # focus pulse. Drive the reconcile several times with unchanged order.
+    for _ in range(4):
+        page.evaluate("() => renderUpdateCards(state.timelineItems)")
+        page.wait_for_timeout(150)
+    page.wait_for_timeout(1500)  # let any lingering animation finish
+    assert page.evaluate("() => window.__flashStarts") == starts_after_click, (
+        "focus flash replayed on live refresh"
+    )
+    # Focus itself persists.
+    expect(
+        page.locator(f'.update-card[data-key="call:{call_id}"][data-phase="input"] '
+                     ".update-jump.timeline-update-focus")
+    ).not_to_have_count(0)

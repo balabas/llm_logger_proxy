@@ -13,6 +13,7 @@ const state = {
   mixedSegmentDetails: [],
   liveBusy: false,
   followedUpdateKey: null,
+  pendingSelection: null,
   followedUpdateTimer: null,
   followNewItems: false,
   updatesUserScrollVersion: 0,
@@ -114,6 +115,36 @@ function requestContent(request) {
   return request || {};
 }
 
+// Where each stored message begins inside the rendered content, derived from
+// the serializer's own list structure: a message item is a line at the item
+// indent starting with "- ", and deeper lines belong to it. Nothing here looks
+// at message text, so two identical messages still get distinct spans.
+function messageItemSpans(text, itemIndent) {
+  const marker = `${" ".repeat(itemIndent)}- `;
+  const spans = [];
+  let cursor = 0;
+  while (cursor <= text.length) {
+    const lineEnd = text.indexOf("\n", cursor);
+    if (text.startsWith(marker, cursor)) {
+      // End the previous span before the line break, so a mark never spills
+      // onto the next message's line.
+      if (spans.length) spans[spans.length - 1][1] = Math.max(cursor - 1, 0);
+      spans.push([cursor, text.length]);
+    }
+    if (lineEnd < 0) break;
+    cursor = lineEnd + 1;
+  }
+  return spans;
+}
+
+// A payload is placeable by recorded offset only while the pane renders it
+// verbatim. Structured values are reformatted for display, which invalidates
+// every stored offset, so those fall back to content matching.
+function payloadAnchors(label, value, rendered) {
+  const verbatim = typeof value === "string" && rendered === value;
+  return { payloadStart: label.length, verbatim, messageSpans: null };
+}
+
 function stateDisplayParts(detail) {
   const parameters = requestParameters(detail.request);
   const topParameterText = Object.keys(parameters).length
@@ -122,15 +153,36 @@ function stateDisplayParts(detail) {
   const parameterText = Object.keys(parameters).length
     ? yaml({ input_params: parameters }, 2)
     : "  input_params: {}";
+  const hasPrompt = Object.hasOwn(detail.request || {}, "prompt");
+  const promptLabel = "  prompt:\n";
+  const promptRendered = hasPrompt ? displayValue(detail.request.prompt) : "";
+  const contentText = hasPrompt
+    ? `${promptLabel}${promptRendered}`
+    : yaml(requestContent(detail.request), 2);
+  const thoughtsLabel = "thoughts:\n";
+  const outputLabel = "output:\n";
+  const output = responseValue(detail);
+  const outputRendered = displayValue(output);
   return {
     parameters,
     topParameterText,
     parameterText,
-    contentText: Object.hasOwn(detail.request || {}, "prompt")
-      ? `  prompt:\n${displayValue(detail.request.prompt)}`
-      : yaml(requestContent(detail.request), 2),
-    thoughtsText: `thoughts:\n${detail.thoughts || ""}`,
-    outputText: `output:\n${displayValue(responseValue(detail))}`,
+    contentText,
+    contentAnchors: hasPrompt
+      ? payloadAnchors(promptLabel, detail.request.prompt, promptRendered)
+      : {
+          payloadStart: null,
+          verbatim: false,
+          messageSpans: messageItemSpans(contentText, 4),
+        },
+    thoughtsText: `${thoughtsLabel}${detail.thoughts || ""}`,
+    thoughtsAnchors: payloadAnchors(
+      thoughtsLabel,
+      detail.thoughts || "",
+      detail.thoughts || "",
+    ),
+    outputText: `${outputLabel}${outputRendered}`,
+    outputAnchors: payloadAnchors(outputLabel, output, outputRendered),
   };
 }
 
@@ -161,20 +213,24 @@ function messageStructureHtml(html, includeListLabel = true) {
       '<span class="message-list-label">Messages</span>\n',
     );
   }
+  // A structural key can now be preceded by an update mark that opens on the
+  // line, so keep any leading tags and relabel what follows them.
   content = content
     .replace(
-      /^[ \t]*-[ \t]+content:(?: )?/gm,
-      '<span class="message-field-label">Content</span> ',
+      /^((?:<[^>]+>)*)[ \t]*-[ \t]+content:(?: )?/gm,
+      '$1<span class="message-field-label">Content</span> ',
     )
     .replace(
-      /^[ \t]*role:(?: )?/gm,
-      '<span class="message-field-label message-role-label">Role</span> ',
+      /^((?:<[^>]+>)*)[ \t]*role:(?: )?/gm,
+      '$1<span class="message-field-label message-role-label">Role</span> ',
     )
     .replace(
       /(<span class="message-field-label[^"]*">[^<]+<\/span>) &quot;/g,
       "$1 ",
     )
-    .replace(/&quot;(?=\n|$)/gm, "");
+    // A closing update-mark tag can now sit between the trailing quote and the
+    // line end; the quote is still serializer syntax, not payload.
+    .replace(/&quot;(?=(?:<\/[^>]+>)*(?:\n|$))/gm, "");
   return content;
 }
 
@@ -339,6 +395,9 @@ function updateEntries(detail) {
     if (change.op === "=") continue;
     const oldMessages = change.old_messages || [];
     const newMessages = change.new_messages || change.messages || [];
+    // The hunk records which message indexes it touches; that index is the
+    // position, so identical messages never collapse onto one another.
+    const newStartIndex = Number.isFinite(change.new?.[0]) ? change.new[0] : null;
     if (change.op === "-") {
       for (const message of oldMessages) {
         entries.push({
@@ -347,6 +406,7 @@ function updateEntries(detail) {
           oldText: yaml(message),
           newText: "",
           mixedOldText: yaml(message),
+          messageIndex: newStartIndex,
           anchorNeedle: firstSearchableValue(
             detail.request?.messages?.[change.new?.[0]]?.content,
           ),
@@ -372,6 +432,7 @@ function updateEntries(detail) {
             oldText: oldMessage ? yaml(oldMessage) : "",
             newText: newMessage ? yaml(newMessage) : "",
             mixedOldText: oldMessage ? yaml(oldMessage) : "",
+            messageIndex: newStartIndex == null ? null : newStartIndex + index,
             needle: newMessage ? firstSearchableValue(newMessage.content) : "",
             needles: newMessage ? searchableLines(newMessage.content) : [],
             scope: "input",
@@ -385,6 +446,7 @@ function updateEntries(detail) {
             oldText: yaml(oldMessage),
             newText: yaml(newMessage),
             mixedOldText: firstSearchableValue(oldMessage.content),
+            messageIndex: newStartIndex == null ? null : newStartIndex + index,
             needle: firstSearchableValue(newMessage.content),
             needles: searchableLines(newMessage.content),
             scope: "input",
@@ -395,57 +457,39 @@ function updateEntries(detail) {
       }
       continue;
     }
-    for (const message of newMessages) {
+    newMessages.forEach((message, index) => {
       entries.push({
         label: `Added input · ${message.role || "message"}`,
         text: markedValue("+", message),
         oldText: "",
         newText: yaml(message),
+        messageIndex: newStartIndex == null ? null : newStartIndex + index,
         needle: firstSearchableValue(message.content),
         needles: searchableLines(message.content),
         scope: "input",
         category: "input",
         operation: "+",
       });
-    }
+    });
   }
   const promptHunks = diff.prompt?.hunks || [];
-  for (let hunkIndex = 0; hunkIndex < promptHunks.length; hunkIndex += 1) {
-    const hunk = promptHunks[hunkIndex];
+  for (const hunk of promptHunks) {
     const hasAdded = Object.hasOwn(hunk, "+");
     const hasRemoved = Object.hasOwn(hunk, "-");
     if (!hasAdded && !hasRemoved) continue;
-    const separator = promptHunks[hunkIndex + 1];
-    const following = promptHunks[hunkIndex + 2];
-    const separatorLines = Number.parseInt(separator?.["="], 10);
-    const nearbyReplacement = hasRemoved
-      && !hasAdded
-      && separatorLines <= 1
-      && Object.hasOwn(following || {}, "+")
-      && !Object.hasOwn(following || {}, "-");
-    if (nearbyReplacement) {
-      const removed = hunk["-"]?.preview ?? "";
-      const added = following["+"] ?? "";
-      entries.push({
-        label: "Changed prompt",
-        text: transitionText({ op: "~", old: removed, new: added }),
-        oldText: removed,
-        newText: added,
-        mixedOldText: removed,
-        needle: firstUsefulLine(added),
-        needles: searchableLines(added),
-        scope: "input",
-        category: "input",
-        operation: "~",
-      });
-      hunkIndex += 2;
-      continue;
-    }
+    // Only a hunk the differ itself recorded as a replacement is one. Pairing a
+    // removal with a later insertion because they sit near each other invents a
+    // transition between unrelated lines, and binds both to one identity so
+    // focusing the addition also lights up the removal.
     const operation = hasAdded && hasRemoved ? "~" : hasAdded ? "+" : "-";
-    const removed = hunk["-"]?.preview ?? "";
+    // The full removed text belongs to the call that removed it, so Mixed can
+    // show what was removed in full rather than truncated to a one-line preview.
+    const removed = hunk["-"]?.text ?? hunk["-"]?.preview ?? "";
     const added = hunk["+"] ?? "";
     entries.push({
       label: `${operationName(operation)} prompt`,
+      location: promptLocationLabel(hunk, operation),
+      promptLine: Number.isFinite(hunk.at_new) ? hunk.at_new : null,
       text: operation === "~"
         ? transitionText({ op: "~", old: removed, new: added })
         : markedValue(operation === "+" ? "+" : "−", hasAdded ? added : removed),
@@ -620,7 +664,52 @@ function entryRange(text, entry) {
   return start == null ? null : [start, start + entry.needle.length];
 }
 
-function entryRanges(text, entry) {
+// The store records where every change sits: prompt hunks carry their line,
+// message hunks their index, response fragments their character offsets. Those
+// positions are what place a fragment. Text matching cannot tell two identical
+// lines apart, and cannot place a removed line at all.
+function payloadLineOffset(text, anchors, line) {
+  if (!Number.isFinite(line) || line < 1) return null;
+  let cursor = anchors.payloadStart;
+  for (let remaining = line - 1; remaining > 0; remaining -= 1) {
+    const next = text.indexOf("\n", cursor);
+    if (next < 0) return null;
+    cursor = next + 1;
+  }
+  return cursor <= text.length ? cursor : null;
+}
+
+// Recorded positions describe the call that produced them. An entry replayed
+// from an earlier call in the segment describes that call's text, so its
+// presence in the current state stays a content question.
+function recordedRange(text, entry, anchors) {
+  if (!anchors || entry.fromEarlierCall) return null;
+  if (entry.messageIndex != null && anchors.messageSpans) {
+    const span = anchors.messageSpans[entry.messageIndex];
+    if (!span) return null;
+    return entry.operation === "-" ? [span[0], span[0]] : [span[0], span[1]];
+  }
+  if (!anchors.verbatim || anchors.payloadStart == null) return null;
+  if (entry.promptLine != null) {
+    const start = payloadLineOffset(text, anchors, entry.promptLine);
+    if (start == null) return null;
+    if (entry.operation === "-") return [start, start];
+    const added = entry.newText || "";
+    if (!added || !text.startsWith(added, start)) return null;
+    return [start, start + added.length];
+  }
+  if (entry.newStart != null && entry.newEnd != null) {
+    const start = anchors.payloadStart + entry.newStart;
+    const end = anchors.payloadStart + entry.newEnd;
+    if (end > text.length) return null;
+    return [start, end];
+  }
+  return null;
+}
+
+function entryRanges(text, entry, anchors = null) {
+  const recorded = recordedRange(text, entry, anchors);
+  if (recorded) return [recorded];
   if (!entry.needles?.length) {
     const range = entryRange(text, entry);
     return range ? [range] : [];
@@ -630,6 +719,13 @@ function entryRanges(text, entry) {
   const scopeEnd = entry.scope === "input" && boundary >= 0 ? boundary : text.length;
   const ranges = [];
   let cursor = scopeStart;
+  // Two entries of one call can carry the same text. On the content-matching
+  // path they must still land on different occurrences of it.
+  for (let skipped = entry.occurrence || 0; skipped > 0; skipped -= 1) {
+    const at = text.indexOf(entry.needles[0], cursor);
+    if (at < 0 || at >= scopeEnd) break;
+    cursor = at + Math.max(entry.needles[0].length, 1);
+  }
   for (const needle of entry.needles) {
     const start = text.indexOf(needle, cursor);
     if (start < 0 || start >= scopeEnd) continue;
@@ -652,8 +748,22 @@ function changePartHtml(kind, text, category, inline = false, attributes = "") {
   return `<${tag} class="${classes}"${attributes ? ` ${attributes}` : ""}>${escapeHtml(text)}</${tag}>`;
 }
 
+// Same convention as an output fragment's location, so identical prompt text at
+// two different places is distinguishable at a glance.
+function promptLocationLabel(hunk, operation) {
+  const oldLine = hunk.at_old;
+  const newLine = hunk.at_new;
+  if (operation === "-") return Number.isFinite(oldLine) ? `old ${oldLine}` : "";
+  if (operation === "+") return Number.isFinite(newLine) ? `new ${newLine}` : "";
+  if (!Number.isFinite(oldLine) || !Number.isFinite(newLine)) return "";
+  return oldLine === newLine ? `line ${newLine}` : `old ${oldLine} → new ${newLine}`;
+}
+
 function updateEntryHtml(entry) {
   const category = entry.category || "content";
+  const location = entry.location
+    ? `<span class="fragment-location">${escapeHtml(entry.location)}</span>`
+    : "";
   if (entry.fragments) {
     const grouped = new Map();
     entry.fragments.forEach((fragment, index) => {
@@ -704,7 +814,7 @@ function updateEntryHtml(entry) {
     }).join("")}</div>`;
   }
   if (entry.operation === "~") {
-    return `<div class="change-pair">${
+    return `<div class="change-pair">${location}${
       changePartHtml("removed", entry.oldText || "", category)
     }<span class="change-arrow"> → </span>${
       changePartHtml("added", entry.newText || "", category)
@@ -714,7 +824,7 @@ function updateEntryHtml(entry) {
   const text = entry.operation === "-"
     ? entry.oldText || entry.text
     : entry.newText || entry.text;
-  return `<div class="single-change">${changePartHtml(kind, text, category)}</div>`;
+  return `<div class="single-change">${location}${changePartHtml(kind, text, category)}</div>`;
 }
 
 function updateEntryBodyHtml(entry) {
@@ -726,7 +836,7 @@ function unchangedOutputNoticeHtml(detail) {
   if (detail.output_diff?.mode !== "unchanged") return "";
   const baseCallId = detail.output_diff.base_call_id;
   return `
-    <div class="update-unchanged-output trace-kind-output" data-update-scope="output" role="status">
+    <div class="update-unchanged-output trace-kind-output" data-update-scope="output" role="button" tabindex="0">
       <strong>Unchanged output</strong>
       <small>${baseCallId == null
         ? "Same output as its comparison call"
@@ -734,20 +844,87 @@ function unchangedOutputNoticeHtml(detail) {
     </div>`;
 }
 
-function mixedStateHtml(text, entries) {
+// A call can carry no input update while its output changed. Without a row of
+// its own the input event would fall back to the whole card and pulse the
+// output update, which reads as "the input click focused an output change".
+//
+// A parallel lane forks with no parent state, so nothing it could have changed
+// from exists: the diff baseline is a concurrent sibling picked by arrival
+// order, not an ancestor. Such a lane names no call at all — a reference would
+// contradict the very absence the row reports — and never says "unchanged".
+function parallelLaneInput(detail) {
+  return detail.parent_source === "parallel"
+    || detail.input_parent_source === "sibling";
+}
+
+// With no previous state, nothing in the lane's request is a change — so the
+// card shows the request itself, the way a snapshot card shows one, instead of
+// leaving the moment unrepresented.
+function laneInputSnapshotHtml(detail) {
+  const parameters = requestParameters(detail.request);
+  return `
+    <div class="lane-snapshot">
+      <section class="lane-snapshot-section trace-kind-input" data-lane-scope="input">
+        <strong>Input</strong>
+        ${checkpointInputHtml(detail, requestContent(detail.request))}
+      </section>
+      ${Object.keys(parameters).length ? `
+        <section class="lane-snapshot-section trace-kind-input-params" data-lane-scope="input-params">
+          <strong>Parameters</strong>
+          <pre>${escapeHtml(yaml(parameters))}</pre>
+        </section>` : ""}
+    </div>`;
+}
+
+function unchangedInputNoticeHtml(detail, entries) {
+  if (entries.some(entry => entry.scope === "input")) return "";
+  const baseCallId = detail.input_parent_call_id;
+  if (parallelLaneInput(detail)) {
+    return `
+      <div class="update-unchanged-input trace-kind-input" data-update-scope="input" role="button" tabindex="0">
+        <strong>Parallel lane input</strong>
+        <small>No previous state to compare</small>
+      </div>`;
+  }
+  return `
+    <div class="update-unchanged-input trace-kind-input" data-update-scope="input" role="button" tabindex="0">
+      <strong>Unchanged input</strong>
+      <small>${baseCallId == null
+        ? "Same input as its comparison call"
+        : `Same input as call #${escapeHtml(baseCallId)}`}</small>
+    </div>`;
+}
+
+function mixedStateHtml(text, entries, anchors = null) {
   const boundary = text.indexOf("\noutput:");
+  // Text that some entry explicitly removed. A removal owns its removed text and
+  // links it back to the call that did the removing, so a later re-drawing of
+  // that same text (an earlier addition now gone) would only duplicate it and,
+  // worse, point removed text at the call that ADDED it. So an addition-now-gone
+  // is shown as removed history only when no real removal already covers it —
+  // which keeps grow-never-lose while fixing the del→added-side mismatch.
+  const removedByEntry = new Set();
+  for (const entry of entries) {
+    if (entry.operation === "-" || entry.operation === "~") {
+      const removed = entry.oldText || entry.mixedOldText || entry.text || "";
+      if (removed) removedByEntry.add(removed);
+    }
+  }
   const changes = [];
   for (const entry of entries) {
     if (entry.operation === "-") {
-      let position = -1;
-      if (entry.anchorNeedle) position = text.indexOf(entry.anchorNeedle);
+      // Removed text is placed where the store says it used to be, so it stays
+      // in its own neighbourhood instead of being parked at the scope end.
+      const recorded = recordedRange(text, entry, anchors);
+      let position = recorded ? recorded[0] : -1;
+      if (position < 0 && entry.anchorNeedle) position = text.indexOf(entry.anchorNeedle);
       if (position < 0) {
         position = entry.scope === "input" && boundary >= 0 ? boundary : text.length;
       }
       changes.push({ start: position, end: position, entry });
       continue;
     }
-    const ranges = entryRanges(text, entry);
+    const ranges = entryRanges(text, entry, anchors);
     ranges.forEach((range, rangeIndex) => {
       changes.push({
         start: range[0],
@@ -766,11 +943,45 @@ function mixedStateHtml(text, entries) {
     }
   }
   if (!changes.length) return escapeHtml(text);
-  changes.sort((left, right) => left.start - right.start || left.end - right.end);
+  // A flat text can carry only one mark per character, so overlapping spans
+  // compete — and the selected call's own change must win. An earlier call's
+  // retained span, especially a whole-scope one, would otherwise swallow every
+  // fragment of the call being looked at and leave it with no focus target.
+  // Nothing is dropped: what loses is kept as retained history instead.
+  const placed = [];
+  const claimed = [];
+  const ordered = [...changes].sort((left, right) => (
+    (left.entry.fromEarlierCall ? 1 : 0) - (right.entry.fromEarlierCall ? 1 : 0)
+    || left.start - right.start
+    || left.end - right.end
+  ));
+  for (const change of ordered) {
+    // A zero-width anchor claims nothing, so it can never collide.
+    if (change.historical || change.start === change.end) {
+      placed.push(change);
+      continue;
+    }
+    const collides = claimed.some(
+      span => change.start < span[1] && span[0] < change.end,
+    );
+    if (collides) {
+      placed.push({ ...change, historical: true, start: text.length, end: text.length });
+      continue;
+    }
+    claimed.push([change.start, change.end]);
+    placed.push(change);
+  }
+  placed.sort((left, right) => left.start - right.start || left.end - right.end);
   let html = "";
   let cursor = 0;
-  for (const change of changes) {
-    if (change.start < cursor) continue;
+  for (const change of placed) {
+    if (change.start < cursor) {
+      // An anchor inside an already-rendered span still deserves its place:
+      // move it to the cursor rather than losing the fragment.
+      if (change.start !== change.end) continue;
+      change.start = cursor;
+      change.end = cursor;
+    }
     const { entry } = change;
     const category = entry.category || "content";
     html += escapeHtml(text.slice(cursor, change.start));
@@ -782,19 +993,22 @@ function mixedStateHtml(text, entries) {
     if (change.historical) {
       const oldText = entry.oldText || entry.mixedOldText || "";
       const newText = entry.newText || entry.text || "";
+      // The selected call's own absent addition is still "added" (it is what the
+      // call produced). An earlier call's absent addition is retained as removed
+      // history — unless a real removal entry already shows that exact text, in
+      // which case that removal owns it with the correct del↔del reference.
+      const ownedByRemoval = entry.fromEarlierCall
+        && newText
+        && removedByEntry.has(newText);
+      const showNew = newText && entry.operation !== "-" && !ownedByRemoval;
+      const newKind = entry.fromEarlierCall ? "removed" : "added";
       html += "\n";
       if (entry.operation === "~" && oldText) {
         html += changePartHtml("removed", oldText, category, false, entryAttribute);
-        html += '<span class="change-arrow inline-arrow"> → </span>';
+        if (showNew) html += '<span class="change-arrow inline-arrow"> → </span>';
       }
-      if (entry.operation !== "-" && newText) {
-        html += changePartHtml(
-          entry.fromEarlierCall ? "removed" : "added",
-          newText,
-          category,
-          false,
-          entryAttribute,
-        );
+      if (showNew) {
+        html += changePartHtml(newKind, newText, category, false, entryAttribute);
       }
       html += "\n";
     } else if (entry.operation === "-") {
@@ -836,6 +1050,10 @@ function mixedOutputEntries(entries) {
       oldText: fragment.old || "",
       newText: fragment.new || "",
       mixedOldText: fragment.old || "",
+      // The offsets the store recorded for this fragment, so two identical
+      // fragments stay two fragments in Mixed as well as in Exact.
+      newStart: fragment.new_start,
+      newEnd: fragment.new_end,
       needle: firstUsefulLine(fragment.new),
       needles: searchableLines(fragment.new),
     }));
@@ -901,17 +1119,75 @@ function ensureObserver() {
   }, { root: $("updates"), rootMargin: "500px" });
 }
 
-function appendUpdateCard(item) {
+function phaseLabel(phase) {
+  return phase === "output" ? "← output" : "→ input";
+}
+
+function updateCardHeadHtml(id, phase) {
+  return `<div class="update-card-head trace-kind-${phase}">
+      <span class="update-card-phase">${phaseLabel(phase)}</span>
+      <span>LLM call #${escapeHtml(id)}</span>
+    </div>`;
+}
+
+function createUpdateCard(item, phase) {
   ensureObserver();
-  const key = itemKey(item);
   const card = document.createElement("article");
-  card.className = "update-card loading";
-  card.dataset.key = key;
+  card.className = `update-card update-card-${phase} trace-kind-${phase} loading`;
+  card.dataset.key = itemKey(item);
+  card.dataset.phase = phase;
   card.dataset.type = item.type;
   card.dataset.id = item.id;
-  card.innerHTML = `<div class="update-card-head">LLM call #${item.id}</div>`;
-  $("updates").appendChild(card);
+  card.innerHTML = updateCardHeadHtml(item.id, phase);
   state.observer.observe(card);
+  return card;
+}
+
+function updateCardId(card) {
+  return `${card.dataset.key}:${card.dataset.phase}`;
+}
+
+// One card per phase, laid out in timeline event order. Existing cards are
+// moved rather than rebuilt, so loaded content and pending detail requests
+// survive a reorder — an earlier call completing inserts its output card
+// between later inputs without disturbing the rest.
+function renderUpdateCards(items) {
+  const updates = $("updates");
+  const existing = new Map();
+  updates.querySelectorAll(".update-card").forEach(card => {
+    existing.set(updateCardId(card), card);
+  });
+  const ordered = timelinePhaseEvents(items).sort(compareTimelineEvents);
+  const desired = [];
+  for (const { item, phase } of ordered) {
+    const id = `${itemKey(item)}:${phase}`;
+    const card = existing.get(id) || createUpdateCard(item, phase);
+    existing.delete(id);
+    desired.push(card);
+  }
+  existing.forEach(card => {
+    state.observer?.unobserve(card);
+    card.remove();
+  });
+  // Reconcile order in place: a card that is already where it belongs is left
+  // untouched. Re-inserting a node — even to the same spot — restarts every CSS
+  // animation on it and its descendants, so a blanket rebuild would replay the
+  // focus flash on every live refresh. Only genuinely out-of-order or new cards
+  // are moved.
+  let ref = updates.firstChild;
+  for (const card of desired) {
+    if (card === ref) {
+      ref = ref.nextSibling;
+    } else {
+      updates.insertBefore(card, ref);
+    }
+  }
+}
+
+function updateCardFor(key, phase = "input") {
+  return document.querySelector(
+    `.update-card[data-key="${key}"][data-phase="${phase}"]`,
+  ) || document.querySelector(`.update-card[data-key="${key}"]`);
 }
 
 function timelineCallBlocks(items) {
@@ -946,19 +1222,39 @@ function timelineCallBlocks(items) {
   return blocks;
 }
 
-function renderTimelineEvents(items) {
+// A call occupies two moments: the request leaves at created_at, the response
+// lands duration_ms later. Timeline and Updates order the same event list, so
+// both panes tell the same history — interleaved when calls overlap.
+// An item without a usable timestamp still needs a defined position: park it at
+// the end of history rather than letting NaN make the comparison inconsistent.
+const UNDATED_EVENT_AT = 8.64e15;
+
+function timelinePhaseEvents(items) {
   const events = [];
   for (const item of items) {
-    const startedAt = Date.parse(item.created_at);
+    const parsedStart = Date.parse(item.created_at);
+    const dated = Number.isFinite(parsedStart);
+    const startedAt = dated ? parsedStart : UNDATED_EVENT_AT;
     events.push({ item, phase: "input", at: startedAt, sortOrder: 3 });
     if (item.status !== "running") {
       const duration = Number(item.duration_ms);
-      const completedAt = Number.isFinite(startedAt) && Number.isFinite(duration)
+      const completedAt = dated && Number.isFinite(duration)
         ? startedAt + Math.max(duration, 0)
-        : startedAt + 0.001;
+        : startedAt + 1;
       events.push({ item, phase: "output", at: completedAt, sortOrder: 0 });
     }
   }
+  return events;
+}
+
+function compareTimelineEvents(left, right) {
+  return left.at - right.at
+    || left.sortOrder - right.sortOrder
+    || (left.item?.sequence || 0) - (right.item?.sequence || 0);
+}
+
+function renderTimelineEvents(items) {
+  const events = timelinePhaseEvents(items);
   for (const [index, block] of timelineCallBlocks(items).entries()) {
     if (block.calls.length < 2) continue;
     const branchCount = new Set(
@@ -981,11 +1277,7 @@ function renderTimelineEvents(items) {
       });
     }
   }
-  events.sort((left, right) => (
-    left.at - right.at
-    || left.sortOrder - right.sortOrder
-    || (left.item?.sequence || 0) - (right.item?.sequence || 0)
-  ));
+  events.sort(compareTimelineEvents);
 
   $("timeline").innerHTML = "";
   for (const event of events) {
@@ -1052,9 +1344,12 @@ function captureTimelineViewport() {
   };
 }
 
-function restoreTimelineViewport(anchor) {
+// Sticking to the newest end is following, so it belongs to Follow. With the
+// option off, a viewport that happens to sit at the bottom must stay where the
+// user left it instead of being dragged along by every arriving event.
+function restoreTimelineViewport(anchor, stickToNewest = state.followNewItems) {
   const container = $("timeline");
-  if (anchor.nearBottom) {
+  if (anchor.nearBottom && stickToNewest) {
     container.scrollTop = container.scrollHeight;
     return;
   }
@@ -1067,6 +1362,32 @@ function restoreTimelineViewport(anchor) {
   if (!target) return;
   const currentOffset =
     target.getBoundingClientRect().top - container.getBoundingClientRect().top;
+  container.scrollTop += currentOffset - anchor.offset;
+}
+
+// Update cards are moved, not rebuilt, so the anchor holds the element itself:
+// an output card inserted above the viewport must not shift what is on screen.
+function captureUpdatesViewport() {
+  const container = $("updates");
+  const containerRect = container.getBoundingClientRect();
+  const visibleCard = [...container.querySelectorAll(".update-card")].find(node => {
+    const rect = node.getBoundingClientRect();
+    return rect.bottom > containerRect.top && rect.top < containerRect.bottom;
+  });
+  return {
+    card: visibleCard || null,
+    offset: visibleCard
+      ? visibleCard.getBoundingClientRect().top - containerRect.top
+      : null,
+  };
+}
+
+function restoreUpdatesViewport(anchor, fallbackScrollTop) {
+  const container = $("updates");
+  container.scrollTop = fallbackScrollTop;
+  if (!anchor.card?.isConnected || anchor.offset == null) return;
+  const currentOffset =
+    anchor.card.getBoundingClientRect().top - container.getBoundingClientRect().top;
   container.scrollTop += currentOffset - anchor.offset;
 }
 
@@ -1124,9 +1445,7 @@ function applyBranchIndentation() {
 
 function keepFollowedUpdateVisible() {
   if (!state.followedUpdateKey) return;
-  const card = document.querySelector(
-    `.update-card[data-key="${state.followedUpdateKey}"]`,
-  );
+  const card = updateCardFor(state.followedUpdateKey, state.selectedPhase);
   card?.scrollIntoView({ behavior: "auto", block: "nearest" });
   window.clearTimeout(state.followedUpdateTimer);
   state.followedUpdateTimer = window.setTimeout(() => {
@@ -1227,36 +1546,51 @@ function focusedFragmentEntry(entry, indices) {
   };
 }
 
-function focusMixedFragments(indices, entry) {
+// Clicking one side of a transition asks about that side. Mixed renders the
+// removed half as <del> and the present half as <ins>, so the clicked part
+// selects which of them is focused; clicking elsewhere in the entry focuses the
+// change as a whole.
+function clickedPartKind(event) {
+  const part = event?.target?.closest?.("del, ins");
+  if (!part) return null;
+  return part.tagName === "DEL" ? "removed" : "added";
+}
+
+function partMatches(node, part) {
+  if (!part) return true;
+  return part === "removed" ? node.tagName === "DEL" : node.tagName === "INS";
+}
+
+function applyMixedFocus(targets) {
   $("mixed").querySelectorAll(".fragment-focus").forEach(node => {
     node.classList.remove("fragment-focus", "flash");
   });
-  const targets = indices.flatMap(index => (
-    [...$("mixed").querySelectorAll(
-      `[data-update-entry="${entry.entryKey}"][data-output-fragment="${index}"]`,
-    )]
-  ));
   for (const target of targets) {
+    // Restart the pulse when the same target is chosen again.
+    void target.offsetWidth;
     target.classList.add("fragment-focus", "flash");
   }
   focusScrollIntoView(targets[0]);
 }
 
-function focusMixedEntry(entry) {
+function focusMixedFragments(indices, entry, part = null) {
+  const targets = indices.flatMap(index => (
+    [...$("mixed").querySelectorAll(
+      `[data-update-entry="${entry.entryKey}"][data-output-fragment="${index}"]`,
+    )]
+  )).filter(node => partMatches(node, part));
+  applyMixedFocus(targets);
+}
+
+function focusMixedEntry(entry, part = null) {
   if (entry.fragments) {
-    focusMixedFragments(entry.fragments.map((_, index) => index), entry);
+    focusMixedFragments(entry.fragments.map((_, index) => index), entry, part);
     return;
   }
-  $("mixed").querySelectorAll(".fragment-focus").forEach(node => {
-    node.classList.remove("fragment-focus", "flash");
-  });
   const targets = [
     ...$("mixed").querySelectorAll(`[data-update-entry="${entry.entryKey}"]`),
-  ];
-  for (const target of targets) {
-    target.classList.add("fragment-focus", "flash");
-  }
-  focusScrollIntoView(targets[0]);
+  ].filter(node => partMatches(node, part));
+  applyMixedFocus(targets);
 }
 
 function focusCheckpointScope(scope) {
@@ -1275,6 +1609,46 @@ function focusCheckpointScope(scope) {
     target?.classList.add("checkpoint-pane-focus");
     focusScrollIntoView(target, "start");
   }
+}
+
+// A card is a navigation control for its own phase, not only a container for
+// entries: a card whose body is a scope notice must still select its call and
+// activate the matching timeline event.
+// Only input events carry data-key, so a card must hand selectItem the event
+// element for its own phase: left to its fallback lookup, every update in an
+// output card would activate that call's input.
+function timelineEventFor(callId, phase) {
+  const key = `call:${callId}`;
+  return phase === "output"
+    ? document.querySelector(`.timeline-output[data-call-key="${key}"]`)
+    : document.querySelector(`.timeline-input[data-key="${key}"]`);
+}
+
+async function selectPhaseFromCard(card) {
+  const id = Number(card.dataset.id);
+  await selectItem("call", id, timelineEventFor(id, card.dataset.phase), true);
+}
+
+// Entries, fragments, and checkpoint sections carry a more specific target, so
+// they keep their own handlers; the card answers for everything else.
+const CARD_OWN_CONTROLS =
+  ".update-jump, .fragment-change, .checkpoint-section, .checkpoint-jump, .identical-jump";
+
+function bindCardPhaseSelection(card) {
+  if (card.dataset.phaseBound) return;
+  card.dataset.phaseBound = "true";
+  card.addEventListener("click", event => {
+    if (event.target.closest(CARD_OWN_CONTROLS)) return;
+    if (hasTextSelectionWithin(card)) return;
+    selectPhaseFromCard(card);
+  });
+  card.addEventListener("keydown", event => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const target = event.target.closest("[data-update-scope]");
+    if (!target || target.closest(CARD_OWN_CONTROLS)) return;
+    event.preventDefault();
+    selectPhaseFromCard(card);
+  });
 }
 
 async function loadUpdateCard(card) {
@@ -1304,7 +1678,7 @@ async function loadUpdateCard(card) {
     card.querySelector("button")?.addEventListener("click", () => {
       card.classList.remove("load-error");
       card.classList.add("loading");
-      card.innerHTML = `<div class="update-card-head">LLM call #${escapeHtml(card.dataset.id)}</div>`;
+      card.innerHTML = updateCardHeadHtml(card.dataset.id, card.dataset.phase || "input");
       loadUpdateCard(card);
     });
     return;
@@ -1312,9 +1686,16 @@ async function loadUpdateCard(card) {
   delete card.dataset.loading;
   card.dataset.loaded = "true";
   card.classList.remove("load-error");
+  bindCardPhaseSelection(card);
+  const phase = card.dataset.phase || "input";
   const checkpoint = isCheckpoint(detail);
   const identicalTo = identicalBaseCall(detail);
   const entries = updateEntries(detail);
+  const phaseEntries = entries.filter(entry => (
+    phase === "output"
+      ? entry.scope === "output" || entry.scope === "thoughts"
+      : entry.scope === "input"
+  ));
   card.classList.remove("loading");
   card.classList.toggle("checkpoint", checkpoint);
   const timelineItem = document.querySelector(
@@ -1335,7 +1716,23 @@ async function loadUpdateCard(card) {
     const input = requestContent(detail.request);
     const parameters = requestParameters(detail.request);
     const output = responseValue(detail);
-    card.innerHTML = `
+    // The snapshot splits along the same seam as the timeline: the request it
+    // flushed to, then the response that arrived against it.
+    card.innerHTML = phase === "output"
+      ? `
+      ${updateCardHeadHtml(detail.id, phase)}
+      <div class="checkpoint-state">
+        ${detail.thoughts ? `
+          <section class="checkpoint-section checkpoint-thoughts trace-kind-thoughts" role="button" tabindex="0" data-checkpoint-scope="thoughts">
+            <strong>Thoughts</strong>
+            <pre>${escapeHtml(detail.thoughts)}</pre>
+          </section>` : ""}
+        <section class="checkpoint-section checkpoint-output trace-kind-output" role="button" tabindex="0" data-checkpoint-scope="output">
+          <strong>Output</strong>
+          <pre>${escapeHtml(displayValue(output))}</pre>
+        </section>
+      </div>`
+      : `
       <button class="checkpoint-jump">
         <strong>◆ New current state</strong>
         <span>LLM call #${detail.id}</span>
@@ -1350,26 +1747,21 @@ async function loadUpdateCard(card) {
             <strong>Parameters</strong>
             <pre>${escapeHtml(yaml(parameters))}</pre>
           </section>` : ""}
-        ${detail.thoughts ? `
-          <section class="checkpoint-section checkpoint-thoughts trace-kind-thoughts" role="button" tabindex="0" data-checkpoint-scope="thoughts">
-            <strong>Thoughts</strong>
-            <pre>${escapeHtml(detail.thoughts)}</pre>
-          </section>` : ""}
-        <section class="checkpoint-section checkpoint-output trace-kind-output" role="button" tabindex="0" data-checkpoint-scope="output">
-          <strong>Output</strong>
-          <pre>${escapeHtml(displayValue(output))}</pre>
-        </section>
       </div>`;
     const openScope = async scope => {
       if (hasTextSelectionWithin(card)) return;
-      await selectItem("call", detail.id, null, true);
+      await selectItem(
+        "call", detail.id, timelineEventFor(detail.id, phase), true, false,
+      );
       focusCheckpointScope(scope);
       card.querySelectorAll(".checkpoint-section.active").forEach(node => {
         node.classList.remove("active");
       });
       card.querySelector(`[data-checkpoint-scope="${scope}"]`)?.classList.add("active");
     };
-    card.querySelector("button").onclick = () => openScope("input");
+    card.querySelector(".checkpoint-jump")?.addEventListener("click", () => {
+      openScope("input");
+    });
     card.querySelectorAll("[data-checkpoint-scope]").forEach(section => {
       section.onclick = () => openScope(section.dataset.checkpointScope);
       section.onkeydown = event => {
@@ -1382,42 +1774,61 @@ async function loadUpdateCard(card) {
     keepFollowedUpdateVisible();
     return;
   }
-  if (identicalTo) {
+  // The identity statement covers the whole call, so it stays a single compact
+  // card at the input moment; the output card still carries its unchanged row.
+  if (identicalTo && phase === "input") {
     card.classList.add("identical");
     card.innerHTML = `
-      <button class="identical-jump" data-update-scope="output">
+      <button class="identical-jump" data-update-scope="input">
         <strong>↻ Identical call</strong>
         <span>LLM call #${detail.id} = call #${identicalTo}</span>
         <small>No input, parameter, or output changes</small>
       </button>`;
-    card.querySelector("button").onclick = () => selectItem("call", detail.id, null, true);
+    card.querySelector("button").onclick = () => selectItem(
+      "call", detail.id, timelineEventFor(detail.id, phase), true, false,
+    );
     keepFollowedUpdateVisible();
     return;
   }
+  // Each phase carries its own scope notice, so a phase with nothing to show
+  // still owns a focus target instead of borrowing the other phase's updates.
+  const notice = phase === "output"
+    ? unchangedOutputNoticeHtml(detail)
+    : unchangedInputNoticeHtml(detail, entries);
+  const laneSnapshot = phase !== "output" && notice && parallelLaneInput(detail)
+    ? laneInputSnapshotHtml(detail)
+    : "";
+  const entriesHtml = phaseEntries.map(entry => `
+    <div class="update-jump ${escapeHtml(entry.category || "content")}-update-card trace-kind-${traceKind(entry.category)} trace-op-${traceOperation(entry.operation)} op-${escapeHtml(entry.operation || "change")}" data-update-index="${entry.entryIndex}" role="button" tabindex="0">
+      <strong>${escapeHtml(entry.label)}</strong>
+      ${updateEntryBodyHtml(entry)}
+    </div>`).join("");
   card.innerHTML = `
-    <div class="update-card-head">Δ LLM call #${detail.id}</div>
+    ${updateCardHeadHtml(detail.id, phase)}
     <div class="update-card-body">
-      ${entries.map((entry, index) => `
-        <div class="update-jump ${escapeHtml(entry.category || "content")}-update-card trace-kind-${traceKind(entry.category)} trace-op-${traceOperation(entry.operation)} op-${escapeHtml(entry.operation || "change")}" data-update-index="${index}" role="button" tabindex="0">
-          <strong>${escapeHtml(entry.label)}</strong>
-          ${updateEntryBodyHtml(entry)}
-        </div>`).join("") || '<div class="no-update">No textual update</div>'}
-      ${unchangedOutputNoticeHtml(detail)}
+      ${phase === "output" ? entriesHtml : notice + laneSnapshot + entriesHtml}
+      ${phase === "output" ? notice : ""}
+      ${entriesHtml || notice ? "" : '<div class="no-update">No textual update</div>'}
     </div>`;
   card.querySelectorAll(".update-jump").forEach(button => {
-    const openUpdate = async () => {
+    const openUpdate = async event => {
       if (hasTextSelectionWithin(button)) return;
       const entry = entries[Number(button.dataset.updateIndex)];
-      await selectItem("call", detail.id, null, true);
+      const part = clickedPartKind(event);
+      await selectItem(
+        "call", detail.id, timelineEventFor(detail.id, phase), true, false,
+      );
       activateTab("state");
-      renderExact(entry);
-      focusMixedEntry(entry);
+      // Removed text is absent from Exact State by definition, so a click on
+      // the removed half must not flash the present half there instead.
+      renderExact(part === "removed" ? null : entry);
+      focusMixedEntry(entry, part);
     };
     button.onclick = openUpdate;
     button.onkeydown = event => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
-        openUpdate();
+        openUpdate(event);
       }
     };
   });
@@ -1431,10 +1842,13 @@ async function loadUpdateCard(card) {
         .split(",")
         .map(Number);
       const focusedEntry = focusedFragmentEntry(entry, indices);
-      await selectItem("call", detail.id, null, true);
+      const part = clickedPartKind(event);
+      await selectItem(
+        "call", detail.id, timelineEventFor(detail.id, phase), true, false,
+      );
       activateTab("state");
-      renderExact(focusedEntry);
-      focusMixedFragments(indices, entry);
+      renderExact(part === "removed" ? null : focusedEntry);
+      focusMixedFragments(indices, entry, part);
       card.querySelectorAll(".fragment-change.active").forEach(node => {
         node.classList.remove("active");
       });
@@ -1472,16 +1886,36 @@ async function loadMixedSegment(type, id, selectionVersion = null) {
     return selectionIsCurrent();
   }
   const details = [];
-  for (let index = selectedIndex; index >= 0; index -= 1) {
+  // The walk back to the checkpoint is sequential, but its fetches need not be:
+  // one round trip per call made selecting a long segment take most of a second,
+  // which is the window in which a second click cancels the first.
+  const WINDOW = 12;
+  let index = selectedIndex;
+  let reachedCheckpoint = false;
+  while (index >= 0 && !reachedCheckpoint) {
+    const windowStart = Math.max(index - WINDOW + 1, 0);
+    const warming = [];
+    for (let at = index; at >= windowStart; at -= 1) {
+      const item = state.timelineItems[at];
+      if (item.type === "call" && Number(item.id) !== Number(id)) {
+        warming.push(detailFor(item.type, item.id).catch(() => null));
+      }
+    }
+    await Promise.all(warming);
     if (!selectionIsCurrent()) return false;
-    const item = state.timelineItems[index];
-    if (item.type !== "call") continue;
-    const detail = Number(item.id) === Number(id)
-      ? selectedDetail
-      : await detailFor(item.type, item.id);
-    if (!selectionIsCurrent()) return false;
-    details.unshift(detail);
-    if (isCheckpoint(detail)) break;
+    for (; index >= windowStart; index -= 1) {
+      const item = state.timelineItems[index];
+      if (item.type !== "call") continue;
+      const detail = Number(item.id) === Number(id)
+        ? selectedDetail
+        : await detailFor(item.type, item.id);
+      if (!selectionIsCurrent()) return false;
+      details.unshift(detail);
+      if (isCheckpoint(detail)) {
+        reachedCheckpoint = true;
+        break;
+      }
+    }
   }
   if (!selectionIsCurrent()) return false;
   state.mixedSegmentDetails = details;
@@ -1526,7 +1960,7 @@ function renderMixed(previousDetail = null) {
   const parameterHtml = mixedStateHtml(parts.parameterText, parameterEntries);
   const contentHtml = inputContentHtml(
     state.detail,
-    mixedStateHtml(parts.contentText, inputEntries),
+    mixedStateHtml(parts.contentText, inputEntries, parts.contentAnchors),
   );
   const inputHtml = stateScopeHtml(
     "input",
@@ -1536,14 +1970,14 @@ function renderMixed(previousDetail = null) {
     "output",
     checkpoint
       ? escapeHtml(parts.outputText)
-      : mixedStateHtml(parts.outputText, outputEntries),
+      : mixedStateHtml(parts.outputText, outputEntries, parts.outputAnchors),
   );
   const thoughtsHtml = state.detail.thoughts
     ? stateScopeHtml(
         "thoughts",
         checkpoint
           ? escapeHtml(parts.thoughtsText)
-          : mixedStateHtml(parts.thoughtsText, thoughtsEntries),
+          : mixedStateHtml(parts.thoughtsText, thoughtsEntries, parts.thoughtsAnchors),
       )
     : "";
   $("mixed-status").textContent = checkpoint
@@ -1564,13 +1998,29 @@ function activateTab(tab) {
   });
 }
 
-function exactUpdateRanges(text, entries) {
+function exactUpdateRanges(text, entries, anchors = null) {
   const updates = [];
   for (const entry of entries) {
     if (entry.operation === "-") continue;
     if (entry.fragments) {
       let searchFrom = 0;
       entry.fragments.forEach((fragment, fragmentIndex) => {
+        // Each fragment carries its own offsets into the stored payload.
+        const recorded = recordedRange(
+          text,
+          { ...entry, newStart: fragment.new_start, newEnd: fragment.new_end },
+          anchors,
+        );
+        if (recorded && recorded[1] > recorded[0]) {
+          updates.push({
+            start: recorded[0],
+            end: recorded[1],
+            entry,
+            fragmentIndex,
+          });
+          searchFrom = recorded[1];
+          return;
+        }
         for (const needle of searchableLines(fragment.new)) {
           const start = text.indexOf(needle, searchFrom);
           if (start < 0) continue;
@@ -1585,15 +2035,15 @@ function exactUpdateRanges(text, entries) {
       });
       continue;
     }
-    for (const [start, end] of entryRanges(text, entry)) {
+    for (const [start, end] of entryRanges(text, entry, anchors)) {
       updates.push({ start, end, entry, fragmentIndex: null });
     }
   }
   return updates.sort((left, right) => left.start - right.start || left.end - right.end);
 }
 
-function exactStateHtml(text, entries, focusEntry = null) {
-  const ranges = exactUpdateRanges(text, entries);
+function exactStateHtml(text, entries, focusEntry = null, anchors = null) {
+  const ranges = exactUpdateRanges(text, entries, anchors);
   if (!ranges.length) return escapeHtml(text);
   let html = "";
   let cursor = 0;
@@ -1632,18 +2082,21 @@ function renderExact(focusEntry = null) {
         parts.contentText,
         entries.filter(entry => entry.scope === "input" && entry.category !== "parameter"),
         focusEntry,
+        parts.contentAnchors,
       ),
     );
     const outputHtml = exactStateHtml(
       parts.outputText,
       entries.filter(entry => entry.scope === "output"),
       focusEntry,
+      parts.outputAnchors,
     );
     const thoughtsHtml = state.detail.thoughts
       ? exactStateHtml(
           parts.thoughtsText,
           entries.filter(entry => entry.scope === "thoughts"),
           focusEntry,
+          parts.thoughtsAnchors,
         )
       : "";
     $("exact").innerHTML = `${
@@ -1689,7 +2142,28 @@ function renderExact(focusEntry = null) {
   }
 }
 
+// Focus decoration from a previous selection must be cleared, not added to. A
+// fresh renderMixed/renderExact already wipes it, but a re-selection that reuses
+// the rendered panes does not — so clearing here keeps this correct for every
+// caller, and a click on one phase never leaves the other phase's marks behind.
+function clearPaneFocus() {
+  for (const pane of [$("mixed"), $("exact")]) {
+    pane.querySelectorAll(
+      ".fragment-focus, .exact-focus, .timeline-scope-focus, .checkpoint-pane-focus, .flash",
+    ).forEach(node => {
+      node.classList.remove(
+        "fragment-focus",
+        "exact-focus",
+        "timeline-scope-focus",
+        "checkpoint-pane-focus",
+        "flash",
+      );
+    });
+  }
+}
+
 function focusTimelineSelection(detail, preferredScope = "input") {
+  clearPaneFocus();
   const panes = [$("mixed"), $("exact")];
   if (isCheckpoint(detail)) {
     for (const pane of panes) {
@@ -1782,24 +2256,44 @@ function focusTimelineUpdateCard(card, entryKey = null, preferredScope = "input"
     node.classList.remove("active", "update-back-focus");
   });
   if (!card) return;
+  const isOutput = preferredScope === "output" || preferredScope === "thoughts";
   const entryIndex = entryKey?.split(":").at(-1);
-  const update = entryIndex == null
+  const primary = entryIndex == null
     ? null
     : card.querySelector(`.update-jump[data-update-index="${entryIndex}"]`);
+  // A phase click focuses every change of that phase, not just the first: a call
+  // that changed both its parameters and its prompt lights both. The entry's
+  // data kind decides the phase it belongs to, so nested and sibling references
+  // are all considered rather than only the primary one.
+  const scopeSelector = isOutput
+    ? ".update-jump.output-update-card, .update-jump.thoughts-update-card"
+    : ".update-jump.input-update-card, .update-jump.parameter-update-card";
+  const phaseUpdates = [...card.querySelectorAll(scopeSelector)];
   const checkpointTarget = card.classList.contains("checkpoint")
     ? card.querySelector(`[data-checkpoint-scope="${preferredScope}"]`)
     : null;
-  const unchangedOutputTarget = preferredScope === "output"
+  const unchangedOutputTarget = isOutput
     ? card.querySelector('[data-update-scope="output"]')
     : null;
-  const target = update || checkpointTarget || unchangedOutputTarget || card;
-  // Force a fresh animation frame so a second click on the same event pulses
-  // the corresponding update again.
-  void target.offsetWidth;
-  target.classList.add("timeline-update-focus", "timeline-update-flash");
+  // An input phase never falls through to the card as a whole, because the
+  // card body may hold only output updates.
+  const unchangedInputTarget = !isOutput
+    ? card.querySelector('[data-update-scope="input"]')
+    : null;
+  const scopeTarget = unchangedOutputTarget || unchangedInputTarget;
+  const marks = phaseUpdates.length
+    ? phaseUpdates
+    : [checkpointTarget || scopeTarget || card];
+  const scrollTarget = primary && marks.includes(primary) ? primary : marks[0];
+  for (const mark of marks) {
+    // Force a fresh animation frame so a second click on the same event pulses
+    // the corresponding updates again.
+    void mark.offsetWidth;
+    mark.classList.add("timeline-update-focus", "timeline-update-flash");
+  }
   focusScrollIntoView(
-    target,
-    update || checkpointTarget || unchangedOutputTarget ? "center" : "start",
+    scrollTarget,
+    phaseUpdates.length || checkpointTarget || scopeTarget ? "center" : "start",
   );
 }
 
@@ -1884,7 +2378,7 @@ async function focusUpdateFromState(element) {
       : document.querySelector(`.timeline-input[data-key="${key}"]`);
     timelineTarget?.classList.add("active");
 
-    const card = document.querySelector(`.update-card[data-key="${key}"]`);
+    const card = updateCardFor(key, phase);
     if (!card) return;
     await loadUpdateCard(card);
     document.querySelectorAll(".update-card.active").forEach(node => {
@@ -1899,12 +2393,12 @@ async function focusUpdateFromState(element) {
 
   if (!state.selected) return;
   const key = itemKey(state.selected);
-  const card = document.querySelector(`.update-card[data-key="${key}"]`);
-  if (!card) return;
-  await loadUpdateCard(card);
   const scope = element.closest("[data-state-scope]")?.dataset.stateScope;
   if (!scope) return;
   const phase = scope === "output" || scope === "thoughts" ? "output" : "input";
+  const card = updateCardFor(key, phase);
+  if (!card) return;
+  await loadUpdateCard(card);
   state.selectedPhase = phase;
   document.querySelectorAll(".timeline-item.active").forEach(node => {
     node.classList.remove("active");
@@ -2011,7 +2505,32 @@ function bindStateBackReferences(pane) {
   });
 }
 
+// Two clicks on one call are one selection. Without this, the second click
+// bumps the selection version and cancels the load the first click started, so
+// the focus it was about to apply never lands — on a long segment that load
+// takes long enough for an impatient second click to be the normal case.
 async function selectItem(
+  type,
+  id,
+  element = null,
+  scrollTimeline = true,
+  focusSelection = element !== null,
+) {
+  const key = `${type}:${id}`;
+  if (state.pendingSelection?.key === key) {
+    await state.pendingSelection.promise.catch(() => {});
+    return applySelection(type, id, element, scrollTimeline, focusSelection);
+  }
+  const promise = applySelection(type, id, element, scrollTimeline, focusSelection);
+  state.pendingSelection = { key, promise };
+  try {
+    return await promise;
+  } finally {
+    if (state.pendingSelection?.promise === promise) state.pendingSelection = null;
+  }
+}
+
+async function applySelection(
   type,
   id,
   element = null,
@@ -2025,11 +2544,30 @@ async function selectItem(
   button?.classList.add("active");
   if (scrollTimeline && button) focusScrollIntoView(button, "nearest");
   document.querySelectorAll(".update-card.active").forEach(node => node.classList.remove("active"));
-  const updateCard = document.querySelector(`.update-card[data-key="${type}:${id}"]`);
+  const updateCard = updateCardFor(`${type}:${id}`, phase);
   updateCard?.classList.add("active");
   const previousDetail = state.detail;
+  // Re-selecting the call already on screen must not rebuild Mixed: for a long
+  // segment that costs a visible pause, and every entry click inside one card
+  // would restart it — long enough for the next click to abort the previous
+  // selection, so the focus it was about to apply never arrived.
+  const alreadyRendered = state.selected
+    && state.selected.type === type
+    && Number(state.selected.id) === Number(id)
+    && Number(state.detail?.id) === Number(id)
+    && state.mixedSegmentDetails.at(-1)?.id === state.detail?.id;
   state.selected = { type, id };
   state.selectedPhase = phase;
+  if (alreadyRendered) {
+    activateTab("state");
+    if (focusSelection) {
+      if (updateCard) await loadUpdateCard(updateCard);
+      if (selectionVersion !== state.selectionVersion) return;
+      const renderedEntryKey = focusTimelineSelection(state.detail, phase);
+      focusTimelineUpdateCard(updateCard, renderedEntryKey, phase);
+    }
+    return;
+  }
   const detail = await detailFor(type, id);
   if (selectionVersion !== state.selectionVersion) return;
   state.detail = detail;
@@ -2059,9 +2597,11 @@ async function rebuildTimeline(items, previousSelected, followNewItems) {
   state.observer?.disconnect();
   state.observer = null;
   state.checkpointKeys.clear();
-  for (const item of items) appendUpdateCard(item);
+  renderUpdateCards(items);
   renderTimelineEvents(items);
-  restoreTimelineViewport(timelineViewport);
+  // A first render of a session has no viewport to preserve, and it selects the
+  // newest call, so it opens at that end whatever Follow says.
+  restoreTimelineViewport(timelineViewport, true);
   $("updates").scrollTop = updatesScroll;
   if (!items.length) {
     state.selected = null;
@@ -2080,8 +2620,7 @@ async function rebuildTimeline(items, previousSelected, followNewItems) {
 async function refreshChangedItem(item) {
   const key = itemKey(item);
   state.details.delete(key);
-  const card = document.querySelector(`.update-card[data-key="${key}"]`);
-  if (card) {
+  for (const card of document.querySelectorAll(`.update-card[data-key="${key}"]`)) {
     delete card.dataset.loaded;
     await loadUpdateCard(card);
   }
@@ -2101,7 +2640,11 @@ async function refreshChangedItem(item) {
       state.detail,
       state.selectedPhase,
     );
-    focusTimelineUpdateCard(card, focusedEntryKey, state.selectedPhase);
+    focusTimelineUpdateCard(
+      updateCardFor(key, state.selectedPhase),
+      focusedEntryKey,
+      state.selectedPhase,
+    );
   }
 }
 
@@ -2130,21 +2673,26 @@ async function loadTimeline() {
   }
 
   const previousByKey = new Map(previousItems.map(item => [itemKey(item), item]));
+  const changed = [];
   for (const item of items) {
     const previous = previousByKey.get(itemKey(item));
     if (previous && previous.status !== item.status) {
-      await refreshChangedItem(item);
+      // Apply the new status first: a completed call earns an output card, and
+      // its arrival time decides where that card belongs in the sequence.
       Object.assign(previous, item);
+      changed.push(item);
     }
   }
   const appended = items.filter(item => !previousByKey.has(itemKey(item)));
-  for (const item of appended) appendUpdateCard(item);
-  // Preserve the viewport immediately after the synchronous append. Do not
+  state.timelineItems = [...previousItems, ...appended];
+  const updatesViewport = captureUpdatesViewport();
+  renderUpdateCards(state.timelineItems);
+  // Preserve the viewport immediately after the synchronous reorder. Do not
   // restore it after awaited detail loading: the user may scroll meanwhile.
   if (state.updatesUserScrollVersion === updatesUserScrollVersion) {
-    updates.scrollTop = updatesScroll;
+    restoreUpdatesViewport(updatesViewport, updatesScroll);
   }
-  state.timelineItems = [...previousItems, ...appended];
+  for (const item of changed) await refreshChangedItem(item);
   const timelineViewport = captureTimelineViewport();
   renderTimelineEvents(state.timelineItems);
   // Output events can be inserted above the viewport when an earlier running
@@ -2154,8 +2702,10 @@ async function loadTimeline() {
     ? itemKey(state.timelineItems[state.timelineItems.length - 1])
     : null;
   if (appended.length && followNewItems) {
+    // Follow means the newest item is the one being watched, so bring it into
+    // view even when the viewport had drifted away from the newest end.
     const last = appended[appended.length - 1];
-    await selectItem(last.type, last.id, null, false, true);
+    await selectItem(last.type, last.id, null, true, true);
   }
   return true;
 }
