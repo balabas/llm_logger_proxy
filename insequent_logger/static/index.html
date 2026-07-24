@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Insequent Trace Viewer</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <span class="eyebrow">LLM TRACE</span>
+      <h1>Insequent</h1>
+    </div>
+    <label class="session-picker">
+      <span>Session</span>
+      <select id="session" aria-label="Session"></select>
+    </label>
+    <form id="search-form">
+      <input id="search" type="search" placeholder="Search inputs, outputs, state…" autocomplete="off">
+      <button>Search</button>
+    </form>
+    <div id="stats" class="stats">Loading…</div>
+  </header>
+
+  <main>
+    <section class="pane timeline-pane">
+      <div class="pane-title">
+        <div><span>01</span><h2>Timeline</h2></div>
+        <div class="timeline-tools">
+          <label
+            class="follow-toggle"
+            title="When off, stay on the currently focused item"
+          >
+            <input id="follow-new-items" type="checkbox">
+            <span>Follow</span>
+          </label>
+          <span id="live-indicator" class="live-indicator">● LIVE</span>
+          <button id="refresh" class="quiet">Refresh</button>
+        </div>
+      </div>
+      <div id="waiting-calls" class="waiting-calls">
+        <div class="waiting-calls-head">
+          <span>0 waiting / running</span>
+        </div>
+      </div>
+      <div id="search-results" class="search-results hidden"></div>
+      <div id="timeline" class="timeline"></div>
+    </section>
+
+    <section class="pane mixed-pane">
+      <div class="pane-title">
+        <div><span>02</span><h2>Mixed trace</h2></div>
+        <div id="mixed-status" class="mixed-legend">Select a call</div>
+      </div>
+      <pre id="mixed" class="code mixed empty">The current state with marked updates appears here.</pre>
+    </section>
+
+    <section class="pane exact-pane">
+      <div class="pane-title">
+        <div><span>03</span><h2>Exact state</h2></div>
+        <div class="exact-tools">
+          <div id="lineage" class="lineage">Select an event</div>
+          <div class="tabs">
+            <button data-tab="state" class="active">I/O</button>
+            <button data-tab="parameters">Params</button>
+            <button data-tab="raw_response">Raw</button>
+            <button data-tab="metadata">Metadata</button>
+          </div>
+        </div>
+      </div>
+      <pre id="exact" class="code empty">The complete reconstructed value appears here.</pre>
+    </section>
+
+    <section class="pane updates-pane">
+      <div class="pane-title">
+        <div><span>04</span><h2>Updates</h2></div>
+        <div class="mixed-legend">chronological · append-only</div>
+      </div>
+      <div id="updates" class="updates"></div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
