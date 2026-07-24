@@ -8,7 +8,7 @@ from .server import serve
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compact, reconstructable LLM tracing proxy")
-    parser.add_argument("--config", default="insequent.toml", help="TOML configuration path")
+    parser.add_argument("--config", default="config.toml", help="TOML configuration path")
     parser.add_argument("--db", help="Override SQLite .llmtrace path")
     parser.add_argument("--host", help="Override listener host")
     parser.add_argument("--port", type=int, help="Override listener port")

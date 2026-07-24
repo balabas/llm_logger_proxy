@@ -35,10 +35,12 @@ Application → Insequent proxy → OpenAI-compatible model server
 
 ## Installation
 
-Clone the repository, create a virtual environment, and install the package:
+Clone the repository, create a virtual environment, install the dependencies, and install the
+package in editable mode:
 
 ```bash
 python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m pip install -e .
 ```
 
@@ -50,11 +52,12 @@ Install the OpenAI Python client if you want to run the client example below:
 
 ## Quick start
 
-The included [`insequent.toml`](insequent.toml) expects the upstream model server at
-`http://127.0.0.1:8080` and starts Insequent at `http://127.0.0.1:8081`.
+Insequent loads [`config.toml`](config.toml) by default. The included configuration expects the
+upstream model server at `http://127.0.0.1:8080` and starts Insequent at
+`http://127.0.0.1:8081`.
 
 ```bash
-.venv/bin/python -m insequent_logger --config insequent.toml
+.venv/bin/python -m insequent_logger
 ```
 
 Then:
@@ -105,7 +108,8 @@ session_id = "unassigned"
 branch_id = "main"
 ```
 
-Command-line options can override the main settings:
+Command-line options can override the main settings. Use `--config PATH` only to load a file
+other than the default `config.toml`:
 
 ```text
 --config PATH
@@ -119,7 +123,6 @@ Example:
 
 ```bash
 .venv/bin/python -m insequent_logger \
-  --config insequent.toml \
   --db experiment.llmtrace \
   --port 8090
 ```
@@ -239,10 +242,10 @@ the configured limit.
 
 ## Development and tests
 
-Install the test dependencies and Chromium:
+The dependencies in `requirements.txt` include the packages needed by the test suite. Install
+Chromium for the Playwright browser tests:
 
 ```bash
-.venv/bin/python -m pip install pytest pytest-playwright
 .venv/bin/python -m playwright install chromium
 ```
 
@@ -269,5 +272,5 @@ insequent_logger/
 ├── examples/
 ├── tests/
 ├── docs/
-└── insequent.toml
+└── config.toml
 ```
