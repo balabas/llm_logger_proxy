@@ -837,7 +837,7 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   background: color-mix(in srgb, var(--trace-kind-accent) 7%, transparent);
   border-left: 3px solid var(--trace-kind-accent);
   border-radius: 4px;
-  cursor: pointer;
+  cursor: text;
 }
 .state-scope:last-child { margin-bottom: 0; }
 .state-scope-label {
@@ -854,17 +854,52 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   letter-spacing: .08em;
   text-transform: uppercase;
   user-select: none;
+  cursor: pointer;
 }
 .state-scope-content {
   display: block;
   min-height: 1em;
   white-space: pre-wrap;
 }
-.state-scope:hover > .state-scope-label,
-.state-scope:focus-visible > .state-scope-label {
+.state-field {
+  display: block;
+  margin: 2px 0;
+  padding: 0 7px 7px;
+  background: color-mix(in srgb, var(--trace-kind-accent) 8%, #17201d);
+  border: 1px solid color-mix(in srgb, var(--trace-kind-accent) 48%, transparent);
+  border-radius: 4px;
+}
+.state-field-label {
+  display: table;
+  margin: 0 0 7px -7px;
+  padding: 3px 8px 3px 7px;
+  color: var(--trace-kind-text);
+  background: var(--trace-kind-surface);
+  border-right: 1px solid var(--trace-kind-accent);
+  border-bottom: 1px solid var(--trace-kind-accent);
+  border-radius: 0 0 4px;
+  font: 700 9px/1.25 system-ui, sans-serif;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.state-field-content {
+  display: block;
+  min-height: 1em;
+  white-space: pre-wrap;
+}
+.checkpoint-field {
+  margin: 8px;
+}
+.checkpoint-section .checkpoint-field > pre {
+  padding: 0;
+  background: transparent;
+}
+.state-scope-label:hover,
+.state-scope-label:focus-visible {
   filter: brightness(1.18);
 }
-.state-scope:focus-visible {
+.state-scope-label:focus-visible {
   outline: 2px solid var(--trace-kind-accent);
   outline-offset: 2px;
 }

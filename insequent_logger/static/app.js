@@ -139,7 +139,20 @@ function stateScopeHtml(kind, html, nested = false) {
   const sourceLabel = sourceLabels[kind];
   const labelPattern = new RegExp(`^\\s*${sourceLabel}:(?: |\\n)?`);
   const content = String(html).replace(labelPattern, "");
-  return `<span class="state-scope ${nested ? "state-subscope " : ""}trace-kind-${kind}" data-state-scope="${kind}" role="button" tabindex="0" aria-label="${labels[kind]} scope"><span class="state-scope-label" aria-hidden="true">${labels[kind]}</span><span class="state-scope-content">${content}</span></span>`;
+  return `<span class="state-scope ${nested ? "state-subscope " : ""}trace-kind-${kind}" data-state-scope="${kind}"><span class="state-scope-label" role="button" tabindex="0" aria-label="${labels[kind]} scope">${labels[kind]}</span><span class="state-scope-content">${content}</span></span>`;
+}
+
+function inputContentHtml(detail, html) {
+  if (!Object.hasOwn(detail?.request || {}, "prompt")) return html;
+  const content = String(html).replace(/^\s*prompt:(?: |\n)?/, "");
+  return `<span class="state-field state-prompt" data-input-field="prompt"><span class="state-field-label">Prompt</span><span class="state-field-content">${content}</span></span>`;
+}
+
+function checkpointInputHtml(detail, input) {
+  if (!Object.hasOwn(detail?.request || {}, "prompt")) {
+    return `<pre>${escapeHtml(yaml(input))}</pre>`;
+  }
+  return `<span class="state-field checkpoint-field state-prompt" data-input-field="prompt"><span class="state-field-label">Prompt</span><pre class="state-field-content">${escapeHtml(yaml(detail.request.prompt))}</pre></span>`;
 }
 
 function firstUsefulLine(value) {
@@ -1264,7 +1277,7 @@ async function loadUpdateCard(card) {
       <div class="checkpoint-state">
         <section class="checkpoint-section checkpoint-input trace-kind-input" role="button" tabindex="0" data-checkpoint-scope="input">
           <strong>Input</strong>
-          <pre>${escapeHtml(yaml(input))}</pre>
+          ${checkpointInputHtml(detail, input)}
         </section>
         ${Object.keys(parameters).length ? `
           <section class="checkpoint-section checkpoint-parameters trace-kind-input-params" role="button" tabindex="0" data-checkpoint-scope="input-params">
@@ -1437,7 +1450,10 @@ function renderMixed(previousDetail = null) {
     entries.filter(entry => entry.scope === "output"),
   );
   const parameterHtml = mixedStateHtml(parts.parameterText, parameterEntries);
-  const contentHtml = mixedStateHtml(parts.contentText, inputEntries);
+  const contentHtml = inputContentHtml(
+    state.detail,
+    mixedStateHtml(parts.contentText, inputEntries),
+  );
   const inputHtml = stateScopeHtml(
     "input",
     `input:\n${stateScopeHtml("input-params", parameterHtml, true)}\n${contentHtml}`,
@@ -1528,10 +1544,13 @@ function renderExact(focusEntry = null) {
       entries.filter(entry => entry.category === "parameter"),
       focusEntry,
     );
-    const contentHtml = exactStateHtml(
-      parts.contentText,
-      entries.filter(entry => entry.scope === "input" && entry.category !== "parameter"),
-      focusEntry,
+    const contentHtml = inputContentHtml(
+      state.detail,
+      exactStateHtml(
+        parts.contentText,
+        entries.filter(entry => entry.scope === "input" && entry.category !== "parameter"),
+        focusEntry,
+      ),
     );
     const outputHtml = exactStateHtml(
       parts.outputText,
@@ -1710,6 +1729,38 @@ function markUpdateTarget(card, target, button = null) {
   window.setTimeout(() => target.classList.remove("update-back-focus"), 1600);
 }
 
+function focusStateUpdateEntry(entryKey, fragmentIndex = null) {
+  for (const pane of [$("mixed"), $("exact")]) {
+    pane.querySelectorAll(
+      ".fragment-focus, .exact-focus, .checkpoint-pane-focus, .timeline-scope-focus",
+    ).forEach(node => {
+      node.classList.remove(
+        "fragment-focus",
+        "exact-focus",
+        "checkpoint-pane-focus",
+        "timeline-scope-focus",
+        "flash",
+      );
+    });
+    let targets = [...pane.querySelectorAll(`[data-update-entry="${entryKey}"]`)];
+    if (fragmentIndex != null) {
+      const fragmentTargets = targets.filter(
+        node => Number(node.dataset.outputFragment) === fragmentIndex,
+      );
+      if (fragmentTargets.length) targets = fragmentTargets;
+    }
+    targets.forEach(node => {
+      // Restart the pulse when the same update is clicked repeatedly.
+      void node.offsetWidth;
+      node.classList.add(
+        pane.id === "mixed" ? "fragment-focus" : "exact-focus",
+        "flash",
+      );
+    });
+    focusScrollIntoView(targets[0]);
+  }
+}
+
 async function focusUpdateFromState(element) {
   const updateElement = element.closest("[data-update-entry]");
   if (updateElement) {
@@ -1717,21 +1768,32 @@ async function focusUpdateFromState(element) {
     const callId = Number(rawCallId);
     const entryIndex = Number(rawEntryIndex);
     const key = `call:${callId}`;
-    const card = document.querySelector(`.update-card[data-key="${key}"]`);
-    if (!card) return;
-    await loadUpdateCard(card);
+    const fragmentIndex = updateElement.dataset.outputFragment == null
+      ? null
+      : Number(updateElement.dataset.outputFragment);
+    focusStateUpdateEntry(updateElement.dataset.updateEntry, fragmentIndex);
+    const scope = updateElement.closest("[data-state-scope]")?.dataset.stateScope;
+    const phase = scope === "output"
+      || updateElement.classList.contains("output-update")
+      ? "output"
+      : "input";
+    state.selectedPhase = phase;
     document.querySelectorAll(".timeline-item.active").forEach(node => {
       node.classList.remove("active");
     });
-    document.querySelector(`.timeline-item[data-key="${key}"]`)?.classList.add("active");
+    const timelineTarget = phase === "output"
+      ? document.querySelector(`.timeline-output[data-call-key="${key}"]`)
+      : document.querySelector(`.timeline-input[data-key="${key}"]`);
+    timelineTarget?.classList.add("active");
+
+    const card = document.querySelector(`.update-card[data-key="${key}"]`);
+    if (!card) return;
+    await loadUpdateCard(card);
     document.querySelectorAll(".update-card.active").forEach(node => {
       node.classList.remove("active");
     });
     const button = card.querySelector(`.update-jump[data-update-index="${entryIndex}"]`);
     if (!button) return;
-    const fragmentIndex = updateElement.dataset.outputFragment == null
-      ? null
-      : Number(updateElement.dataset.outputFragment);
     const fragment = updateFragmentForIndex(button, fragmentIndex);
     markUpdateTarget(card, fragment || button, button);
     return;
@@ -1822,15 +1884,32 @@ async function focusUpdateFromState(element) {
 function bindStateBackReferences(pane) {
   pane.addEventListener("click", event => {
     if (hasTextSelectionWithin(pane)) return;
-    const target = event.target.closest("[data-update-entry], [data-state-scope]");
+    const updateTarget = event.target.closest("[data-update-entry]");
+    if (updateTarget) {
+      focusUpdateFromState(updateTarget);
+      return;
+    }
+    // Plain reconstructed content is selectable state, not an update reference.
+    // Whole-scope navigation belongs to its visible label. A checkpoint is the
+    // exception because its complete snapshot scope has one owning Updates section.
+    const scopeTarget = event.target.closest(".state-scope-label")
+      ?.closest("[data-state-scope]")
+      || (isCheckpoint(state.detail)
+        ? event.target.closest("[data-state-scope]")
+        : null);
+    const target = scopeTarget;
     if (target) focusUpdateFromState(target);
   });
   pane.addEventListener("keydown", event => {
     if (event.key !== "Enter" && event.key !== " ") return;
-    const target = event.target.closest("[data-update-entry], [data-state-scope]");
+    const target = event.target.closest(
+      "[data-update-entry], .state-scope-label",
+    );
     if (!target) return;
     event.preventDefault();
-    focusUpdateFromState(target);
+    focusUpdateFromState(
+      target.closest("[data-update-entry], [data-state-scope]"),
+    );
   });
 }
 

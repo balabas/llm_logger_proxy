@@ -31,7 +31,7 @@ def viewer_url(tmp_path):
             "model": "local",
             "messages": [
                 {"role": "system", "content": shared_context},
-                {"role": "user", "content": "Remember cobalt blue."},
+                {"role": "user", "content": "Remember cobalt blue precisely."},
             ],
             "temperature": 0.1,
             "obsolete": True,
@@ -61,12 +61,7 @@ def viewer_url(tmp_path):
     summary = store.start_call(
         {
             "model": "local",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "Summarize the cobalt blue project conversation.",
-                }
-            ],
+            "prompt": "Summarize the cobalt blue project conversation.",
         },
         session_id="viewer",
         branch_id="summary-side-call",
@@ -380,6 +375,18 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(
         page.locator('.update-card[data-key="call:4"] .checkpoint-input')
     ).to_contain_text("Summarize the cobalt blue project conversation.")
+    expect(
+        page.locator(
+            '.update-card[data-key="call:4"] '
+            '[data-input-field="prompt"] > .state-field-label'
+        )
+    ).to_have_text("Prompt")
+    expect(
+        page.locator(
+            '.update-card[data-key="call:4"] '
+            '[data-input-field="prompt"] > .state-field-content'
+        )
+    ).not_to_contain_text("prompt:")
     expect(
         page.locator('.update-card[data-key="call:4"] .checkpoint-output')
     ).to_contain_text("cobalt blue summary")
@@ -834,6 +841,31 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(added_user).to_have_class(re.compile("timeline-update-focus"))
     expect(page.locator("#mixed .fragment-focus.input-update")).not_to_have_count(0)
     expect(page.locator("#exact .exact-focus.input-update")).not_to_have_count(0)
+    changed_input_state = page.locator(
+        "#exact .state-scope-content "
+        ".exact-update.input-update.trace-kind-input.trace-op-changed",
+        has_text="Remember cobalt blue.",
+    )
+    expect(changed_input_state).to_be_visible()
+    changed_input_state.click()
+    expect(changed_input_state).to_have_class(re.compile("exact-focus"))
+    expect(changed_input_state).to_have_class(re.compile("flash"))
+    expect(
+        page.locator(
+            "#mixed .state-scope-content "
+            ".trace-part.input-update.fragment-focus",
+            has_text="Remember cobalt blue.",
+        )
+    ).not_to_have_count(0)
+    expect(
+        page.locator(
+            '.update-card[data-key="call:3"] '
+            ".input-update-card.trace-op-changed"
+        )
+    ).to_have_class(re.compile(r"\bactive\b"))
+    expect(page.locator('.timeline-input[data-key="call:3"]')).to_have_class(
+        re.compile("active")
+    )
     page.locator(
         '#mixed [data-state-scope="output"] > .state-scope-label'
     ).click()
@@ -851,6 +883,28 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(
         page.locator("#updates .timeline-update-focus.trace-kind-input-params")
     ).not_to_have_count(0)
+    page.evaluate(
+        """() => {
+          document.querySelectorAll(
+            ".fragment-focus, .exact-focus, .timeline-scope-focus, "
+              + ".checkpoint-pane-focus, .timeline-update-focus, "
+              + ".timeline-update-flash"
+          ).forEach(node => node.classList.remove(
+            "fragment-focus",
+            "exact-focus",
+            "timeline-scope-focus",
+            "checkpoint-pane-focus",
+            "timeline-update-focus",
+            "timeline-update-flash",
+          ));
+          document.querySelector(
+            '#exact [data-state-scope="input"] > .state-scope-content'
+          ).dispatchEvent(new MouseEvent("click", {bubbles: true}));
+        }"""
+    )
+    expect(page.locator("#mixed .fragment-focus")).to_have_count(0)
+    expect(page.locator("#exact .exact-focus")).to_have_count(0)
+    expect(page.locator("#updates .timeline-update-focus")).to_have_count(0)
     page.locator("#exact .state-scope.trace-kind-input").select_text()
     assert "Continue with the next section." in page.evaluate(
         "window.getSelection().toString()"
@@ -1085,6 +1139,18 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.locator("#exact > .state-scope > .state-scope-label")).to_have_text(
         ["Input parameters", "Input", "Output"]
     )
+    expect(
+        page.locator('#mixed [data-input-field="prompt"] > .state-field-label')
+    ).to_have_text("Prompt")
+    expect(
+        page.locator('#exact [data-input-field="prompt"] > .state-field-label')
+    ).to_have_text("Prompt")
+    expect(
+        page.locator('#exact [data-input-field="prompt"] > .state-field-content')
+    ).to_contain_text("retained prompt line one")
+    assert not page.locator(
+        '#exact [data-input-field="prompt"] > .state-field-content'
+    ).text_content().lstrip().startswith("prompt:")
     expect(
         page.locator(
             '#mixed [data-state-scope="input-params"] .state-scope-content'

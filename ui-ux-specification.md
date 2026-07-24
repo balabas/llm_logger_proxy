@@ -20,8 +20,13 @@ The four panes deliberately provide different views of the same trace:
 | Updates | What changed at each call? | Chronological cards | Append-only |
 
 The panes are linked, but they are not interchangeable. Exact State is a current-value
-projection. Mixed Trace is retained history with current-presence status. Updates is an
-append-only change journal.
+projection. Mixed Trace is a **mixed projection**: selected-call truth combined with retained
+segment history and current-presence status. Updates is an append-only provenance journal.
+
+“Mixed” does not mean concatenating requests or showing a conventional before/after diff. It
+means preserving every meaningful change in the active checkpoint segment, projecting those
+changes into the selected call’s semantic input/output structure, and visibly distinguishing
+what is still present from what has been superseded.
 
 ## 2. UX approach
 
@@ -38,7 +43,46 @@ state, accumulated history, chronology, and provenance without becoming ambiguou
 A selection is propagated across panes through stable call and update-entry identities. The
 same data is allowed to look different when the pane answers a different question.
 
-### 2.2 Progressive disclosure
+### 2.2 The mixing approach
+
+Mixed Trace combines three sources without collapsing their meanings:
+
+1. **The selected exact state** supplies the current input, parameters, and output structure.
+2. **The active checkpoint segment** supplies every retained update through the selected call.
+3. **Stable update provenance** links each marked fragment to its owning call and Updates
+   entry.
+
+The result is a state-shaped historical surface. It reads like the selected request and
+response, but contains retained evidence of how that state developed.
+
+The mixing procedure is:
+
+1. Find the checkpoint that begins the selected call’s active segment.
+2. Reconstruct the selected call’s exact input, parameters, and output.
+3. Collect update entries from the segment start through the selected call.
+4. Map surviving update text into its semantic location in the reconstructed state.
+5. Keep superseded text near its former or replacement location instead of discarding it.
+6. Classify every retained fragment by data kind, operation, and current presence.
+7. Attach the original update-entry identity so marked text remains a back-reference.
+
+This creates two simultaneous readings:
+
+- read unmarked and green text to understand the selected current state;
+- read red/green transitions to understand how the segment arrived there.
+
+Mixing is deliberately not:
+
+- a concatenation of complete requests;
+- a replacement for Exact State;
+- a diff only against the immediately preceding call;
+- a chronological log pasted into the input;
+- permission to alter copied payload text.
+
+When mapping is uncertain, the renderer retains history visibly rather than presenting old
+text as current. Exact State remains the authority for what the selected call actually
+contains.
+
+### 2.3 Progressive disclosure
 
 The first visible level stays compact:
 
@@ -49,7 +93,7 @@ The first visible level stays compact:
 Full payloads remain available in the code surfaces and expanded update entries. Raw provider
 data and metadata are secondary tabs rather than competing with the default I/O view.
 
-### 2.3 Semantic decoration rather than text mutation
+### 2.4 Semantic decoration rather than text mutation
 
 Status is expressed through CSS and surrounding labels. This keeps copied prompt/output text
 faithful and allows the same fragment to combine several independent meanings:
@@ -62,7 +106,7 @@ faithful and allows the same fragment to combine several independent meanings:
 These meanings must compose as layers instead of being flattened into one color or prefixed
 with operation characters.
 
-### 2.4 Persistent state plus transient confirmation
+### 2.5 Persistent state plus transient confirmation
 
 Every navigation action has two feedback phases:
 
@@ -72,7 +116,7 @@ Every navigation action has two feedback phases:
 This is preferable to animation-only feedback, which disappears, or persistent-only
 feedback, which does not visibly replay on a second click.
 
-### 2.5 Local motion
+### 2.6 Local motion
 
 Each pane scrolls independently to its own corresponding target. The interface does not move
 the page as a whole on desktop, and one pane must not borrow another pane’s scroll state.
@@ -94,6 +138,10 @@ Within one checkpoint segment, Mixed Trace must never lose previously observed d
 “Retained” and “present” are separate properties. Historical text can be retained in Mixed
 Trace while being absent from Exact State. In that case it must be red and struck through,
 not green.
+
+Mixed Trace must preserve semantic placement. Input history stays in Input, parameter history
+stays in Input parameters, and output history stays in Output. The renderer must never move a
+fragment into another scope merely because the same text occurs there.
 
 ### 3.2 Exact State is selected-call truth
 
@@ -181,6 +229,39 @@ the selected exact value:
 This rule applies equally to input and output. Output history does not disappear merely
 because Exact State contains only the selected call’s short response.
 
+#### Mixed Trace reading model
+
+The pane should look like state first and history second:
+
+- structural labels establish Input parameters, Input, Prompt when applicable, and Output;
+- unchanged payload remains quiet monospaced text;
+- present additions remain embedded at their current location;
+- replacements show an old-to-new transition;
+- removed history remains available without pretending to belong to Exact State;
+- focus decoration is applied only after kind, operation, and presence are resolved.
+
+Labels such as Input, Output, Input parameters, and Prompt are interface structure. They use a
+separate UI font, surface, and border treatment and must not resemble or become part of model
+input/output text.
+
+#### Identity and provenance
+
+Every marked mixed fragment carries the stable identity of the update that produced it.
+Repeated text is not sufficient identity: two equal strings introduced by different calls
+remain different updates. Grouped output fragments additionally retain their fragment index
+so navigation can select one grouped occurrence rather than the entire output change.
+
+The same update identity may have different visual forms across panes:
+
+| Surface | Representation of one update |
+| --- | --- |
+| Mixed Trace | Retained old/new fragment in state context |
+| Exact State | Current surviving fragment only |
+| Updates | Complete change entry with provenance details |
+| Timeline | Owning call and input/output phase |
+
+Cross-pane focus follows this identity, not text search or visual proximity.
+
 The Mixed status label communicates either:
 
 - checkpoint/new current state;
@@ -202,6 +283,10 @@ The output timeline event always focuses output:
 - if the call is a checkpoint, focus the checkpoint output scope.
 
 This prevents “unchanged relative to a parent” from being misread as “no output exists.”
+
+Exact State participates in mixing only as the current-value anchor. It must not absorb
+retained removed text from Mixed Trace. A marked Exact fragment may link to an update, but
+plain exact content is still payload, not a navigation control.
 
 ### 4.5 Updates
 
@@ -283,6 +368,10 @@ Temporal styling answers **is retained history still current?**
 This layer is computed, not merely inherited from the operation recorded at the original
 call. An addition can later become a retained removal.
 
+This computation is the defining visual operation of mixing. Operation describes what
+happened when an update was recorded; temporal truth describes whether its value survives in
+the selected state. Both must remain available at once.
+
 ### 5.5 Layer 5: interaction and navigation
 
 Interaction styling answers **what is the user currently following?**
@@ -334,6 +423,23 @@ Text selection takes precedence. Dragging to select text must not trigger naviga
 
 Clicking marked state text navigates to the owning Updates entry. Fragment-level output
 selection must select the matching grouped fragment rather than the whole output card.
+
+The hit target determines the semantic action:
+
+| Click target | Result |
+| --- | --- |
+| Marked fragment with an update identity | Focus only that update in Mixed, Exact, Updates, and its Timeline phase |
+| Input, Output, or Input parameters label | Focus the corresponding whole scope and its mapped updates |
+| Plain `.state-scope-content` payload | No navigation; leave it available for caret placement and text selection |
+| Checkpoint snapshot content | Focus the owning checkpoint scope because the full snapshot is one update section |
+
+A click on plain reconstructed content must never guess provenance, choose the first nearby
+update, or focus every update in the scope. If provenance is not represented by a marked
+fragment, the content is not a back-reference.
+
+Prompt is a structural sub-label inside Input, not an independent trace phase. Clicking a
+marked prompt fragment follows that fragment’s update identity. Clicking unmarked prompt text
+does nothing.
 
 ## 7. Animation rules
 
@@ -435,6 +541,8 @@ Copied trace text must represent stored data.
 - CSS pseudo-elements, borders, and labels may communicate status without contaminating
   copied content.
 - Metadata such as fragment locations and repeat counts must remain outside payload elements.
+- Structural Input, Output, Input parameters, and Prompt labels must remain outside payload
+  elements and must not appear in copied model text.
 
 ## 12. Loading, error, and empty states
 
@@ -454,12 +562,16 @@ Every UI change should verify:
 - Is superseded text retained but red?
 - Is current text green?
 - Does a checkpoint flush prior history?
+- Does each retained fragment remain in its correct semantic scope?
+- Does update identity, rather than equal text, drive cross-pane linking?
 
 ### Exact State
 
 - Does it contain only selected-call values?
 - Does output focus work for both changed and unchanged output?
 - Are copied values free of UI-injected operation characters?
+- Does clicking plain payload leave focus unchanged?
+- Does clicking a marked fragment focus only its owning update?
 
 ### Updates
 
@@ -480,3 +592,4 @@ Every UI change should verify:
 - Does green/red still mean present/removed?
 - Is yellow used only for interaction focus?
 - Are real stored protocol symbols preserved and UI-generated `+`/`−` symbols absent?
+- Are structural labels visually and textually separate from model payload?
