@@ -597,3 +597,77 @@ def test_retention_defers_when_wal_checkpoint_is_locked(tmp_path):
 
     store.finish_call(call, "completed")
     store.close()
+
+
+def test_req_id_declares_explicit_branch_lineage(tmp_path):
+    store = TraceStore(tmp_path / "reqid.llmtrace")
+
+    def call(req_id, prev_req_id, content):
+        made = store.start_call(
+            {"model": "local", "messages": [{"role": "user", "content": content}]},
+            session_id="nb",
+            branch_id="main",
+            req_id=req_id,
+            prev_req_id=prev_req_id,
+        )
+        store.finish_call(made, "ok")
+        return made
+
+    # A tree the caller declares itself: B and C both continue A, so they branch.
+    a = call("A", None, "root")
+    b = call("B", "A", "continue B")
+    c = call("C", "A", "branch C")
+    d = call("D", "C", "continue D")
+
+    state_a = store.get_call(a)["request_state_id"]
+    state_c = store.get_call(c)["request_state_id"]
+    detail_b = store.get_call(b)
+    detail_c = store.get_call(c)
+    detail_d = store.get_call(d)
+
+    assert detail_b["parent_state_id"] == state_a
+    assert detail_c["parent_state_id"] == state_a  # sibling branch off A
+    assert detail_d["parent_state_id"] == state_c
+    assert detail_b["parent_source"] == "explicit"
+    assert (detail_b["req_id"], detail_b["prev_req_id"]) == ("B", "A")
+
+    # The identity is surfaced on the timeline row, not only in the full call.
+    row = next(item for item in store.timeline() if item.get("id") == d)
+    assert row["req_id"] == "D"
+    assert row["prev_req_id"] == "C"
+
+    # An unknown predecessor is a caller error, not a silent fallback.
+    import pytest
+
+    with pytest.raises(ValueError):
+        call("E", "does-not-exist", "x")
+    store.close()
+
+
+def test_timeline_loads_rows_in_batches_instead_of_one_query_per_item(tmp_path):
+    store = TraceStore(tmp_path / "batched-timeline.llmtrace")
+    for index in range(40):
+        call_id = store.start_call(
+            {"model": "local", "prompt": f"request {index}"},
+            session_id="large-session",
+        )
+        store.finish_call(call_id, f"response {index}")
+    for index in range(4):
+        store.record_event(
+            "checkpoint",
+            {"index": index},
+            session_id="large-session",
+        )
+
+    statements = []
+    store._db.set_trace_callback(statements.append)
+    timeline = store.timeline(limit=100, session_id="large-session")
+    store._db.set_trace_callback(None)
+
+    selects = [
+        statement for statement in statements
+        if statement.lstrip().upper().startswith("SELECT")
+    ]
+    assert len(timeline) == 44
+    assert len(selects) == 3, selects
+    store.close()

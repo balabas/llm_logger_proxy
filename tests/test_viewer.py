@@ -2297,3 +2297,274 @@ def test_update_focus_flash_does_not_replay_on_live_refresh(
         page.locator(f'.update-card[data-key="call:{call_id}"][data-phase="input"] '
                      ".update-jump.timeline-update-focus")
     ).not_to_have_count(0)
+
+
+@pytest.fixture
+def debug_label_viewer_url(tmp_path):
+    """Calls carrying a debug_label, and one without."""
+    store = TraceStore(tmp_path / "debuglabel.llmtrace")
+    context = (
+        "You are inspecting a technical project. Preserve exact facts and prior "
+        "decisions. " * 6
+    )
+    messages = [
+        {"role": "system", "content": context},
+        {"role": "user", "content": "Begin the outline."},
+    ]
+
+    def call(label, extra_user):
+        payload = list(messages)
+        if extra_user:
+            payload = payload + [{"role": "user", "content": extra_user}]
+        made = store.start_call(
+            {"model": "local", "messages": payload, "temperature": 0.2},
+            session_id="debuglabel",
+            branch_id="main",
+            metadata={"debug_label": label} if label else None,
+        )
+        store.finish_call(made, "outline", metadata={"duration_ms": 5})
+        return made
+
+    labelled = call("07-rewrite-attempt-with-a-really-long-step-name", None)
+    labelled_two = call("08-review", "Expand section two.")
+    plain = call(None, "Expand section two with detail.")
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", labelled_two, plain
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_debug_label_rides_existing_lines_in_timeline_and_updates(
+    page: Page, debug_label_viewer_url
+):
+    url, labelled, plain = debug_label_viewer_url
+    page.goto(f"{url}/")
+    expect(page.locator(".timeline-item")).not_to_have_count(0)
+
+    # The label appears on the timeline item, and a call without one shows none.
+    labelled_item = page.locator(f'.timeline-input[data-key="call:{labelled}"]')
+    plain_item = page.locator(f'.timeline-input[data-key="call:{plain}"]')
+    expect(labelled_item.locator(".item-debug")).to_have_text("08-review")
+    expect(plain_item.locator(".item-debug")).to_have_count(0)
+
+    # It rides the action line — the item is no taller than the one without a
+    # label (same two-line layout).
+    labelled_h = labelled_item.bounding_box()["height"]
+    plain_h = plain_item.bounding_box()["height"]
+    assert abs(labelled_h - plain_h) < 1, (labelled_h, plain_h)
+
+    # It appears on the update card head, on that single head line — the head is
+    # no taller than a head without a label.
+    page.evaluate(
+        """async () => {
+          for (const c of document.querySelectorAll(
+            '.update-card[data-phase=\"input\"]'
+          )) { c.scrollIntoView(); await loadUpdateCard(c); }
+        }"""
+    )
+    page.wait_for_timeout(400)
+    labelled_head = page.locator(
+        f'.update-card[data-key="call:{labelled}"][data-phase="input"] .update-card-head'
+    )
+    plain_head = page.locator(
+        f'.update-card[data-key="call:{plain}"][data-phase="input"] .update-card-head'
+    )
+    expect(labelled_head.locator(".update-card-debug")).to_have_text("08-review")
+    expect(plain_head.locator(".update-card-debug")).to_have_count(0)
+    assert abs(
+        labelled_head.bounding_box()["height"] - plain_head.bounding_box()["height"]
+    ) < 1
+
+
+@pytest.fixture
+def req_id_viewer_url(tmp_path):
+    """A caller-declared branch tree: B and C both continue A."""
+    store = TraceStore(tmp_path / "reqid.llmtrace")
+
+    def call(req_id, prev_req_id, content):
+        made = store.start_call(
+            {"model": "local", "messages": [{"role": "user", "content": content}]},
+            session_id="nb",
+            branch_id="main",
+            req_id=req_id,
+            prev_req_id=prev_req_id,
+            metadata={"debug_label": f"{req_id}-step"},
+        )
+        store.finish_call(made, "ok", metadata={"duration_ms": 5})
+        return made
+
+    a = call("A", None, "root")
+    b = call("B", "A", "continue B")
+    c = call("C", "A", "branch C from A")
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", a, b, c
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_req_id_lineage_is_shown_in_header_and_metadata(page: Page, req_id_viewer_url):
+    url, _a, b, _c = req_id_viewer_url
+    page.goto(f"{url}/")
+    page.locator(f'.timeline-input[data-key="call:{b}"]').click()
+    page.wait_for_timeout(400)
+
+    # The lineage header names the request and its declared predecessor rather
+    # than an inferred parent source.
+    expect(page.locator("#lineage")).to_contain_text("B ·")
+    expect(page.locator("#lineage")).to_contain_text("← req A")
+
+    page.get_by_role("button", name="Metadata").click()
+    expect(page.locator("#exact")).to_contain_text('req_id: "B"')
+    expect(page.locator("#exact")).to_contain_text('prev_req_id: "A"')
+
+
+def test_branch_view_is_disabled_even_with_saved_preference(
+    page: Page, req_id_viewer_url
+):
+    url, _a, _b, _c = req_id_viewer_url
+    page.add_init_script(
+        "() => localStorage.setItem('insequent.timelineView', 'branches')"
+    )
+    page.goto(f"{url}/")
+    page.wait_for_selector(".timeline-item", timeout=20000)
+
+    assert page.evaluate("() => FRONTEND_CONFIG.branchGraph.enabled") is False
+    assert page.evaluate("() => state.timelineView") == "list"
+    expect(page.locator("#view-branches")).to_have_count(0)
+    expect(page.locator("#orientation-switch")).to_have_count(0)
+    expect(page.locator("#timeline")).not_to_have_class(re.compile(r"\bhidden\b"))
+    expect(page.locator("#branch-graph")).to_have_class(re.compile(r"\bhidden\b"))
+    expect(page.locator(".branch-node")).to_have_count(0)
+
+    # Even a direct stale call cannot activate or render the graph.
+    result = page.evaluate(
+        """() => {
+          setTimelineView("branches");
+          renderBranchGraph(state.timelineItems);
+          return {
+            view: state.timelineView,
+            nodes: document.querySelectorAll(".branch-node").length,
+          };
+        }"""
+    )
+    assert result == {"view": "list", "nodes": 0}
+
+
+def test_timeline_pane_is_resizable_and_persists_width(page: Page, req_id_viewer_url):
+    url, _a, _b, _c = req_id_viewer_url
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{url}/")
+    handle = page.get_by_role("separator", name="Resize Timeline")
+    expect(handle).to_be_visible()
+
+    before = page.locator(".timeline-pane").bounding_box()["width"]
+    box = handle.bounding_box()
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + 100)
+    page.mouse.down()
+    page.mouse.move(box["x"] + box["width"] / 2 + 90, box["y"] + 100)
+    page.mouse.up()
+
+    after = page.locator(".timeline-pane").bounding_box()["width"]
+    assert after >= before + 70, (before, after)
+    stored = page.evaluate("() => Number(localStorage.getItem('insequent.timelinePaneWidth'))")
+    assert abs(stored - after) <= 2, (stored, after)
+
+    page.reload()
+    persisted = page.locator(".timeline-pane").bounding_box()["width"]
+    assert abs(persisted - after) <= 2, (persisted, after)
+
+
+def test_other_pane_focus_targets_owning_timeline_item(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    page.locator('.timeline-input[data-key="call:3"]').click()
+
+    # Focusing a real Exact-state fragment highlights and focuses its list item.
+    exact_fragment = page.locator('#exact [data-update-entry^="3:"]').first
+    exact_fragment.click()
+    expect(page.locator('.timeline-input[data-key="call:3"]')).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+    expect(page.locator('.timeline-input[data-key="call:3"]')).to_be_focused()
+
+    # Historical parts may belong to a different call than the current state.
+    # Their timeline focus changes independently and must not replace that state.
+    focused = page.evaluate(
+        """async () => {
+          const historicalPart = document.createElement("span");
+          historicalPart.dataset.updateEntry = "2:0";
+          document.querySelector("#exact").appendChild(historicalPart);
+          await focusUpdateFromState(historicalPart);
+          historicalPart.remove();
+          return {
+            selected: state.selected.id,
+            focus: state.timelineFocus,
+          };
+        }"""
+    )
+    assert focused == {
+        "selected": 3,
+        "focus": {"key": "call:2", "phase": "input"},
+    }
+    expect(page.locator('.timeline-input[data-key="call:2"]')).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+    expect(page.locator('.timeline-input[data-key="call:2"]')).to_be_focused()
+    expect(page.locator('.timeline-input[data-key="call:3"]')).not_to_have_class(
+        re.compile(r"\bactive\b")
+    )
+
+
+def test_three_thousand_calls_render_without_quadratic_ui_work(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    result = page.evaluate(
+        """() => {
+          const origin = Date.parse("2026-07-25T10:00:00Z");
+          const items = Array.from({length: 3000}, (_, index) => ({
+            type: "call",
+            id: 10000 + index,
+            sequence: index + 1,
+            created_at: new Date(origin + index * 10).toISOString(),
+            duration_ms: 1,
+            status: "complete",
+            branch_id: "main",
+            label: "rewrite",
+            request_state_id: 10000 + index,
+            parent_state_id: index ? 9999 + index : null,
+          }));
+          const startedAt = performance.now();
+          renderUpdateCards(items);
+          renderTimelineEvents(items);
+          const elapsed = performance.now() - startedAt;
+          state.observer?.disconnect();
+          return {
+            elapsed,
+            timelineEvents: document.querySelectorAll(".timeline-item").length,
+            updateCards: document.querySelectorAll(".update-card").length,
+            mixedMaxCalls: FRONTEND_CONFIG.mixedTrace.maxCalls,
+            retainedPreview: limitedMixedTraceText("x".repeat(10000)).length,
+            contentVisibility: getComputedStyle(
+              document.querySelector(".timeline-item")
+            ).contentVisibility,
+          };
+        }"""
+    )
+    assert result["timelineEvents"] == 6000
+    assert result["updateCards"] == 6000
+    assert result["mixedMaxCalls"] == 12
+    assert result["retainedPreview"] < 1100
+    assert result["contentVisibility"] == "auto"
+    assert result["elapsed"] < 5000, result

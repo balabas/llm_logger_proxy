@@ -85,6 +85,8 @@ class TraceStore:
                     thoughts_blob_hash TEXT REFERENCES blobs(hash),
                     raw_response_blob_hash TEXT REFERENCES blobs(hash),
                     status TEXT NOT NULL,
+                    req_id TEXT,
+                    prev_req_id TEXT,
                     metadata_json TEXT NOT NULL
                 );
 
@@ -161,6 +163,16 @@ class TraceStore:
                 self._db.execute(
                     "ALTER TABLE calls ADD COLUMN thoughts_blob_hash TEXT REFERENCES blobs(hash)"
                 )
+            # Caller-assigned request identity, so the notebook can declare its
+            # own branch tree by pointing each request at its predecessor.
+            if "req_id" not in call_columns:
+                self._db.execute("ALTER TABLE calls ADD COLUMN req_id TEXT")
+            if "prev_req_id" not in call_columns:
+                self._db.execute("ALTER TABLE calls ADD COLUMN prev_req_id TEXT")
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_calls_req_id "
+                "ON calls(session_id, req_id)"
+            )
             self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_states_branch_root "
                 "ON states(session_id, branch_root_id, id DESC)"
@@ -573,10 +585,29 @@ class TraceStore:
         branch_id: str = "main",
         purpose: str = "chat",
         explicit_parent_state: int | None = None,
+        req_id: str | None = None,
+        prev_req_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> int:
         created = _now()
         with self._lock:
+            # A caller-declared predecessor pins the parent exactly, the same way
+            # an explicit parent state does, so the notebook's own branch tree is
+            # honoured instead of being re-inferred by similarity.
+            if explicit_parent_state is None and prev_req_id is not None:
+                prev = self._db.execute(
+                    """
+                    SELECT request_state_id FROM calls
+                    WHERE session_id=? AND req_id=?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (session_id, prev_req_id),
+                ).fetchone()
+                if prev is None:
+                    raise ValueError(
+                        f"prev_req_id {prev_req_id!r} has no matching call in this session"
+                    )
+                explicit_parent_state = prev["request_state_id"]
             manifest = self._build_manifest(request)
             (
                 parent_id,
@@ -660,8 +691,9 @@ class TraceStore:
                     """
                     INSERT INTO calls(
                         created_at, session_id, branch_id, branch_root_id, purpose,
-                        chronological_parent_id, request_state_id, status, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)
+                        chronological_parent_id, request_state_id, status,
+                        req_id, prev_req_id, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
                     """,
                     (
                         created,
@@ -671,6 +703,8 @@ class TraceStore:
                         purpose,
                         previous["id"] if previous else None,
                         state_id,
+                        req_id,
+                        prev_req_id,
                         _json(metadata or {}),
                     ),
                 )
@@ -1194,6 +1228,8 @@ class TraceStore:
                 "parent_state_id": row["parent_state_id"],
                 "parent_source": row["parent_source"],
                 "similarity": row["similarity"],
+                "req_id": row["req_id"],
+                "prev_req_id": row["prev_req_id"],
                 "diff": self._resolve(call_diff),
                 "input_parent_call_id": input_parent_call_id,
                 "input_parent_source": input_parent_source,
@@ -1290,27 +1326,59 @@ class TraceStore:
                     """,
                     (session_id, session_id, limit),
                 ).fetchall()
+            call_ids = [
+                row["item_id"] for row in rows if row["item_type"] == "call"
+            ]
+            event_ids = [
+                row["item_id"] for row in rows if row["item_type"] == "event"
+            ]
+            calls: dict[int, sqlite3.Row] = {}
+            events: dict[int, sqlite3.Row] = {}
+            # Stay below the conservative SQLite host-parameter limit used by
+            # older distributions while still replacing the previous N+1
+            # query pattern with a handful of batches.
+            for offset in range(0, len(call_ids), 900):
+                batch = call_ids[offset:offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                call_rows = self._db.execute(
+                    f"""
+                    SELECT c.id, c.session_id, c.branch_id, c.branch_root_id,
+                           c.purpose AS label, c.status, c.req_id, c.prev_req_id,
+                           c.request_state_id, s.parent_state_id,
+                           c.metadata_json
+                    FROM calls c JOIN states s ON s.id=c.request_state_id
+                    WHERE c.id IN ({placeholders})
+                    """,
+                    batch,
+                ).fetchall()
+                calls.update({item["id"]: item for item in call_rows})
+            for offset in range(0, len(event_ids), 900):
+                batch = event_ids[offset:offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                event_rows = self._db.execute(
+                    f"""
+                    SELECT id, session_id, branch_id, kind AS label,
+                           'event' AS status
+                    FROM events
+                    WHERE id IN ({placeholders})
+                    """,
+                    batch,
+                ).fetchall()
+                events.update({item["id"]: item for item in event_rows})
             items: list[dict[str, Any]] = []
             for row in reversed(rows):
-                if row["item_type"] == "call":
-                    item = self._db.execute(
-                        """
-                        SELECT id, session_id, branch_id, branch_root_id,
-                               purpose AS label, status, metadata_json
-                        FROM calls WHERE id=?
-                        """,
-                        (row["item_id"],),
-                    ).fetchone()
-                else:
-                    item = self._db.execute(
-                        "SELECT id, session_id, branch_id, kind AS label, 'event' AS status FROM events WHERE id=?",
-                        (row["item_id"],),
-                    ).fetchone()
+                item = (
+                    calls.get(row["item_id"])
+                    if row["item_type"] == "call"
+                    else events.get(row["item_id"])
+                )
                 if item:
                     item_data = dict(item)
                     metadata = json.loads(item_data.pop("metadata_json", "{}"))
                     if isinstance(metadata.get("duration_ms"), (int, float)):
                         item_data["duration_ms"] = metadata["duration_ms"]
+                    if metadata.get("debug_label"):
+                        item_data["debug_label"] = metadata["debug_label"]
                     items.append(
                         {
                             "sequence": row["sequence"],

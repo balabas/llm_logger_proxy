@@ -1,3 +1,24 @@
+const FRONTEND_CONFIG = Object.freeze({
+  branchGraph: Object.freeze({
+    enabled: false,
+    lanePitch: 31,
+    overlapShift: 8,
+    bandPitch: 32,
+    rowGap: 14,
+    edgeHoverWidth: 16,
+  }),
+  timeline: Object.freeze({
+    minWidth: 205,
+    otherPanesMinWidth: 780,
+    storageKey: "insequent.timelinePaneWidth",
+  }),
+  mixedTrace: Object.freeze({
+    maxCalls: 12,
+    maxHistoricalChars: 250000,
+    maxEntryChars: 1000,
+  }),
+});
+
 const state = {
   selected: null,
   detail: null,
@@ -11,6 +32,7 @@ const state = {
   lastTimelineKey: null,
   timelineItems: [],
   mixedSegmentDetails: [],
+  mixedHistoryTruncated: false,
   liveBusy: false,
   followedUpdateKey: null,
   pendingSelection: null,
@@ -19,7 +41,13 @@ const state = {
   updatesUserScrollVersion: 0,
   selectionVersion: 0,
   selectedPhase: "input",
+  timelineFocus: null,
   checkpointKeys: new Set(),
+  timelineView: "list",
+  branchOrientation:
+    localStorage.getItem("insequent.branchOrientation") === "horizontal"
+      ? "horizontal"
+      : "vertical",
 };
 
 const $ = id => document.getElementById(id);
@@ -87,6 +115,11 @@ async function fetchJson(url, options) {
 
 function itemKey(item) {
   return `${item.type}:${item.id}`;
+}
+
+function focusedTimelineKey() {
+  return state.timelineFocus?.key
+    || (state.selected ? itemKey(state.selected) : null);
 }
 
 function responseValue(detail) {
@@ -895,6 +928,14 @@ function unchangedInputNoticeHtml(detail, entries) {
     </div>`;
 }
 
+function limitedMixedTraceText(value) {
+  const text = String(value || "");
+  const limit = FRONTEND_CONFIG.mixedTrace.maxEntryChars;
+  return text.length <= limit
+    ? text
+    : `${text.slice(0, limit)}\n… retained trace text truncated …`;
+}
+
 function mixedStateHtml(text, entries, anchors = null) {
   const boundary = text.indexOf("\noutput:");
   // Text that some entry explicitly removed. A removal owns its removed text and
@@ -991,8 +1032,12 @@ function mixedStateHtml(text, entries, anchors = null) {
     const entryAttribute =
       `data-update-entry="${entry.entryKey}"${fragmentAttribute} role="button" tabindex="0"`;
     if (change.historical) {
-      const oldText = entry.oldText || entry.mixedOldText || "";
-      const newText = entry.newText || entry.text || "";
+      const oldText = limitedMixedTraceText(
+        entry.oldText || entry.mixedOldText || "",
+      );
+      const newText = limitedMixedTraceText(
+        entry.newText || entry.text || "",
+      );
       // The selected call's own absent addition is still "added" (it is what the
       // call produced). An earlier call's absent addition is retained as removed
       // history — unless a real removal entry already shows that exact text, in
@@ -1012,7 +1057,9 @@ function mixedStateHtml(text, entries, anchors = null) {
       }
       html += "\n";
     } else if (entry.operation === "-") {
-      const removed = entry.mixedOldText || entry.oldText || entry.text;
+      const removed = limitedMixedTraceText(
+        entry.mixedOldText || entry.oldText || entry.text,
+      );
       html += `\n${changePartHtml(
         "removed",
         removed,
@@ -1025,7 +1072,7 @@ function mixedStateHtml(text, entries, anchors = null) {
       if (entry.operation === "~" && entry.mixedOldText && change.firstRange) {
         html += changePartHtml(
           "removed",
-          entry.mixedOldText,
+          limitedMixedTraceText(entry.mixedOldText),
           category,
           true,
           entryAttribute,
@@ -1123,10 +1170,20 @@ function phaseLabel(phase) {
   return phase === "output" ? "← output" : "→ input";
 }
 
-function updateCardHeadHtml(id, phase) {
+// The step's debug label rides on an existing line — the timeline item's action
+// row and the update card's head — never a new one. It truncates rather than
+// wraps, and is omitted entirely when absent.
+function debugLabelHtml(label, className) {
+  if (!label) return "";
+  const text = escapeHtml(label);
+  return `<span class="${className}" title="${text}">${text}</span>`;
+}
+
+function updateCardHeadHtml(id, phase, debugLabel = null) {
   return `<div class="update-card-head trace-kind-${phase}">
       <span class="update-card-phase">${phaseLabel(phase)}</span>
-      <span>LLM call #${escapeHtml(id)}</span>
+      <span class="update-card-id">LLM call #${escapeHtml(id)}</span>
+      ${debugLabelHtml(debugLabel, "update-card-debug")}
     </div>`;
 }
 
@@ -1138,7 +1195,8 @@ function createUpdateCard(item, phase) {
   card.dataset.phase = phase;
   card.dataset.type = item.type;
   card.dataset.id = item.id;
-  card.innerHTML = updateCardHeadHtml(item.id, phase);
+  if (item.debug_label) card.dataset.debugLabel = item.debug_label;
+  card.innerHTML = updateCardHeadHtml(item.id, phase, item.debug_label);
   state.observer.observe(card);
   return card;
 }
@@ -1255,7 +1313,8 @@ function compareTimelineEvents(left, right) {
 
 function renderTimelineEvents(items) {
   const events = timelinePhaseEvents(items);
-  for (const [index, block] of timelineCallBlocks(items).entries()) {
+  const callBlocks = timelineCallBlocks(items);
+  for (const [index, block] of callBlocks.entries()) {
     if (block.calls.length < 2) continue;
     const branchCount = new Set(
       block.calls.map(({ item }) => item.branch_id || "main"),
@@ -1305,34 +1364,535 @@ function renderTimelineEvents(items) {
     }
     const checkpoint = phase === "input" && state.checkpointKeys.has(key);
     button.innerHTML = `
-      <span class="item-label">${
-        phase === "input"
-          ? checkpoint ? "→ new state input" : "→ input"
-          : "← output"
-      }</span>
+      <span class="item-head">
+        <span class="item-label">${
+          phase === "input"
+            ? checkpoint ? "→ new state input" : "→ input"
+            : "← output"
+        }</span>
+        ${debugLabelHtml(item.debug_label, "item-debug")}
+      </span>
       <span class="item-meta">
         <span>#${item.id} · <b class="branch">${escapeHtml(item.branch_id || "main")}</b></span>
         <span>${escapeHtml(phase === "input" ? "sent" : item.status)}</span>
       </span>`;
     button.classList.toggle(
       "active",
-      state.selected
-        && itemKey(state.selected) === key
-        && state.selectedPhase === phase,
+      focusedTimelineKey() === key
+        && (state.timelineFocus?.phase || state.selectedPhase) === phase,
     );
     button.onclick = () => selectItem(item.type, item.id, button);
     $("timeline").appendChild(button);
   }
-  applyBranchIndentation();
+  applyBranchIndentation(callBlocks);
+  renderBranchGraph(items);
+}
+
+// The branch graph is the call tree. Each call's parent is the request it
+// continued: its declared predecessor (prev_req_id) when the caller named one,
+// otherwise the most recent earlier call that produced its parent state. A
+// parent with several children is a branch; a lane with no more children ends.
+function buildBranchGraph(items) {
+  const calls = items
+    .filter(item => item.type === "call")
+    .slice()
+    .sort((left, right) => left.id - right.id);
+  const byReqId = new Map();
+  for (const item of calls) {
+    if (item.req_id) byReqId.set(item.req_id, item.id);
+  }
+  const stateHead = new Map();
+  const parentOf = new Map();
+  const childCount = new Map();
+  for (const item of calls) {
+    let parent = null;
+    if (item.prev_req_id != null && byReqId.get(item.prev_req_id) !== item.id) {
+      parent = byReqId.get(item.prev_req_id) ?? null;
+    } else if (item.parent_state_id != null && stateHead.has(item.parent_state_id)) {
+      parent = stateHead.get(item.parent_state_id);
+    }
+    parentOf.set(item.id, parent);
+    if (parent != null) childCount.set(parent, (childCount.get(parent) || 0) + 1);
+    stateHead.set(item.request_state_id, item.id);
+  }
+
+  // Lane assignment with reuse: a continuation keeps its parent's lane, a branch
+  // takes the lowest free lane, and a lane frees when its tip has no children
+  // left to place. This keeps a mostly-linear trace narrow.
+  const laneTip = [];
+  const laneOf = new Map();
+  const extended = new Set();
+  const remaining = new Map(childCount);
+  const nodes = [];
+  calls.forEach((item, depth) => {
+    const parent = parentOf.get(item.id);
+    let lane;
+    if (parent != null && laneOf.has(parent) && !extended.has(parent)) {
+      lane = laneOf.get(parent);
+      extended.add(parent);
+    } else {
+      lane = laneTip.findIndex(tip => tip == null);
+      if (lane < 0) {
+        lane = laneTip.length;
+        laneTip.push(null);
+      }
+    }
+    laneOf.set(item.id, lane);
+    laneTip[lane] = item.id;
+    nodes.push({ item, id: item.id, depth, lane, parentId: parent });
+    if (parent != null) {
+      remaining.set(parent, (remaining.get(parent) || 0) - 1);
+      const parentLane = laneOf.get(parent);
+      if (remaining.get(parent) === 0 && laneTip[parentLane] === parent) {
+        laneTip[parentLane] = null;
+      }
+    }
+  });
+  const nodeById = new Map(nodes.map(node => [node.id, node]));
+  return { nodes, nodeById, laneCount: Math.max(laneTip.length, 1) };
+}
+
+const BRANCH_MARGIN = 18;
+const BRANCH_NODE_R = 5;
+const BRANCH_HORIZONTAL_STEP = 138;
+const BRANCH_HORIZONTAL_GAP = 54;
+let branchResizeObserver = null;
+let branchResizeFrame = 0;
+let branchRenderedWidth = 0;
+
+function branchNodeLabel(item) {
+  // The step name leads — it is what identifies a call to a reader — with the id
+  // and branch as secondary. A caller-set debug label is best; otherwise the
+  // call's purpose (overview, rewrite, …) still names the step; the id is the
+  // last resort.
+  const step = item.debug_label
+    ? escapeHtml(item.debug_label)
+    : (item.label ? escapeHtml(item.label) : "");
+  const branch = escapeHtml(item.branch_id || "main");
+  return `<span class="branch-node-step">${step || `#${item.id}`}</span>`
+    + `<span class="branch-node-meta">${step ? `#${item.id} · ` : ""}${branch}</span>`;
+}
+
+function branchLaneColor(lane) {
+  return `hsl(${(145 + lane * 37) % 360}, 42%, 46%)`;
+}
+
+function wrapBranchLane(slot, columns) {
+  const band = Math.floor(slot / columns);
+  const offset = slot % columns;
+  return {
+    band,
+    column: band % 2 === 0 ? offset : columns - 1 - offset,
+  };
+}
+
+function horizontalBranchMarkup(nodes, nodeById, laneCount) {
+  const depthCount = nodes.length;
+  const width = BRANCH_MARGIN * 2 + Math.max(depthCount - 1, 0) * BRANCH_HORIZONTAL_STEP;
+  const height = BRANCH_MARGIN * 2 + Math.max(laneCount - 1, 0) * BRANCH_HORIZONTAL_GAP + 24;
+  const xOf = node => BRANCH_MARGIN + node.depth * BRANCH_HORIZONTAL_STEP;
+  const yOf = node => BRANCH_MARGIN + node.lane * BRANCH_HORIZONTAL_GAP;
+  const edges = nodes
+    .filter(node => node.parentId != null && nodeById.has(node.parentId))
+    .map(node => {
+      const parent = nodeById.get(node.parentId);
+      const x1 = xOf(parent);
+      const y1 = yOf(parent);
+      const x2 = xOf(node);
+      const y2 = yOf(node);
+      const branched = parent.lane !== node.lane;
+      const d = branched
+        ? `M ${x1} ${y1} C ${(x1 + x2) / 2} ${y1}, ${(x1 + x2) / 2} ${y2}, ${x2} ${y2}`
+        : `M ${x1} ${y1} L ${x2} ${y2}`;
+      const attributes = `data-parent-id="${parent.id}" data-child-id="${node.id}"`;
+      return `<path class="branch-edge${branched ? " branch-edge-split" : ""}" d="${d}" stroke="${branchLaneColor(node.lane)}" ${attributes}/>`
+        + `<path class="branch-edge-hit" d="${d}" ${attributes}/>`;
+    })
+    .join("");
+  const svg = `<svg class="branch-graph-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${edges}
+    ${nodes.map(node => {
+      const cx = xOf(node);
+      const cy = yOf(node);
+      const running = node.item.status === "running";
+      const checkpoint = state.checkpointKeys.has(`call:${node.id}`);
+      const active = focusedTimelineKey() === `call:${node.id}`;
+      return `<circle class="branch-dot${running ? " running" : ""}${checkpoint ? " checkpoint" : ""}${active ? " active" : ""}"
+        cx="${cx}" cy="${cy}" r="${BRANCH_NODE_R}" fill="${branchLaneColor(node.lane)}" data-call-id="${node.id}"/>`;
+    }).join("")}
+  </svg>`;
+  const labels = nodes.map(node => {
+    const cx = xOf(node);
+    const cy = yOf(node);
+    const key = `call:${node.id}`;
+    const active = focusedTimelineKey() === key;
+    return `<button class="branch-node${active ? " active" : ""} horizontal"
+      data-key="${key}" data-call-id="${node.id}" style="left:${cx}px;top:${cy + BRANCH_NODE_R + 3}px;"
+      title="LLM call #${node.id}${node.item.debug_label ? ` · ${escapeHtml(node.item.debug_label)}` : ""} · ${escapeHtml(node.item.branch_id || "main")}">
+      ${branchNodeLabel(node.item)}
+    </button>`;
+  }).join("");
+  return { width, height, html: `<div class="branch-canvas" style="width:${width + 220}px;height:${height}px;">${svg}${labels}</div>` };
+}
+
+function verticalBranchMarkup(nodes, nodeById, width) {
+  const config = FRONTEND_CONFIG.branchGraph;
+  const padding = 8;
+  const usableWidth = Math.max(config.lanePitch, width - padding * 2);
+  const columns = Math.max(1, Math.floor(usableWidth / config.lanePitch));
+  const edges = nodes
+    .filter(node => node.parentId != null && nodeById.has(node.parentId))
+    .map(node => ({
+      node,
+      parent: nodeById.get(node.parentId),
+      lane: node.lane,
+    }));
+
+  const rows = [];
+  let rowTop = BRANCH_MARGIN;
+  for (let depth = 0; depth < nodes.length; depth += 1) {
+    const active = new Set([nodes[depth].lane]);
+    for (const edge of edges) {
+      if (edge.parent.depth <= depth && depth <= edge.node.depth) active.add(edge.lane);
+    }
+    const lanes = [...active].sort((left, right) => left - right);
+    const slotByLane = new Map(lanes.map((lane, slot) => [lane, slot]));
+    const bands = Math.max(1, Math.ceil(lanes.length / columns));
+    rows.push({ top: rowTop, slotByLane });
+    rowTop += bands * config.bandPitch + config.rowGap;
+  }
+  const height = rowTop + BRANCH_MARGIN;
+
+  const position = (lane, depth) => {
+    const wrapped = wrapBranchLane(rows[depth].slotByLane.get(lane), columns);
+    return {
+      x: padding + wrapped.column * config.lanePitch + config.lanePitch / 2,
+      y: rows[depth].top + wrapped.band * config.bandPitch + config.bandPitch / 2,
+    };
+  };
+  const positions = new Map(nodes.map(node => [node.id, position(node.lane, node.depth)]));
+  const geometries = edges.map(edge => {
+    const points = [{ ...positions.get(edge.parent.id) }];
+    for (let depth = edge.parent.depth; depth <= edge.node.depth; depth += 1) {
+      if (!rows[depth].slotByLane.has(edge.lane)) continue;
+      const point = position(edge.lane, depth);
+      const previous = points[points.length - 1];
+      if (point.x !== previous.x || point.y !== previous.y) points.push(point);
+    }
+    const segments = [];
+    for (let index = 1; index < points.length; index += 1) {
+      const from = points[index - 1];
+      const to = points[index];
+      const dx = to.x - from.x;
+      const dy = to.y - from.y;
+      const length = Math.hypot(dx, dy) || 1;
+      let normalX = -dy / length;
+      let normalY = dx / length;
+      if (normalX < 0 || (Math.abs(normalX) < .001 && normalY < 0)) {
+        normalX *= -1;
+        normalY *= -1;
+      }
+      segments.push({
+        edge, index, from, to, normalX, normalY,
+        conflicts: new Set(), offset: 0, routed: false,
+      });
+    }
+    return { edge, points, segments };
+  });
+
+  const verticalCorridors = new Map();
+  const horizontalCorridors = new Map();
+  const identicalFragments = new Map();
+  for (const geometry of geometries) {
+    for (const segment of geometry.segments) {
+      const { from, to } = segment;
+      if (Math.abs(from.x - to.x) <= .25) {
+        const key = Math.round(from.x * 2) / 2;
+        if (!verticalCorridors.has(key)) verticalCorridors.set(key, []);
+        verticalCorridors.get(key).push({
+          segment,
+          start: Math.min(from.y, to.y),
+          end: Math.max(from.y, to.y),
+        });
+      } else if (Math.abs(from.y - to.y) <= .25) {
+        const key = Math.round(from.y * 2) / 2;
+        if (!horizontalCorridors.has(key)) horizontalCorridors.set(key, []);
+        horizontalCorridors.get(key).push({
+          segment,
+          start: Math.min(from.x, to.x),
+          end: Math.max(from.x, to.x),
+        });
+      } else {
+        const key = [
+          Math.round(from.x * 2), Math.round(from.y * 2),
+          Math.round(to.x * 2), Math.round(to.y * 2),
+        ].join(":");
+        if (!identicalFragments.has(key)) identicalFragments.set(key, []);
+        identicalFragments.get(key).push(segment);
+      }
+    }
+  }
+  const registerConflict = (left, right) => {
+    if (left.edge === right.edge) return;
+    left.conflicts.add(right);
+    right.conflicts.add(left);
+  };
+  for (const corridors of [verticalCorridors, horizontalCorridors]) {
+    for (const fragments of corridors.values()) {
+      fragments.sort((left, right) => left.start - right.start || left.end - right.end);
+      for (let left = 0; left < fragments.length; left += 1) {
+        for (let right = left + 1; right < fragments.length; right += 1) {
+          if (fragments[right].start >= fragments[left].end - 1) break;
+          registerConflict(fragments[left].segment, fragments[right].segment);
+        }
+      }
+    }
+  }
+  for (const fragments of identicalFragments.values()) {
+    for (let left = 0; left < fragments.length; left += 1) {
+      for (let right = left + 1; right < fragments.length; right += 1) {
+        registerConflict(fragments[left], fragments[right]);
+      }
+    }
+  }
+
+  const candidates = [0];
+  for (let distance = 1; distance <= 8; distance += 1) {
+    candidates.push(-distance * config.overlapShift, distance * config.overlapShift);
+  }
+  const segments = geometries
+    .flatMap(geometry => geometry.segments)
+    .sort((left, right) => right.conflicts.size - left.conflicts.size);
+  for (const segment of segments) {
+    const used = new Set(
+      [...segment.conflicts].filter(other => other.routed).map(other => other.offset),
+    );
+    segment.offset = candidates.find(candidate => {
+      if (used.has(candidate)) return false;
+      return [segment.from, segment.to].every(point => {
+        const x = point.x + candidate * segment.normalX;
+        const y = point.y + candidate * segment.normalY;
+        return x >= 3 && x <= width - 3 && y >= 3 && y <= height - 3;
+      });
+    }) ?? 0;
+    segment.routed = true;
+  }
+
+  const edgeMarkup = geometries.map(geometry => {
+    const { edge, points, segments: routeSegments } = geometry;
+    const pointOffsets = points.map((point, index) => {
+      if (index === 0 || index === points.length - 1) return { x: 0, y: 0 };
+      const before = routeSegments[index - 1];
+      const after = routeSegments[index];
+      return {
+        x: (before.offset * before.normalX + after.offset * after.normalX) / 2,
+        y: (before.offset * before.normalY + after.offset * after.normalY) / 2,
+      };
+    });
+    let d = `M ${points[0].x} ${points[0].y}`;
+    for (const segment of routeSegments) {
+      const shiftX = segment.offset * segment.normalX;
+      const shiftY = segment.offset * segment.normalY;
+      const target = pointOffsets[segment.index];
+      const midpoint = (segment.from.y + segment.to.y) / 2;
+      d += ` C ${segment.from.x + shiftX} ${midpoint + shiftY},`
+        + ` ${segment.to.x + shiftX} ${midpoint + shiftY},`
+        + ` ${segment.to.x + target.x} ${segment.to.y + target.y}`;
+    }
+    const branched = edge.parent.lane !== edge.node.lane;
+    const attributes = `data-parent-id="${edge.parent.id}" data-child-id="${edge.node.id}"`;
+    return `<path class="branch-edge${branched ? " branch-edge-split" : ""}" d="${d}" stroke="${branchLaneColor(edge.lane)}" ${attributes}/>`
+      + `<path class="branch-edge-hit" d="${d}" ${attributes}/>`;
+  }).join("");
+
+  const dots = nodes.map(node => {
+    const point = positions.get(node.id);
+    const running = node.item.status === "running";
+    const checkpoint = state.checkpointKeys.has(`call:${node.id}`);
+    const active = focusedTimelineKey() === `call:${node.id}`;
+    return `<circle class="branch-dot${running ? " running" : ""}${checkpoint ? " checkpoint" : ""}${active ? " active" : ""}"
+      cx="${point.x}" cy="${point.y}" r="${BRANCH_NODE_R}" fill="${branchLaneColor(node.lane)}" data-call-id="${node.id}"/>`;
+  }).join("");
+  const labels = nodes.map(node => {
+    const point = positions.get(node.id);
+    const roomRight = width - point.x;
+    const placeLeft = roomRight < 150;
+    const available = Math.max(76, Math.min(190, placeLeft ? point.x - 18 : roomRight - 18));
+    const active = focusedTimelineKey() === `call:${node.id}`;
+    return `<button class="branch-node${active ? " active" : ""}${placeLeft ? " place-left" : ""}"
+      data-key="call:${node.id}" data-call-id="${node.id}"
+      style="left:${point.x + (placeLeft ? -8 : 8)}px;top:${point.y}px;width:${available}px;"
+      title="LLM call #${node.id}${node.item.debug_label ? ` · ${escapeHtml(node.item.debug_label)}` : ""} · ${escapeHtml(node.item.branch_id || "main")}">
+      ${branchNodeLabel(node.item)}
+    </button>`;
+  }).join("");
+  const svg = `<svg class="branch-graph-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${edgeMarkup}${dots}</svg>`;
+  return { width, height, html: `<div class="branch-canvas" style="width:${width}px;height:${height}px;">${svg}${labels}</div>` };
+}
+
+function clearBranchHover(container) {
+  container.classList.remove("has-hover", "lane-hover", "node-hover");
+  container.querySelectorAll(".hover-related, .hover-focus").forEach(element => {
+    element.classList.remove("hover-related", "hover-focus");
+  });
+}
+
+function markBranchNode(container, id, focus = false) {
+  container.querySelectorAll(`[data-call-id="${id}"]`).forEach(element => {
+    element.classList.add("hover-related");
+    if (focus) element.classList.add("hover-focus");
+  });
+}
+
+function highlightBranchEdge(container, edge) {
+  clearBranchHover(container);
+  container.classList.add("has-hover", "lane-hover");
+  edge.classList.add("hover-related");
+  markBranchNode(container, edge.dataset.parentId);
+  markBranchNode(container, edge.dataset.childId);
+}
+
+function highlightBranchNode(container, id) {
+  clearBranchHover(container);
+  container.classList.add("has-hover", "node-hover");
+  markBranchNode(container, id, true);
+  container.querySelectorAll(".branch-edge").forEach(edge => {
+    if (edge.dataset.parentId === id || edge.dataset.childId === id) {
+      edge.classList.add("hover-related");
+      markBranchNode(container, edge.dataset.parentId);
+      markBranchNode(container, edge.dataset.childId);
+    }
+  });
+}
+
+function bindBranchGraphInteractions(container) {
+  container.querySelectorAll(".branch-node").forEach(button => {
+    button.onclick = () => selectItem("call", Number(button.dataset.callId), button);
+    button.onmouseenter = () => highlightBranchNode(container, button.dataset.callId);
+    button.onmouseleave = () => clearBranchHover(container);
+  });
+  container.querySelectorAll(".branch-dot").forEach(dot => {
+    dot.onmouseenter = () => highlightBranchNode(container, dot.dataset.callId);
+    dot.onmouseleave = () => clearBranchHover(container);
+  });
+  container.querySelectorAll(".branch-edge-hit").forEach(hit => {
+    const edge = hit.previousElementSibling;
+    hit.onmouseenter = () => highlightBranchEdge(container, edge);
+    hit.onmouseleave = () => clearBranchHover(container);
+  });
+}
+
+function renderBranchGraph(items) {
+  const container = $("branch-graph");
+  if (
+    !FRONTEND_CONFIG.branchGraph.enabled
+    || !container
+    || state.timelineView !== "branches"
+  ) return;
+  const oldScrollHeight = Math.max(container.scrollHeight, 1);
+  const oldScrollRatio = container.scrollTop / oldScrollHeight;
+  const { nodes, nodeById, laneCount } = buildBranchGraph(items);
+  const horizontal = state.branchOrientation === "horizontal";
+  container.classList.toggle("horizontal", horizontal);
+  container.style.setProperty(
+    "--branch-edge-hover-width",
+    `${FRONTEND_CONFIG.branchGraph.edgeHoverWidth}px`,
+  );
+  const availableWidth = Math.max(120, container.clientWidth - 20);
+  branchRenderedWidth = container.clientWidth;
+  const markup = horizontal
+    ? horizontalBranchMarkup(nodes, nodeById, laneCount)
+    : verticalBranchMarkup(nodes, nodeById, availableWidth);
+  container.style.setProperty("--branch-canvas-width", `${markup.width}px`);
+  container.style.setProperty("--branch-canvas-height", `${markup.height}px`);
+  container.innerHTML = markup.html;
+  bindBranchGraphInteractions(container);
+  container.scrollTop = oldScrollRatio * container.scrollHeight;
+}
+
+function initBranchGraphResize() {
+  const container = $("branch-graph");
+  if (!container || branchResizeObserver) return;
+  branchResizeObserver = new ResizeObserver(() => {
+    if (
+      state.timelineView !== "branches" ||
+      state.branchOrientation !== "vertical" ||
+      container.clientWidth === branchRenderedWidth
+    ) return;
+    cancelAnimationFrame(branchResizeFrame);
+    branchResizeFrame = requestAnimationFrame(() => renderBranchGraph(state.timelineItems));
+  });
+  branchResizeObserver.observe(container);
+}
+
+function syncBranchGraphSelection() {
+  const container = $("branch-graph");
+  if (!container || state.timelineView !== "branches") return;
+  const key = focusedTimelineKey();
+  container.querySelectorAll(".branch-node, .branch-dot").forEach(node => {
+    const nodeKey = node.dataset.key || `call:${node.dataset.callId}`;
+    node.classList.toggle("active", nodeKey === key);
+  });
+}
+
+// Selection owns the state rendered in Mixed/Exact. Timeline focus is separate:
+// a historical fragment in those panes can point back to the call that created
+// it without replacing the currently reconstructed state.
+function setTimelineFocus(key, phase = "input", scroll = false, element = null) {
+  state.timelineFocus = { key, phase };
+  state.selectedPhase = phase;
+  document.querySelectorAll(".timeline-item").forEach(node => {
+    const nodeKey = node.dataset.key || node.dataset.callKey;
+    node.classList.toggle(
+      "active",
+      nodeKey === key && node.dataset.phase === phase,
+    );
+  });
+  syncBranchGraphSelection();
+  if (!scroll) return;
+  const graphTarget = state.timelineView === "branches"
+    ? $("branch-graph")?.querySelector(`.branch-node[data-key="${key}"]`)
+    : null;
+  const listTarget = phase === "output"
+    ? document.querySelector(`.timeline-output[data-call-key="${key}"]`)
+    : document.querySelector(`.timeline-input[data-key="${key}"]`);
+  const target = graphTarget || element || listTarget;
+  target?.focus({ preventScroll: true });
+  focusScrollIntoView(target, "nearest");
+}
+
+function applyTimelineView() {
+  const branches = FRONTEND_CONFIG.branchGraph.enabled
+    && state.timelineView === "branches";
+  if (!branches) state.timelineView = "list";
+  $("timeline").classList.toggle("hidden", branches);
+  $("branch-graph").classList.toggle("hidden", !branches);
+  $("orientation-switch")?.classList.toggle("hidden", !branches);
+  document.querySelectorAll(".view-switch-btn[data-view]").forEach(button => {
+    button.classList.toggle("active", button.dataset.view === state.timelineView);
+  });
+  document.querySelectorAll(".view-switch-btn[data-orient]").forEach(button => {
+    button.classList.toggle("active", button.dataset.orient === state.branchOrientation);
+  });
+  if (branches) {
+    renderBranchGraph(state.timelineItems);
+    syncBranchGraphSelection();
+  }
+}
+
+function visibleScrollableChild(container, selector) {
+  const rect = container.getBoundingClientRect();
+  const x = Math.min(rect.right - 2, rect.left + Math.max(2, rect.width / 2));
+  for (let y = rect.top + 2; y < rect.bottom; y += 16) {
+    const child = document.elementFromPoint(x, y)?.closest(selector);
+    if (child && container.contains(child)) return child;
+  }
+  return null;
 }
 
 function captureTimelineViewport() {
   const container = $("timeline");
   const containerRect = container.getBoundingClientRect();
-  const visibleItem = [...container.querySelectorAll(".timeline-item")].find(node => {
-    const rect = node.getBoundingClientRect();
-    return rect.bottom > containerRect.top && rect.top < containerRect.bottom;
-  });
+  const visibleItem = visibleScrollableChild(container, ".timeline-item");
   return {
     scrollTop: container.scrollTop,
     nearBottom: container.scrollHeight - container.scrollTop - container.clientHeight < 80,
@@ -1349,8 +1909,10 @@ function captureTimelineViewport() {
 // user left it instead of being dragged along by every arriving event.
 function restoreTimelineViewport(anchor, stickToNewest = state.followNewItems) {
   const container = $("timeline");
-  if (anchor.nearBottom && stickToNewest) {
-    container.scrollTop = container.scrollHeight;
+  if (anchor.nearBottom) {
+    container.scrollTop = stickToNewest
+      ? container.scrollHeight
+      : anchor.scrollTop;
     return;
   }
   container.scrollTop = anchor.scrollTop;
@@ -1370,10 +1932,7 @@ function restoreTimelineViewport(anchor, stickToNewest = state.followNewItems) {
 function captureUpdatesViewport() {
   const container = $("updates");
   const containerRect = container.getBoundingClientRect();
-  const visibleCard = [...container.querySelectorAll(".update-card")].find(node => {
-    const rect = node.getBoundingClientRect();
-    return rect.bottom > containerRect.top && rect.top < containerRect.bottom;
-  });
+  const visibleCard = visibleScrollableChild(container, ".update-card");
   return {
     card: visibleCard || null,
     offset: visibleCard
@@ -1400,47 +1959,52 @@ function renderWaitingCalls(items) {
     </div>`;
 }
 
-function applyBranchIndentation() {
-  for (const currentBlock of timelineCallBlocks(state.timelineItems)) {
+function applyBranchIndentation(
+  callBlocks = timelineCallBlocks(state.timelineItems),
+) {
+  const layout = new Map();
+  for (const currentBlock of callBlocks) {
     const branchLanes = new Map();
     const parallel = currentBlock.calls.length > 1;
     for (const { item } of currentBlock.calls) {
       const branch = item.branch_id || "main";
       if (!branchLanes.has(branch)) {
-        const usedLanes = new Set(branchLanes.values());
-        let availableLane = 0;
-        while (usedLanes.has(availableLane)) availableLane += 1;
-        branchLanes.set(branch, availableLane);
+        branchLanes.set(branch, branchLanes.size);
       }
       const lane = branchLanes.get(branch);
-      const buttons = [
-        document.querySelector(`.timeline-input[data-key="${itemKey(item)}"]`),
-        document.querySelector(`.timeline-output[data-call-key="${itemKey(item)}"]`),
-      ].filter(Boolean);
-      if (!buttons.length) continue;
       const branchRoot = item.branch_root_id
         || branch.split("~parallel-", 1)[0]
         || "main";
       const visibleBranch = branch === branchRoot || lane === 0
         ? branchRoot
         : `${branchRoot} · p${lane + 1}`;
-      buttons.forEach(button => {
-        const branchColor = `hsl(${145 + lane * 31}, 36%, 42%)`;
-        button.style.setProperty("--branch-lane", lane);
-        button.style.setProperty("--branch-depth", parallel ? lane + 1 : 0);
-        button.style.setProperty("--branch-color", branchColor);
-        button.dataset.branchLane = String(lane);
-        button.dataset.branchDepth = String(parallel ? lane + 1 : 0);
-        button.classList.toggle("parallel-block", parallel);
-        button.classList.toggle("parallel-branch", lane > 0);
-        const branchLabel = button.querySelector(".branch");
-        if (branchLabel) branchLabel.textContent = visibleBranch;
-        button.title = parallel
-          ? `Stored branch ${branch} · parallel lane ${lane + 1}`
-          : `Stored branch ${branch}`;
+      layout.set(itemKey(item), {
+        branch,
+        branchColor: `hsl(${145 + lane * 31}, 36%, 42%)`,
+        depth: parallel ? lane + 1 : 0,
+        lane,
+        parallel,
+        visibleBranch,
       });
     }
   }
+  document.querySelectorAll(".timeline-item").forEach(button => {
+    const key = button.dataset.key || button.dataset.callKey;
+    const itemLayout = layout.get(key);
+    if (!itemLayout) return;
+    button.style.setProperty("--branch-lane", itemLayout.lane);
+    button.style.setProperty("--branch-depth", itemLayout.depth);
+    button.style.setProperty("--branch-color", itemLayout.branchColor);
+    button.dataset.branchLane = String(itemLayout.lane);
+    button.dataset.branchDepth = String(itemLayout.depth);
+    button.classList.toggle("parallel-block", itemLayout.parallel);
+    button.classList.toggle("parallel-branch", itemLayout.lane > 0);
+    const branchLabel = button.querySelector(".branch");
+    if (branchLabel) branchLabel.textContent = itemLayout.visibleBranch;
+    button.title = itemLayout.parallel
+      ? `Stored branch ${itemLayout.branch} · parallel lane ${itemLayout.lane + 1}`
+      : `Stored branch ${itemLayout.branch}`;
+  });
 }
 
 function keepFollowedUpdateVisible() {
@@ -1678,7 +2242,7 @@ async function loadUpdateCard(card) {
     card.querySelector("button")?.addEventListener("click", () => {
       card.classList.remove("load-error");
       card.classList.add("loading");
-      card.innerHTML = updateCardHeadHtml(card.dataset.id, card.dataset.phase || "input");
+      card.innerHTML = updateCardHeadHtml(card.dataset.id, card.dataset.phase || "input", card.dataset.debugLabel || null);
       loadUpdateCard(card);
     });
     return;
@@ -1688,6 +2252,8 @@ async function loadUpdateCard(card) {
   card.classList.remove("load-error");
   bindCardPhaseSelection(card);
   const phase = card.dataset.phase || "input";
+  const debugLabel = detail.metadata?.debug_label || card.dataset.debugLabel || null;
+  if (debugLabel) card.dataset.debugLabel = debugLabel;
   const checkpoint = isCheckpoint(detail);
   const identicalTo = identicalBaseCall(detail);
   const entries = updateEntries(detail);
@@ -1720,7 +2286,7 @@ async function loadUpdateCard(card) {
     // flushed to, then the response that arrived against it.
     card.innerHTML = phase === "output"
       ? `
-      ${updateCardHeadHtml(detail.id, phase)}
+      ${updateCardHeadHtml(detail.id, phase, debugLabel)}
       <div class="checkpoint-state">
         ${detail.thoughts ? `
           <section class="checkpoint-section checkpoint-thoughts trace-kind-thoughts" role="button" tabindex="0" data-checkpoint-scope="thoughts">
@@ -1735,7 +2301,9 @@ async function loadUpdateCard(card) {
       : `
       <button class="checkpoint-jump">
         <strong>◆ New current state</strong>
-        <span>LLM call #${detail.id}</span>
+        <span class="checkpoint-jump-id">LLM call #${detail.id}${
+          debugLabel ? ` <span class="update-card-debug">${escapeHtml(debugLabel)}</span>` : ""
+        }</span>
       </button>
       <div class="checkpoint-state">
         <section class="checkpoint-section checkpoint-input trace-kind-input" role="button" tabindex="0" data-checkpoint-scope="input">
@@ -1781,7 +2349,9 @@ async function loadUpdateCard(card) {
     card.innerHTML = `
       <button class="identical-jump" data-update-scope="input">
         <strong>↻ Identical call</strong>
-        <span>LLM call #${detail.id} = call #${identicalTo}</span>
+        <span>LLM call #${detail.id} = call #${identicalTo}${
+          debugLabel ? ` <span class="update-card-debug">${escapeHtml(debugLabel)}</span>` : ""
+        }</span>
         <small>No input, parameter, or output changes</small>
       </button>`;
     card.querySelector("button").onclick = () => selectItem(
@@ -1804,7 +2374,7 @@ async function loadUpdateCard(card) {
       ${updateEntryBodyHtml(entry)}
     </div>`).join("");
   card.innerHTML = `
-    ${updateCardHeadHtml(detail.id, phase)}
+    ${updateCardHeadHtml(detail.id, phase, debugLabel)}
     <div class="update-card-body">
       ${phase === "output" ? entriesHtml : notice + laneSnapshot + entriesHtml}
       ${phase === "output" ? notice : ""}
@@ -1873,6 +2443,7 @@ async function loadMixedSegment(type, id, selectionVersion = null) {
   if (type !== "call") {
     if (selectionIsCurrent()) {
       state.mixedSegmentDetails = selectedDetail ? [selectedDetail] : [];
+      state.mixedHistoryTruncated = false;
     }
     return selectionIsCurrent();
   }
@@ -1882,6 +2453,7 @@ async function loadMixedSegment(type, id, selectionVersion = null) {
   if (selectedIndex < 0) {
     if (selectionIsCurrent()) {
       state.mixedSegmentDetails = selectedDetail ? [selectedDetail] : [];
+      state.mixedHistoryTruncated = false;
     }
     return selectionIsCurrent();
   }
@@ -1892,7 +2464,11 @@ async function loadMixedSegment(type, id, selectionVersion = null) {
   const WINDOW = 12;
   let index = selectedIndex;
   let reachedCheckpoint = false;
-  while (index >= 0 && !reachedCheckpoint) {
+  while (
+    index >= 0
+    && !reachedCheckpoint
+    && details.length < FRONTEND_CONFIG.mixedTrace.maxCalls
+  ) {
     const windowStart = Math.max(index - WINDOW + 1, 0);
     const warming = [];
     for (let at = index; at >= windowStart; at -= 1) {
@@ -1903,7 +2479,12 @@ async function loadMixedSegment(type, id, selectionVersion = null) {
     }
     await Promise.all(warming);
     if (!selectionIsCurrent()) return false;
-    for (; index >= windowStart; index -= 1) {
+    for (
+      ;
+      index >= windowStart
+        && details.length < FRONTEND_CONFIG.mixedTrace.maxCalls;
+      index -= 1
+    ) {
       const item = state.timelineItems[index];
       if (item.type !== "call") continue;
       const detail = Number(item.id) === Number(id)
@@ -1919,7 +2500,37 @@ async function loadMixedSegment(type, id, selectionVersion = null) {
   }
   if (!selectionIsCurrent()) return false;
   state.mixedSegmentDetails = details;
+  state.mixedHistoryTruncated = !reachedCheckpoint && index >= 0;
   return true;
+}
+
+function boundedHistoricalEntries(segment) {
+  const entries = [];
+  let chars = 0;
+  let omitted = false;
+  // Keep the most recent history first. Older changes are useful only while
+  // their retained text stays inside the render budget.
+  for (let index = segment.length - 2; index >= 0; index -= 1) {
+    const detail = segment[index];
+    if (isCheckpoint(detail)) continue;
+    for (const entry of updateEntries(detail)) {
+      const cost = [
+        entry.text,
+        entry.oldText,
+        entry.newText,
+        entry.mixedOldText,
+      ].reduce((total, value) => total + String(value || "").length, 0);
+      if (
+        chars + cost > FRONTEND_CONFIG.mixedTrace.maxHistoricalChars
+      ) {
+        omitted = true;
+        continue;
+      }
+      chars += cost;
+      entries.push({ ...entry, fromEarlierCall: true });
+    }
+  }
+  return { entries, omitted };
 }
 
 function renderMixed(previousDetail = null) {
@@ -1933,19 +2544,12 @@ function renderMixed(previousDetail = null) {
     ? state.mixedSegmentDetails
     : [state.detail];
   const selectedEntries = checkpoint ? [] : updateEntries(state.detail);
+  const historical = checkpoint
+    ? { entries: [], omitted: false }
+    : boundedHistoricalEntries(segment);
   const entries = checkpoint
     ? []
-    : [
-        ...selectedEntries,
-        ...segment.slice(0, -1).flatMap(
-          detail => isCheckpoint(detail)
-            ? []
-            : updateEntries(detail).map(entry => ({
-                ...entry,
-                fromEarlierCall: true,
-              })),
-        ),
-      ];
+    : [...selectedEntries, ...historical.entries];
   const parts = stateDisplayParts(state.detail);
   const parameterEntries = entries.filter(entry => entry.category === "parameter");
   const inputEntries = entries.filter(
@@ -1984,7 +2588,11 @@ function renderMixed(previousDetail = null) {
     ? "◆ new current state"
     : identicalTo
       ? `↻ identical to call #${identicalTo}`
-      : `Δ ${entries.length} accumulated update${entries.length === 1 ? "" : "s"}`;
+      : `Δ ${entries.length} accumulated update${entries.length === 1 ? "" : "s"}${
+          state.mixedHistoryTruncated || historical.omitted
+            ? " · recent history only"
+            : ""
+        }`;
   $("mixed-status").className = checkpoint ? "mixed-legend checkpoint" : "mixed-legend delta";
   $("mixed").classList.remove("empty");
   $("mixed").innerHTML = `${inputHtml}\n${thoughtsHtml}\n${outputHtml}`;
@@ -2130,6 +2738,8 @@ function renderExact(focusEntry = null) {
       parent_state_id: state.detail.parent_state_id,
       parent_source: state.detail.parent_source,
       similarity: state.detail.similarity,
+      ...(state.detail.req_id ? { req_id: state.detail.req_id } : {}),
+      ...(state.detail.prev_req_id ? { prev_req_id: state.detail.prev_req_id } : {}),
       ...state.detail.metadata,
     };
     delete value.run_id;
@@ -2369,14 +2979,7 @@ async function focusUpdateFromState(element) {
       || updateElement.classList.contains("thoughts-update")
       ? "output"
       : "input";
-    state.selectedPhase = phase;
-    document.querySelectorAll(".timeline-item.active").forEach(node => {
-      node.classList.remove("active");
-    });
-    const timelineTarget = phase === "output"
-      ? document.querySelector(`.timeline-output[data-call-key="${key}"]`)
-      : document.querySelector(`.timeline-input[data-key="${key}"]`);
-    timelineTarget?.classList.add("active");
+    setTimelineFocus(key, phase, true);
 
     const card = updateCardFor(key, phase);
     if (!card) return;
@@ -2399,14 +3002,7 @@ async function focusUpdateFromState(element) {
   const card = updateCardFor(key, phase);
   if (!card) return;
   await loadUpdateCard(card);
-  state.selectedPhase = phase;
-  document.querySelectorAll(".timeline-item.active").forEach(node => {
-    node.classList.remove("active");
-  });
-  const timelineTarget = phase === "output"
-    ? document.querySelector(`.timeline-output[data-call-key="${key}"]`)
-    : document.querySelector(`.timeline-input[data-key="${key}"]`);
-  timelineTarget?.classList.add("active");
+  setTimelineFocus(key, phase, true);
 
   for (const pane of [$("mixed"), $("exact")]) {
     pane.querySelectorAll(
@@ -2539,12 +3135,11 @@ async function applySelection(
 ) {
   const button = element || document.querySelector(`.timeline-item[data-key="${type}:${id}"]`);
   const phase = button?.dataset.phase || "input";
+  const key = `${type}:${id}`;
   const selectionVersion = ++state.selectionVersion;
-  document.querySelectorAll(".timeline-item.active").forEach(node => node.classList.remove("active"));
-  button?.classList.add("active");
-  if (scrollTimeline && button) focusScrollIntoView(button, "nearest");
+  setTimelineFocus(key, phase, scrollTimeline, button);
   document.querySelectorAll(".update-card.active").forEach(node => node.classList.remove("active"));
-  const updateCard = updateCardFor(`${type}:${id}`, phase);
+  const updateCard = updateCardFor(key, phase);
   updateCard?.classList.add("active");
   const previousDetail = state.detail;
   // Re-selecting the call already on screen must not rebuild Mixed: for a long
@@ -2558,6 +3153,7 @@ async function applySelection(
     && state.mixedSegmentDetails.at(-1)?.id === state.detail?.id;
   state.selected = { type, id };
   state.selectedPhase = phase;
+  syncBranchGraphSelection();
   if (alreadyRendered) {
     activateTab("state");
     if (focusSelection) {
@@ -2575,8 +3171,14 @@ async function applySelection(
   const score = state.detail.similarity == null
     ? ""
     : ` · ${(state.detail.similarity * 100).toFixed(0)}%`;
+  // A caller-declared predecessor is the trustworthy lineage; show it in place
+  // of the inferred parent source when present.
+  const parentLabel = state.detail.prev_req_id
+    ? `req ${state.detail.prev_req_id}`
+    : state.detail.parent_source || "root";
+  const reqLabel = state.detail.req_id ? `${state.detail.req_id} · ` : "";
   $("lineage").textContent =
-    `state S${state.detail.request_state_id} ← ${state.detail.parent_source || "root"}${score}`;
+    `${reqLabel}state S${state.detail.request_state_id} ← ${parentLabel}${score}`;
   activateTab("state");
   renderMixed(previousDetail);
   renderExact();
@@ -2605,7 +3207,9 @@ async function rebuildTimeline(items, previousSelected, followNewItems) {
   $("updates").scrollTop = updatesScroll;
   if (!items.length) {
     state.selected = null;
+    state.timelineFocus = null;
     state.detail = null;
+    state.mixedHistoryTruncated = false;
     $("mixed").textContent = "No LLM calls in this session.";
     $("exact").textContent = "No current state.";
     $("updates").innerHTML = '<div class="empty-session">No updates in this session.</div>';
@@ -2740,7 +3344,9 @@ async function loadSessions() {
     state.timelineSignature = "";
     state.timelineItems = [];
     state.mixedSegmentDetails = [];
+    state.mixedHistoryTruncated = false;
     state.selected = null;
+    state.timelineFocus = null;
   }
   return true;
 }
@@ -2812,6 +3418,29 @@ $("refresh").onclick = async () => {
   await loadTimeline();
   await loadStats();
 };
+function setTimelineView(view) {
+  state.timelineView = FRONTEND_CONFIG.branchGraph.enabled && view === "branches"
+    ? "branches"
+    : "list";
+  localStorage.setItem("insequent.timelineView", state.timelineView);
+  applyTimelineView();
+  // Bring the selected node into view when switching to the graph.
+  if (state.timelineView === "branches" && focusedTimelineKey()) {
+    const node = $("branch-graph").querySelector(
+      `.branch-node[data-key="${focusedTimelineKey()}"]`,
+    );
+    node?.scrollIntoView({ behavior: "auto", block: "nearest", inline: "nearest" });
+  }
+}
+$("view-list")?.addEventListener("click", () => setTimelineView("list"));
+$("view-branches")?.addEventListener("click", () => setTimelineView("branches"));
+$("orient-vertical")?.addEventListener("click", () => setBranchOrientation("vertical"));
+$("orient-horizontal")?.addEventListener("click", () => setBranchOrientation("horizontal"));
+function setBranchOrientation(orient) {
+  state.branchOrientation = orient;
+  localStorage.setItem("insequent.branchOrientation", orient);
+  applyTimelineView();
+}
 $("follow-new-items").onchange = async () => {
   state.followNewItems = $("follow-new-items").checked;
   if (!state.followNewItems || !state.timelineItems.length) return;
@@ -2831,6 +3460,7 @@ $("session").onchange = async () => {
   state.detail = null;
   state.details.clear();
   state.mixedSegmentDetails = [];
+  state.mixedHistoryTruncated = false;
   state.timelineSignature = "";
   state.timelineItems = [];
   $("search-results").classList.add("hidden");
@@ -2854,9 +3484,83 @@ async function liveTick() {
   }
 }
 
+function initTimelineResize() {
+  const main = document.querySelector("main");
+  const handle = $("timeline-resizer");
+  if (!main || !handle) return;
+
+  const stored = Number(localStorage.getItem(FRONTEND_CONFIG.timeline.storageKey));
+  const clampWidth = width => {
+    const maximum = Math.max(
+      FRONTEND_CONFIG.timeline.minWidth,
+      main.clientWidth - FRONTEND_CONFIG.timeline.otherPanesMinWidth,
+    );
+    return Math.round(Math.min(maximum, Math.max(FRONTEND_CONFIG.timeline.minWidth, width)));
+  };
+
+  const setWidth = (width, persist = true) => {
+    const next = clampWidth(width);
+    main.style.setProperty("--timeline-pane-width", `${next}px`);
+    handle.setAttribute("aria-valuemin", String(FRONTEND_CONFIG.timeline.minWidth));
+    handle.setAttribute("aria-valuemax", String(clampWidth(Number.MAX_SAFE_INTEGER)));
+    handle.setAttribute("aria-valuenow", String(next));
+    if (persist) {
+      localStorage.setItem(FRONTEND_CONFIG.timeline.storageKey, String(next));
+    }
+  };
+  if (Number.isFinite(stored) && stored >= FRONTEND_CONFIG.timeline.minWidth) {
+    setWidth(stored, false);
+  }
+
+  let startX = 0;
+  let startWidth = 0;
+  handle.addEventListener("pointerdown", event => {
+    if (event.button !== 0) return;
+    startX = event.clientX;
+    startWidth = document.querySelector(".timeline-pane").getBoundingClientRect().width;
+    handle.setPointerCapture(event.pointerId);
+    handle.classList.add("dragging");
+    document.body.classList.add("resizing-pane");
+    event.preventDefault();
+  });
+  handle.addEventListener("pointermove", event => {
+    if (!handle.hasPointerCapture(event.pointerId)) return;
+    setWidth(startWidth + event.clientX - startX);
+  });
+  const stopResize = event => {
+    if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+    handle.classList.remove("dragging");
+    document.body.classList.remove("resizing-pane");
+  };
+  handle.addEventListener("pointerup", stopResize);
+  handle.addEventListener("pointercancel", stopResize);
+  handle.addEventListener("dblclick", () => {
+    main.style.removeProperty("--timeline-pane-width");
+    localStorage.removeItem(FRONTEND_CONFIG.timeline.storageKey);
+  });
+  handle.addEventListener("keydown", event => {
+    if (!["ArrowLeft", "ArrowRight", "Home"].includes(event.key)) return;
+    const current = document.querySelector(".timeline-pane").getBoundingClientRect().width;
+    if (event.key === "Home") {
+      setWidth(FRONTEND_CONFIG.timeline.minWidth);
+    } else {
+      setWidth(current + (event.key === "ArrowRight" ? 16 : -16));
+    }
+    event.preventDefault();
+  });
+  window.addEventListener("resize", () => {
+    if (!main.style.getPropertyValue("--timeline-pane-width")) return;
+    const current = document.querySelector(".timeline-pane").getBoundingClientRect().width;
+    setWidth(current, false);
+  });
+}
+
 async function start() {
+  initTimelineResize();
+  applyTimelineView();
   await loadSessions();
   await Promise.all([loadTimeline(), loadStats()]);
+  applyTimelineView();
   setInterval(liveTick, 1000);
 }
 

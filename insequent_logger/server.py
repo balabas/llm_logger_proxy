@@ -190,6 +190,10 @@ class TraceHandler(BaseHTTPRequestHandler):
         branch = self.headers.get("X-LLMTrace-Branch", self.server.default_branch)
         purpose = self.headers.get("X-LLMTrace-Purpose", "chat")
         run_id = self.headers.get("X-LLMTrace-Run")
+        debug_label = self.headers.get("X-LLMTrace-Debug-Label")
+        group = self.headers.get("X-LLMTrace-Group")
+        req_id = self.headers.get("X-LLMTrace-Req-Id")
+        prev_req_id = self.headers.get("X-LLMTrace-Prev-Req-Id")
         raw_parent = self.headers.get("X-LLMTrace-Base-State")
         try:
             explicit_parent = int(raw_parent) if raw_parent else None
@@ -197,14 +201,25 @@ class TraceHandler(BaseHTTPRequestHandler):
             self._error(400, "X-LLMTrace-Base-State must be an integer")
             return
 
-        call_id = self.server.store.start_call(
-            request_body,
-            session_id=session,
-            branch_id=branch,
-            purpose=purpose,
-            explicit_parent_state=explicit_parent,
-            metadata={"endpoint": path, **({"run_id": run_id} if run_id else {})},
-        )
+        try:
+            call_id = self.server.store.start_call(
+                request_body,
+                session_id=session,
+                branch_id=branch,
+                purpose=purpose,
+                explicit_parent_state=explicit_parent,
+                req_id=req_id,
+                prev_req_id=prev_req_id,
+                metadata={
+                    "endpoint": path,
+                    **({"run_id": run_id} if run_id else {}),
+                    **({"debug_label": debug_label} if debug_label else {}),
+                    **({"group": group} if group else {}),
+                },
+            )
+        except ValueError as exc:
+            self._error(400, str(exc))
+            return
         target = f"{self.server.upstream}{path}"
         forward_headers = {
             "Content-Type": "application/json",

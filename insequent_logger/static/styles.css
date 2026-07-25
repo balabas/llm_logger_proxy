@@ -58,11 +58,44 @@ main {
   padding: 14px;
   display: grid;
   grid-template-columns:
-    minmax(205px, .55fr)
-    minmax(340px, 1fr)
-    minmax(340px, 1fr)
-    minmax(270px, .72fr);
-  gap: 12px;
+    minmax(205px, var(--timeline-pane-width, .55fr))
+    8px
+    minmax(260px, 1fr)
+    minmax(260px, 1fr)
+    minmax(220px, .72fr);
+  gap: 8px;
+}
+
+.pane-resizer {
+  position: relative;
+  min-width: 8px;
+  align-self: stretch;
+  border-radius: 6px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.pane-resizer::before {
+  content: "";
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: 3px;
+  width: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--blue) 24%, var(--line));
+  transition: width .12s ease, left .12s ease, background .12s ease;
+}
+.pane-resizer:hover::before,
+.pane-resizer:focus-visible::before,
+.pane-resizer.dragging::before {
+  left: 2px;
+  width: 4px;
+  background: var(--blue);
+}
+.pane-resizer:focus-visible { outline: 2px solid rgba(45, 93, 104, .2); }
+body.resizing-pane {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .pane {
@@ -133,6 +166,130 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   white-space: nowrap;
 }
 .timeline { overflow: auto; padding: 8px; }
+.timeline.hidden { display: none; }
+
+/* View switch (List / Branches, orientation) */
+.view-switch {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.view-switch.hidden { display: none; }
+.view-switch-btn {
+  padding: 4px 8px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font: 700 10px/1 monospace;
+  cursor: pointer;
+}
+.view-switch-btn + .view-switch-btn { border-left: 1px solid var(--line); }
+.view-switch-btn.active { color: var(--ink); background: color-mix(in srgb, var(--blue) 14%, #f3f1e9); }
+
+/* Branching graph */
+.branch-graph { flex: 1; overflow-x: hidden; overflow-y: auto; padding: 10px; }
+.branch-graph.horizontal { overflow: auto; }
+.branch-graph.hidden { display: none; }
+.branch-canvas { position: relative; }
+.branch-graph-svg { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
+.branch-edge {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  opacity: .75;
+  pointer-events: stroke;
+  transition: opacity .12s ease, stroke-width .12s ease, filter .12s ease;
+}
+.branch-edge-split { opacity: .95; }
+.branch-edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: var(--branch-edge-hover-width, 16px);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+.branch-dot {
+  stroke: var(--panel);
+  stroke-width: 2;
+  pointer-events: all;
+  transition: opacity .12s ease, stroke-width .12s ease, filter .12s ease;
+}
+.branch-dot.checkpoint { stroke: #ed7f4c; stroke-width: 2.5; }
+.branch-dot.running { animation: waiting-pulse 1.4s ease-in-out infinite; }
+.branch-node {
+  position: absolute;
+  transform: translateY(-50%);
+  max-width: 190px;
+  padding: 2px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+  overflow: hidden;
+  transition: opacity .12s ease, background .12s ease, border-color .12s ease;
+}
+.branch-node.horizontal { transform: translateX(-50%); max-width: 120px; }
+.branch-node.place-left { transform: translate(-100%, -50%); text-align: right; }
+.branch-node:hover { background: color-mix(in srgb, var(--blue) 8%, #f3f1e9); }
+.branch-node.active {
+  background: color-mix(in srgb, var(--blue) 16%, #f5f2e9);
+  border-color: var(--blue);
+}
+.branch-dot.active {
+  stroke: var(--blue);
+  stroke-width: 3;
+  filter: drop-shadow(0 0 3px rgba(45, 93, 104, .5));
+}
+.branch-node-step {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+  font: 650 11px/1.25 system-ui, sans-serif;
+}
+.branch-node-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font: 9px/1.2 monospace;
+}
+.branch-node.active .branch-node-step { color: var(--blue); }
+.branch-graph.has-hover .branch-edge:not(.hover-related) { opacity: .2; }
+.branch-graph.has-hover .branch-dot:not(.hover-related) { opacity: .42; }
+.branch-graph.has-hover .branch-node:not(.hover-related) { opacity: .58; }
+.branch-edge.hover-related {
+  opacity: 1;
+  stroke-width: 3;
+  filter: drop-shadow(0 0 2px rgba(23, 32, 29, .2));
+}
+.branch-dot.hover-related {
+  opacity: 1;
+  stroke-width: 3;
+  filter: drop-shadow(0 1px 2px rgba(23, 32, 29, .3));
+}
+.branch-node.hover-related {
+  z-index: 3;
+  opacity: 1;
+  background: color-mix(in srgb, var(--blue) 8%, var(--panel));
+}
+.branch-node.hover-focus {
+  z-index: 4;
+  background: color-mix(in srgb, var(--blue) 15%, var(--panel));
+  border-color: color-mix(in srgb, var(--blue) 72%, transparent);
+}
+.branch-graph.lane-hover .branch-node.hover-related {
+  background: color-mix(in srgb, var(--blue) 6%, var(--panel));
+  border-color: color-mix(in srgb, var(--blue) 30%, transparent);
+}
 .timeline-parallel-divider {
   display: flex;
   align-items: center;
@@ -176,6 +333,8 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   text-align: left;
   background: transparent;
   border-color: transparent;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 55px;
 }
 .timeline-item.parallel-branch {
   border-left: 3px solid var(--branch-color);
@@ -262,7 +421,20 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .timeline-item.parallel-block .branch {
   color: var(--branch-color);
 }
-.item-label { display: block; overflow: hidden; text-overflow: ellipsis; font-weight: 650; white-space: nowrap; }
+.item-head { display: flex; align-items: baseline; gap: 6px; }
+.item-label { flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis; font-weight: 650; white-space: nowrap; }
+/* The step's debug label shares the action line and truncates, so it never
+   adds a row to the item. */
+.item-debug {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: color-mix(in srgb, var(--trace-kind-accent, var(--muted)) 60%, var(--ink));
+  font: 600 10px/1.3 "SFMono-Regular", Consolas, monospace;
+}
 .item-meta { display: flex; justify-content: space-between; gap: 5px; margin-top: 4px; color: var(--muted); font: 10px monospace; }
 .item-meta > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .branch { color: var(--green); }
@@ -324,6 +496,8 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   background: #e9e6dc;
 }
 .update-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 48px;
   margin-bottom: 9px;
   overflow: hidden;
   background: #1e2724;
@@ -349,8 +523,22 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 /* The phase reads first: a card answers "input or output?" before "which call?" */
 .update-card-head .update-card-phase {
   color: var(--trace-kind-text, #78c49d);
+  flex: 0 0 auto;
 }
 .update-card-head span:not(.update-card-phase) { color: #8fa39a; }
+.update-card-head .update-card-id { flex: 0 0 auto; }
+/* The step's debug label shares the head line and truncates, adding no row. */
+.update-card-head .update-card-debug {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--trace-kind-text, #8fa39a);
+  text-transform: none;
+  letter-spacing: 0;
+}
 .update-card[data-phase] {
   border-left: 3px solid var(--trace-kind-accent, #42534d);
 }
@@ -369,7 +557,9 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 }
 .checkpoint-jump strong { display: block; color: #ff9c71; }
 .checkpoint-jump span {
-  display: block;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
   margin-top: 4px;
   color: #a7aaa3;
   font: 10px monospace;
@@ -473,6 +663,15 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   margin-top: 4px;
   color: #9aa8a1;
   font: 10px/1.4 monospace;
+}
+.identical-jump span { display: flex; gap: 6px; align-items: baseline; }
+/* The debug label rides the call-id line of a checkpoint or identical card and
+   truncates, so these cards gain no row either. */
+.checkpoint-jump .update-card-debug,
+.identical-jump .update-card-debug {
+  color: var(--trace-kind-text, #a7aaa3);
+  text-transform: none;
+  letter-spacing: 0;
 }
 .update-card.identical { border-style: dashed; }
 .update-card.load-error {
@@ -1076,5 +1275,6 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   header { grid-template-columns: auto 1fr; gap: 16px; }
   .stats { display: none; }
   main { height: auto; grid-template-columns: 1fr; }
+  .pane-resizer { display: none; }
   .pane { min-height: 440px; }
 }

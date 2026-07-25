@@ -138,6 +138,9 @@ Clients can describe exact lineage using optional request headers:
 | `X-LLMTrace-Purpose` | Adds a short call purpose such as `chat` or `summarize`. |
 | `X-LLMTrace-Base-State` | Identifies the exact request-state parent. |
 | `X-LLMTrace-Run` | Associates calls with a larger application run. |
+| `X-LLMTrace-Debug-Label` | A per-request step label (e.g. `07-rewrite`) shown on the call's timeline and update rows. Set it per request. |
+| `X-LLMTrace-Req-Id` | A caller-assigned identity for this request. |
+| `X-LLMTrace-Prev-Req-Id` | The `req_id` of the request this one continues. Declares the branch tree explicitly: two requests naming the same predecessor become sibling branches. Takes the place of similarity inference; an unknown value is rejected with `400`. |
 
 If no base state is supplied, Insequent chooses the best recent parent and labels the
 relationship as inferred.
@@ -152,11 +155,37 @@ identity.
 Explicit `X-LLMTrace-Branch` values remain branch roots. Supplying
 `X-LLMTrace-Base-State` is recommended when the application already knows the precise parent.
 
+### Branch labels in the timeline
+
+Each timeline item names its branch. `main` is the branch root — the header
+`X-LLMTrace-Branch` value, defaulting to `main`. `p2`, `p3`, … mark **parallel lanes**:
+concurrent calls that forked from the same parent state and ran at the same time. Lane 0 keeps
+the root name (`main`); lane 1 shows as `main · p2`, lane 2 as `main · p3`, and so on. These
+lanes correspond to stored branches `main~parallel-2`, `main~parallel-3`, and are created
+automatically when calls overlap — they are concurrency, not authored branches.
+
+### Declaring branches explicitly (`req_id` / `prev_req_id`)
+
+When the caller already knows its own branch tree — as a notebook driving multiple steps and
+retries does — it can declare lineage directly instead of relying on similarity inference.
+Give each request a `X-LLMTrace-Req-Id`, and point it at its predecessor with
+`X-LLMTrace-Prev-Req-Id`. The predecessor's resulting state becomes this request's parent, so
+two requests naming the same predecessor become sibling branches. The pair is stored on the
+call, surfaced on the timeline row and in the Metadata tab, and shown in the pane header as
+`<req_id> · state S… ← req <prev_req_id>`. Pair this with a meaningful
+`X-LLMTrace-Debug-Label` per step so each request reads as an explainable step name.
+
 ## Viewer
 
 The browser interface has four coordinated panes:
 
 1. **Timeline** shows input and output phases, branches, checkpoints, status, and duration.
+   A **List / Branches** switch toggles between the linear event list and a branching graph of
+   the call tree. In the graph each call is a node led by its step name (`X-LLMTrace-Debug-Label`),
+   parents connect to children, and a parent with several children is a branch. The graph
+   orients **vertically** (grows downward) or **horizontally** (grows rightward). Nodes lead
+   with the step name (`X-LLMTrace-Debug-Label`), falling back to the call purpose when none is
+   set. Clicking a node selects that call, exactly like a list item.
 2. **Mixed trace** reconstructs the current state and marks accumulated changes in place.
 3. **Exact state** shows the reconstructed state without historical replacement text.
 4. **Updates** lists changes chronologically and never rewrites earlier update cards.

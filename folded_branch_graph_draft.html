@@ -1,0 +1,954 @@
+<!doctype html>
+<!-- Standalone prototype built from the supplied 105-node branch-graph snapshot. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Width-constrained branch graph draft</title>
+  <style>
+    :root {
+      --ink: #17201d;
+      --muted: #65706c;
+      --paper: #efede5;
+      --panel: #fbfaf5;
+      --line: #d6d3c7;
+      --accent: #ed6a3b;
+      --blue: #2d5d68;
+      color-scheme: light;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 75% 0, rgba(45, 93, 104, .13), transparent 34rem),
+        var(--paper);
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+
+    header {
+      min-height: 82px;
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 2px 0 0;
+      font: 700 23px/1.1 Georgia, serif;
+    }
+
+    .eyebrow {
+      color: var(--accent);
+      font: 700 10px/1 monospace;
+      letter-spacing: .16em;
+    }
+
+    .summary {
+      max-width: 600px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    main {
+      height: calc(100vh - 82px);
+      min-height: 480px;
+      padding: 14px;
+      display: grid;
+      grid-template-columns: minmax(300px, 460px) 1fr;
+      gap: 12px;
+    }
+
+    .pane {
+      min-width: 0;
+      overflow: hidden;
+      background: rgba(251, 250, 245, .94);
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      box-shadow: 0 14px 40px rgba(25, 32, 29, .08);
+    }
+
+    .controls {
+      padding: 20px;
+      overflow: auto;
+    }
+
+    .controls h2 {
+      margin: 0 0 8px;
+      font-size: 15px;
+    }
+
+    .controls p {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .control {
+      margin: 0 0 18px;
+    }
+
+    .control label {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 7px;
+      font: 700 10px/1.2 monospace;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    .control output {
+      color: var(--blue);
+      letter-spacing: 0;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--blue);
+    }
+
+    .metrics {
+      margin: 20px 0;
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+
+    .metric {
+      padding: 10px;
+      background: #f2f0e8;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+
+    .metric b {
+      display: block;
+      color: var(--blue);
+      font: 700 18px/1.1 Georgia, serif;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font: 9px/1.2 monospace;
+      text-transform: uppercase;
+    }
+
+    .formula {
+      padding: 12px;
+      color: #36433f;
+      background: #e8ece7;
+      border-left: 3px solid var(--green, #38755e);
+      border-radius: 4px;
+      font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 18px;
+      color: var(--muted);
+      font: 10px/1.3 monospace;
+    }
+
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .legend i {
+      width: 9px;
+      height: 9px;
+      display: inline-block;
+      border-radius: 50%;
+      background: var(--blue);
+    }
+
+    .legend .checkpoint {
+      background: var(--panel);
+      border: 2px solid var(--accent);
+    }
+
+    .stage {
+      min-width: 0;
+      padding: 14px;
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+      overflow: auto;
+    }
+
+    .demo-shell {
+      position: relative;
+      width: 420px;
+      min-width: 250px;
+      max-width: 100%;
+      height: 100%;
+      min-height: 420px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      resize: horizontal;
+      background: var(--panel);
+      border: 1px solid #bebbad;
+      border-radius: 8px;
+      box-shadow: 0 10px 30px rgba(23, 32, 29, .12);
+    }
+
+    .demo-head {
+      min-height: 52px;
+      padding: 10px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .demo-head h2 {
+      margin: 0;
+      font-size: 13px;
+    }
+
+    .demo-head small {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font: 9px/1.2 monospace;
+    }
+
+    .width-badge {
+      flex: 0 0 auto;
+      padding: 4px 7px;
+      color: var(--blue);
+      background: #e9efec;
+      border-radius: 999px;
+      font: 700 9px/1 monospace;
+    }
+
+    .branch-graph {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+      overflow-x: hidden;
+      overflow-y: auto;
+      scrollbar-gutter: stable;
+      background:
+        linear-gradient(90deg, rgba(45, 93, 104, .035) 1px, transparent 1px)
+        0 0 / 26px 100%;
+    }
+
+    .branch-canvas {
+      position: relative;
+      width: 100%;
+    }
+
+    .branch-svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      overflow: visible;
+      pointer-events: none;
+    }
+
+    .branch-edge {
+      fill: none;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      opacity: .62;
+      pointer-events: stroke;
+      transition: opacity .12s ease, stroke-width .12s ease, filter .12s ease;
+    }
+
+    .branch-edge.branch-edge-split {
+      stroke-width: 2.15;
+      opacity: .86;
+    }
+
+    .branch-edge-hit {
+      fill: none;
+      stroke: transparent;
+      stroke-width: 16;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      pointer-events: stroke;
+      cursor: pointer;
+    }
+
+    .band-guide {
+      stroke: #9aa8a3;
+      stroke-width: 1;
+      stroke-dasharray: 2 5;
+      opacity: .18;
+    }
+
+    .branch-dot {
+      stroke: var(--panel);
+      stroke-width: 2;
+      pointer-events: all;
+      transition: opacity .12s ease, stroke-width .12s ease, filter .12s ease;
+    }
+
+    .branch-dot.checkpoint {
+      stroke: var(--accent);
+      stroke-width: 2.5;
+    }
+
+    .branch-node {
+      position: absolute;
+      z-index: 2;
+      min-width: 0;
+      max-width: 184px;
+      padding: 3px 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      overflow: hidden;
+      color: var(--ink);
+      text-align: left;
+      background: color-mix(in srgb, var(--panel) 90%, transparent);
+      border: 1px solid transparent;
+      border-radius: 5px;
+      transform: translateY(-50%);
+      cursor: pointer;
+      transition: opacity .12s ease, background .12s ease, border-color .12s ease;
+    }
+
+    .branch-node.place-left {
+      text-align: right;
+      transform: translate(-100%, -50%);
+    }
+
+    .branch-node:hover,
+    .branch-node.active {
+      z-index: 4;
+      overflow: visible;
+      max-width: none;
+      background: #edf1ed;
+      border-color: var(--blue);
+      box-shadow: 0 3px 12px rgba(23, 32, 29, .14);
+    }
+
+    .branch-canvas.has-hover .branch-edge:not(.hover-related) { opacity: .2; }
+    .branch-canvas.has-hover .branch-dot:not(.hover-related) { opacity: .42; }
+    .branch-canvas.has-hover .branch-node:not(.hover-related) { opacity: .58; }
+
+    .branch-edge.hover-related {
+      opacity: 1;
+      stroke-width: 3;
+      filter: drop-shadow(0 0 2px rgba(23, 32, 29, .2));
+    }
+
+    .branch-dot.hover-related {
+      opacity: 1;
+      stroke-width: 3;
+      filter: drop-shadow(0 1px 2px rgba(23, 32, 29, .3));
+    }
+
+    .branch-node.hover-related {
+      z-index: 3;
+      opacity: 1;
+      background: color-mix(in srgb, var(--blue) 8%, var(--panel));
+    }
+
+    .branch-node.hover-focus {
+      z-index: 4;
+      background: color-mix(in srgb, var(--blue) 15%, var(--panel));
+      border-color: color-mix(in srgb, var(--blue) 72%, transparent);
+    }
+
+    .branch-canvas.lane-hover .branch-node.hover-related {
+      background: color-mix(in srgb, var(--blue) 6%, var(--panel));
+      border-color: color-mix(in srgb, var(--blue) 30%, transparent);
+    }
+
+    .branch-node-step {
+      overflow: hidden;
+      color: var(--ink);
+      font: 650 11px/1.2 system-ui, sans-serif;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .branch-node-meta {
+      overflow: hidden;
+      color: var(--muted);
+      font: 9px/1.2 monospace;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .resize-note {
+      position: absolute;
+      right: 5px;
+      bottom: 4px;
+      z-index: 5;
+      color: #71807b;
+      font: 9px/1 monospace;
+      pointer-events: none;
+    }
+
+    @media (max-width: 800px) {
+      header { align-items: flex-start; flex-direction: column; gap: 8px; }
+      main { height: auto; grid-template-columns: 1fr; }
+      .controls { max-height: none; }
+      .stage { height: 70vh; min-height: 520px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <span class="eyebrow">LAYOUT DRAFT</span>
+      <h1>Folded branch lanes</h1>
+    </div>
+    <p class="summary">
+      The attached 75-lane trace is folded into a user-defined width. Every node and edge
+      remains in the document; reducing width adds vertical bands instead of horizontal scroll.
+    </p>
+  </header>
+
+  <main>
+    <aside class="pane controls">
+      <h2>Width-constrained layout</h2>
+      <p>
+        Each chronological item owns a macro-row. Lanes whose edges cross that row wrap into
+        serpentine bands. Completed lanes stop consuming space, but their earlier nodes and
+        edges remain visible. Every child stays below its parent and the canvas equals the pane width.
+      </p>
+
+      <div class="control">
+        <label for="pane-width">Pane width <output id="pane-width-output">420 px</output></label>
+        <input id="pane-width" type="range" min="250" max="720" step="1" value="420">
+      </div>
+
+      <div class="control">
+        <label for="lane-pitch">Lane pitch <output id="lane-pitch-output">26 px</output></label>
+        <input id="lane-pitch" type="range" min="18" max="38" step="1" value="26">
+      </div>
+
+      <div class="control">
+        <label for="overlap-shift">Overlap shift <output id="overlap-shift-output">5 px</output></label>
+        <input id="overlap-shift" type="range" min="2.4" max="8" step=".2" value="5">
+      </div>
+
+      <div class="metrics" aria-live="polite">
+        <div class="metric"><b id="column-count">—</b><span>lanes per band</span></div>
+        <div class="metric"><b id="band-count">—</b><span>maximum bands</span></div>
+        <div class="metric"><b>75</b><span>logical lanes</span></div>
+        <div class="metric"><b>105</b><span>visible nodes</span></div>
+      </div>
+
+      <div id="formula" class="formula"></div>
+
+      <div class="legend">
+        <span><i></i> regular call</span>
+        <span><i class="checkpoint"></i> checkpoint</span>
+        <span>alternate bands run right-to-left</span>
+      </div>
+    </aside>
+
+    <section class="pane stage">
+      <div id="demo-shell" class="demo-shell">
+        <div class="demo-head">
+          <div>
+            <h2>Branches</h2>
+            <small id="graph-status">Preparing layout…</small>
+          </div>
+          <span id="width-badge" class="width-badge">420 px</span>
+        </div>
+        <div id="branch-graph" class="branch-graph">
+          <div id="branch-canvas" class="branch-canvas"></div>
+        </div>
+        <span class="resize-note">drag corner ↘</span>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // [call id, logical lane, parent id, step label, branch id, checkpoint]
+    // Extracted from the supplied branch-graph DOM snapshot.
+    const SOURCE_ROWS = [
+      [2890,0,0,"overview","main",1],[2891,1,0,"overview","main~parallel-2",0],[2892,2,0,"overview","main~parallel-3",0],[2893,3,0,"rewrite","main",1],[2894,4,0,"rewrite","main~parallel-2",0],[2895,3,2893,"rewrite","main",0],[2896,3,2895,"rewrite","main",0],[2897,5,2895,"rewrite","main",0],[2898,5,2897,"rewrite","main",0],[2899,6,2897,"rewrite","main",0],[2900,7,0,"table-discard-vote","main",0],[2901,8,0,"table-discard-vote","main~parallel-2",0],[2902,9,0,"table-discard-vote","main~parallel-3",0],[2903,9,2902,"table-discard-vote","main",0],[2904,10,2902,"table-discard-vote","main~parallel-2",0],[2905,11,2902,"table-discard-vote","main~parallel-3",0],[2906,11,2905,"table-discard-vote","main",0],[2907,12,2905,"table-discard-vote","main~parallel-2",0],[2908,13,2905,"table-discard-vote","main~parallel-3",0],[2909,13,2908,"table-discard-vote","main",0],[2910,14,2908,"table-discard-vote","main~parallel-2",0],[2911,15,2908,"table-discard-vote","main~parallel-3",0],[2912,15,2911,"table-discard-vote","main",0],[2913,16,2911,"table-discard-vote","main~parallel-2",0],[2914,17,2911,"table-discard-vote","main~parallel-3",0],[2915,18,2908,"table-discard-vote","main",0],[2916,19,2908,"table-discard-vote","main~parallel-2",0],[2917,20,2908,"table-discard-vote","main~parallel-3",0],[2918,21,2911,"table-discard-vote","main",0],[2919,22,2911,"table-discard-vote","main~parallel-2",0],[2920,23,2911,"table-discard-vote","main~parallel-3",0],[2921,24,2902,"table-discard-vote","main",0],[2922,25,2902,"table-discard-vote","main~parallel-2",0],[2923,26,2902,"table-discard-vote","main~parallel-3",0],[2924,20,2917,"table-discard-vote","main",0],[2925,27,2917,"table-discard-vote","main~parallel-2",0],[2926,28,2917,"table-discard-vote","main~parallel-3",0],[2927,29,2905,"table-discard-vote","main",0],[2928,30,2905,"table-discard-vote","main~parallel-2",0],[2929,31,2905,"table-discard-vote","main~parallel-3",0],[2930,6,2899,"rewrite","main",1],[2931,26,2923,"table-discard-vote","main~parallel-3",1],[2932,32,2923,"table-discard-vote","main~parallel-2",0],[2933,33,2923,"table-discard-vote","main",0],[2934,34,2917,"table-discard-vote","main",0],[2935,35,2917,"table-discard-vote","main~parallel-2",0],[2936,36,2917,"table-discard-vote","main~parallel-3",0],[2937,28,2926,"table-discard-vote","main",0],[2938,37,2926,"table-discard-vote","main~parallel-2",0],[2939,38,2926,"table-discard-vote","main~parallel-3",0],[2940,6,2930,"rewrite","main",1],[2941,39,2930,"rewrite","main~parallel-2",0],[2942,40,2930,"rewrite","main",0],[2943,23,2920,"table-discard-vote","main",0],[2944,41,2920,"table-discard-vote","main~parallel-2",0],[2945,42,2920,"table-discard-vote","main~parallel-3",0],[2946,42,2945,"table-discard-vote","main",0],[2947,43,2945,"table-discard-vote","main~parallel-2",0],[2948,44,2945,"table-discard-vote","main~parallel-3",0],[2949,44,2948,"table-discard-vote","main",0],[2950,45,2948,"table-discard-vote","main~parallel-2",0],[2951,46,2948,"table-discard-vote","main~parallel-3",0],[2952,46,2951,"table-discard-vote","main",0],[2953,47,2951,"table-discard-vote","main~parallel-2",0],[2954,48,2951,"table-discard-vote","main~parallel-3",0],[2955,31,2929,"table-discard-vote","main",0],[2956,49,2929,"table-discard-vote","main~parallel-2",0],[2957,50,2929,"table-discard-vote","main~parallel-3",0],[2958,50,2957,"table-discard-vote","main",0],[2959,51,2957,"table-discard-vote","main~parallel-2",0],[2960,52,2957,"table-discard-vote","main~parallel-3",0],[2961,40,2942,"rewrite","main",1],[2962,53,2942,"rewrite","main~parallel-2",0],[2963,48,2954,"parent-vote","main~parallel-3",0],[2964,54,2954,"parent-vote","main",0],[2965,55,2954,"parent-vote","main~parallel-2",0],[2966,56,2954,"parent-vote","main~parallel-4",0],[2967,57,2954,"parent-vote","main~parallel-5",0],[2968,40,2961,"rewrite","main",1],[2969,58,2961,"rewrite","main~parallel-2",0],[2970,36,2936,"table-discard-vote","main~parallel-3",1],[2971,59,2936,"table-discard-vote","main",0],[2972,60,2936,"table-discard-vote","main~parallel-4",0],[2973,61,2954,"table-discard-vote","main",0],[2974,62,2954,"table-discard-vote","main~parallel-2",0],[2975,63,2954,"table-discard-vote","main~parallel-3",0],[2976,64,2961,"rewrite","main",1],[2977,65,2961,"rewrite","main~parallel-2",0],[2978,66,2954,"parent-vote","main~parallel-5",0],[2979,67,2954,"parent-vote","main",0],[2980,68,2954,"parent-vote","main~parallel-2",0],[2981,69,2954,"parent-vote","main~parallel-3",0],[2982,70,2954,"parent-vote","main~parallel-4",0],[2983,64,2976,"rewrite","main",1],[2984,71,2976,"rewrite","main~parallel-2",0],[2985,72,2976,"rewrite","main",0],[2986,73,2976,"rewrite","main~parallel-2",0],[2987,74,2976,"rewrite","main",0],[2988,74,2987,"rewrite","main",0],[2989,74,2988,"rewrite","main",0],[2990,74,2989,"rewrite","main",0],[2991,74,2990,"rewrite","main",0],[2992,74,2991,"rewrite","main",0],[2993,74,2992,"rewrite","main",0],[2994,74,2993,"rewrite","main",0]
+    ];
+
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const graph = document.querySelector("#branch-graph");
+    const canvas = document.querySelector("#branch-canvas");
+    const shell = document.querySelector("#demo-shell");
+    const widthSlider = document.querySelector("#pane-width");
+    const pitchSlider = document.querySelector("#lane-pitch");
+    const overlapShiftSlider = document.querySelector("#overlap-shift");
+    const query = new URLSearchParams(location.search);
+    const requestedWidth = Number(query.get("width"));
+    if (Number.isFinite(requestedWidth) && requestedWidth >= 250 && requestedWidth <= 720) {
+      shell.style.width = `${requestedWidth}px`;
+      widthSlider.value = requestedWidth;
+      document.querySelector("#pane-width-output").textContent = `${requestedWidth} px`;
+    }
+    const maxLane = Math.max(...SOURCE_ROWS.map(row => row[1]));
+    const nodeCount = SOURCE_ROWS.length;
+    const byId = new Map();
+    const requestedFocus = Number(query.get("focus"));
+    const requestedHover = Number(query.get("hover"));
+    let selectedId = Number.isFinite(requestedFocus) ? requestedFocus : null;
+    let initialFocusPending = selectedId != null;
+    let initialHoverPending = Number.isFinite(requestedHover);
+    let renderFrame = 0;
+
+    function hslForLane(lane) {
+      return `hsl(${(145 + lane * 37) % 360}, 42%, 46%)`;
+    }
+
+    function makeSvgElement(name, attributes) {
+      const element = document.createElementNS(SVG_NS, name);
+      for (const [key, value] of Object.entries(attributes)) {
+        element.setAttribute(key, value);
+      }
+      return element;
+    }
+
+    function wrapLane(lane, columns) {
+      const band = Math.floor(lane / columns);
+      const offset = lane % columns;
+      const column = band % 2 === 0 ? offset : columns - 1 - offset;
+      return { band, column };
+    }
+
+    function scheduleRender() {
+      cancelAnimationFrame(renderFrame);
+      renderFrame = requestAnimationFrame(render);
+    }
+
+    function clearHoverHighlight() {
+      canvas.classList.remove("has-hover", "lane-hover", "node-hover");
+      canvas.querySelectorAll(".hover-related, .hover-focus").forEach(element => {
+        element.classList.remove("hover-related", "hover-focus");
+      });
+    }
+
+    function markRelatedNode(id, focus = false) {
+      canvas.querySelectorAll(`[data-call-id="${id}"]`).forEach(element => {
+        element.classList.add("hover-related");
+        if (focus) element.classList.add("hover-focus");
+      });
+    }
+
+    function highlightLane(edge) {
+      clearHoverHighlight();
+      canvas.classList.add("has-hover", "lane-hover");
+      edge.classList.add("hover-related");
+      markRelatedNode(edge.dataset.parentId);
+      markRelatedNode(edge.dataset.childId);
+    }
+
+    function highlightNode(id) {
+      clearHoverHighlight();
+      canvas.classList.add("has-hover", "node-hover");
+      markRelatedNode(id, true);
+      canvas.querySelectorAll(".branch-edge").forEach(edge => {
+        if (edge.dataset.parentId === id || edge.dataset.childId === id) {
+          edge.classList.add("hover-related");
+          markRelatedNode(edge.dataset.parentId);
+          markRelatedNode(edge.dataset.childId);
+        }
+      });
+    }
+
+    function render() {
+      clearHoverHighlight();
+      const oldHeight = Math.max(canvas.offsetHeight, 1);
+      const scrollRatio = graph.scrollTop / oldHeight;
+      const paneWidth = Math.floor(graph.clientWidth);
+      const lanePitch = Number(pitchSlider.value);
+      const overlapShift = Number(overlapShiftSlider.value);
+      const padding = 12;
+      const usableWidth = Math.max(lanePitch, paneWidth - padding * 2);
+      const columns = Math.max(1, Math.floor(usableWidth / lanePitch));
+      const bandPitch = 32;
+      const rowGap = 14;
+      const top = 18;
+      const sourceById = new Map(SOURCE_ROWS.map((row, depth) => [row[0], { row, depth }]));
+      const edges = SOURCE_ROWS
+        .map((row, depth) => {
+          const parent = sourceById.get(row[2]);
+          return parent ? { lane: row[1], parentDepth: parent.depth, childDepth: depth } : null;
+        })
+        .filter(Boolean);
+
+      // Compact active logical lanes independently in each chronological row.
+      const rowLayouts = [];
+      let rowTop = top;
+      let maxActive = 0;
+      let maxBands = 1;
+      for (let depth = 0; depth < nodeCount; depth += 1) {
+        const active = new Set([SOURCE_ROWS[depth][1]]);
+        for (const edge of edges) {
+          if (edge.parentDepth <= depth && depth <= edge.childDepth) active.add(edge.lane);
+        }
+        const lanes = [...active].sort((a, b) => a - b);
+        const slotByLane = new Map(lanes.map((lane, slot) => [lane, slot]));
+        const bands = Math.max(1, Math.ceil(lanes.length / columns));
+        rowLayouts.push({ top: rowTop, lanes, slotByLane, bands });
+        rowTop += bands * bandPitch + rowGap;
+        maxActive = Math.max(maxActive, lanes.length);
+        maxBands = Math.max(maxBands, bands);
+      }
+      const canvasHeight = rowTop + top;
+
+      function position(row, depth) {
+        const layout = rowLayouts[depth];
+        const slot = layout.slotByLane.get(row[1]);
+        const wrapped = wrapLane(slot, columns);
+        return {
+          ...wrapped,
+          x: padding + wrapped.column * lanePitch + lanePitch / 2,
+          y: layout.top + wrapped.band * bandPitch + bandPitch / 2
+        };
+      }
+
+      byId.clear();
+      SOURCE_ROWS.forEach((row, depth) => {
+        byId.set(row[0], { row, depth, ...position(row, depth) });
+      });
+
+      const svg = makeSvgElement("svg", {
+        class: "branch-svg",
+        width: paneWidth,
+        height: canvasHeight,
+        viewBox: `0 0 ${paneWidth} ${canvasHeight}`,
+        "aria-hidden": "true"
+      });
+
+      // A faint separator shows where one variable-height chronological macro-row ends.
+      for (let depth = 1; depth < nodeCount; depth += 1) {
+        const y = rowLayouts[depth].top;
+        svg.append(makeSvgElement("path", {
+          class: "band-guide",
+          d: `M 0 ${y} H ${paneWidth}`
+        }));
+      }
+
+      const geometries = [];
+      for (const node of byId.values()) {
+        const parent = byId.get(node.row[2]);
+        if (!parent) continue;
+        const split = parent.row[1] !== node.row[1];
+        const points = [{ x: parent.x, y: parent.y }];
+
+        // Keep the compact moving-lane layout. A later pass separates only those
+        // routes that would otherwise share the same vertical fragment.
+        for (let depth = parent.depth; depth <= node.depth; depth += 1) {
+          const laneRow = [0, node.row[1]];
+          const layout = rowLayouts[depth];
+          if (!layout.slotByLane.has(node.row[1])) continue;
+          const point = position(laneRow, depth);
+          const previous = points[points.length - 1];
+          if (point.x !== previous.x || point.y !== previous.y) points.push(point);
+        }
+        const geometry = { node, parent, split, points, segments: [] };
+        for (let index = 1; index < points.length; index += 1) {
+          const from = points[index - 1];
+          const to = points[index];
+          const dx = to.x - from.x;
+          const dy = to.y - from.y;
+          const length = Math.hypot(dx, dy) || 1;
+          let normalX = -dy / length;
+          let normalY = dx / length;
+          // Canonical normal direction makes opposing fragments use the same
+          // offset axis, which is required for deterministic separation.
+          if (normalX < 0 || (Math.abs(normalX) < .001 && normalY < 0)) {
+            normalX *= -1;
+            normalY *= -1;
+          }
+          geometry.segments.push({
+            geometry,
+            index,
+            from,
+            to,
+            normalX,
+            normalY,
+            conflicts: new Set(),
+            offset: 0,
+            routed: false
+          });
+        }
+        geometries.push(geometry);
+      }
+
+      // Find shared fragments. Vertical corridors can overlap for only part of
+      // their length; non-vertical curves conflict when they have the same routed
+      // endpoints and would therefore draw on top of one another.
+      const verticalCorridors = new Map();
+      const horizontalCorridors = new Map();
+      const identicalFragments = new Map();
+      for (const geometry of geometries) {
+        for (const segment of geometry.segments) {
+          const { from, to } = segment;
+          if (Math.abs(from.x - to.x) <= .25) {
+            const key = Math.round(from.x * 2) / 2;
+            if (!verticalCorridors.has(key)) verticalCorridors.set(key, []);
+            verticalCorridors.get(key).push({
+              segment,
+              start: Math.min(from.y, to.y),
+              end: Math.max(from.y, to.y)
+            });
+          } else if (Math.abs(from.y - to.y) <= .25) {
+            const key = Math.round(from.y * 2) / 2;
+            if (!horizontalCorridors.has(key)) horizontalCorridors.set(key, []);
+            horizontalCorridors.get(key).push({
+              segment,
+              start: Math.min(from.x, to.x),
+              end: Math.max(from.x, to.x)
+            });
+          } else {
+            const key = [
+              Math.round(from.x * 2),
+              Math.round(from.y * 2),
+              Math.round(to.x * 2),
+              Math.round(to.y * 2)
+            ].join(":");
+            if (!identicalFragments.has(key)) identicalFragments.set(key, []);
+            identicalFragments.get(key).push(segment);
+          }
+        }
+      }
+
+      function registerConflict(left, right) {
+        if (left === right) return;
+        left.conflicts.add(right);
+        right.conflicts.add(left);
+      }
+
+      for (const corridors of [verticalCorridors, horizontalCorridors]) {
+        for (const fragments of corridors.values()) {
+          fragments.sort((a, b) => a.start - b.start || a.end - b.end);
+          for (let left = 0; left < fragments.length; left += 1) {
+            for (let right = left + 1; right < fragments.length; right += 1) {
+              if (fragments[right].start >= fragments[left].end - 1) break;
+              if (
+                fragments[left].segment.geometry !==
+                fragments[right].segment.geometry
+              ) {
+                registerConflict(fragments[left].segment, fragments[right].segment);
+              }
+            }
+          }
+        }
+      }
+
+      for (const fragments of identicalFragments.values()) {
+        for (let left = 0; left < fragments.length; left += 1) {
+          for (let right = left + 1; right < fragments.length; right += 1) {
+            registerConflict(fragments[left], fragments[right]);
+          }
+        }
+      }
+
+      // Greedy small-offset coloring: overlapping fragments get distinct parallel
+      // offsets, while non-conflicting routes remain on their original geometry.
+      const offsetCandidates = [0];
+      for (let distance = 1; distance <= 8; distance += 1) {
+        offsetCandidates.push(-distance * overlapShift, distance * overlapShift);
+      }
+      const allSegments = geometries.flatMap(geometry => geometry.segments);
+      const routed = [...allSegments].sort(
+        (a, b) =>
+          b.conflicts.size - a.conflicts.size ||
+          a.geometry.node.depth - b.geometry.node.depth
+      );
+      for (const segment of routed) {
+        const used = new Set(
+          [...segment.conflicts]
+            .filter(other => other.routed)
+            .map(other => other.offset)
+        );
+        segment.offset = offsetCandidates.find(candidate => {
+          if (used.has(candidate)) return false;
+          return [segment.from, segment.to].every(point => {
+            const shiftedX = point.x + candidate * segment.normalX;
+            const shiftedY = point.y + candidate * segment.normalY;
+            return (
+              shiftedX >= 4 &&
+              shiftedX <= paneWidth - 4 &&
+              shiftedY >= 4 &&
+              shiftedY <= canvasHeight - 4
+            );
+          });
+        }) ?? 0;
+        segment.routed = true;
+      }
+      const separatedPairs = allSegments.reduce(
+        (total, segment) => total + segment.conflicts.size,
+        0
+      ) / 2;
+
+      for (const geometry of geometries) {
+        const { node, split, points, segments } = geometry;
+        const pointOffsets = points.map((point, index) => {
+          if (index === 0 || index === points.length - 1) return { x: 0, y: 0 };
+          const before = segments[index - 1];
+          const after = segments[index];
+          return {
+            x: (
+              before.offset * before.normalX +
+              after.offset * after.normalX
+            ) / 2,
+            y: (
+              before.offset * before.normalY +
+              after.offset * after.normalY
+            ) / 2
+          };
+        });
+        let path = `M ${points[0].x} ${points[0].y}`;
+        for (const segment of segments) {
+          const { from, to, index, offset } = segment;
+          const shiftX = offset * segment.normalX;
+          const shiftY = offset * segment.normalY;
+          const toX = to.x + pointOffsets[index].x;
+          const toY = to.y + pointOffsets[index].y;
+          const midpoint = (from.y + to.y) / 2;
+          path +=
+            ` C ${from.x + shiftX} ${midpoint + shiftY},` +
+            ` ${to.x + shiftX} ${midpoint + shiftY}, ${toX} ${toY}`;
+        }
+        const edgeElement = makeSvgElement("path", {
+          class: `branch-edge${split ? " branch-edge-split" : ""}`,
+          d: path,
+          stroke: hslForLane(node.row[1]),
+          "data-parent-id": geometry.parent.row[0],
+          "data-child-id": node.row[0]
+        });
+        edgeElement.addEventListener("mouseenter", () => highlightLane(edgeElement));
+        edgeElement.addEventListener("mouseleave", clearHoverHighlight);
+        svg.append(edgeElement);
+
+        // A wide transparent copy makes thin and curved lanes easy to acquire
+        // without changing their visible stroke width.
+        const hitTarget = makeSvgElement("path", {
+          class: "branch-edge-hit",
+          d: path,
+          "data-parent-id": geometry.parent.row[0],
+          "data-child-id": node.row[0]
+        });
+        hitTarget.addEventListener("mouseenter", () => highlightLane(edgeElement));
+        hitTarget.addEventListener("mouseleave", clearHoverHighlight);
+        svg.append(hitTarget);
+      }
+
+      for (const node of byId.values()) {
+        const dot = makeSvgElement("circle", {
+          class: `branch-dot${node.row[5] ? " checkpoint" : ""}`,
+          cx: node.x,
+          cy: node.y,
+          r: 5,
+          fill: hslForLane(node.row[1]),
+          "data-call-id": node.row[0]
+        });
+        dot.addEventListener("mouseenter", () => highlightNode(String(node.row[0])));
+        dot.addEventListener("mouseleave", clearHoverHighlight);
+        svg.append(dot);
+      }
+
+      canvas.replaceChildren(svg);
+      canvas.style.height = `${canvasHeight}px`;
+
+      for (const node of byId.values()) {
+        const [id, lane, , step, branch] = node.row;
+        const roomOnRight = paneWidth - node.x;
+        const placeLeft = roomOnRight < 150;
+        const button = document.createElement("button");
+        button.className = `branch-node${placeLeft ? " place-left" : ""}${selectedId === id ? " active" : ""}`;
+        button.style.left = `${node.x + (placeLeft ? -8 : 8)}px`;
+        button.style.top = `${node.y}px`;
+        button.style.width = `${Math.max(76, Math.min(184, placeLeft ? node.x - 18 : roomOnRight - 18))}px`;
+        button.title = `LLM call #${id} · ${branch} · logical lane ${lane}`;
+        button.dataset.callId = id;
+        button.innerHTML =
+          `<span class="branch-node-step">${step}</span>` +
+          `<span class="branch-node-meta">#${id} · ${branch} · L${lane}</span>`;
+        button.addEventListener("click", () => {
+          selectedId = id;
+          canvas.querySelectorAll(".branch-node").forEach(candidate => {
+            candidate.classList.toggle("active", Number(candidate.dataset.callId) === id);
+          });
+        });
+        button.addEventListener("mouseenter", () => highlightNode(String(id)));
+        button.addEventListener("mouseleave", clearHoverHighlight);
+        canvas.append(button);
+      }
+
+      if (initialHoverPending) {
+        initialHoverPending = false;
+        highlightNode(String(requestedHover));
+      }
+
+      const focusAfterRender = initialFocusPending;
+      initialFocusPending = false;
+
+      document.querySelector("#column-count").textContent = columns;
+      document.querySelector("#band-count").textContent = maxBands;
+      document.querySelector("#graph-status").textContent =
+        `${nodeCount} nodes · ${maxLane + 1} lanes · up to ${maxBands} folded bands`;
+      document.querySelector("#width-badge").textContent = `${paneWidth} px`;
+      document.querySelector("#formula").textContent =
+        `columns = floor((${paneWidth} − ${padding * 2}) / ${lanePitch}) = ${columns}\n` +
+        `maximum active lanes = ${maxActive}\n` +
+        `maximum folded bands = ${maxBands}\n` +
+        `shared fragments separated = ${separatedPairs}\n` +
+        `separation = ${overlapShift}px perpendicular offsets\n` +
+        `row height = active bands × ${bandPitch} + ${rowGap}px`;
+
+      requestAnimationFrame(() => {
+        if (focusAfterRender) {
+          canvas.querySelector(`[data-call-id="${selectedId}"]`)?.scrollIntoView({
+            block: "center",
+            inline: "nearest"
+          });
+        } else {
+          graph.scrollTop = scrollRatio * canvasHeight;
+        }
+      });
+    }
+
+    widthSlider.addEventListener("input", () => {
+      const width = Number(widthSlider.value);
+      shell.style.width = `${width}px`;
+      document.querySelector("#pane-width-output").textContent = `${width} px`;
+      scheduleRender();
+    });
+
+    pitchSlider.addEventListener("input", () => {
+      document.querySelector("#lane-pitch-output").textContent = `${pitchSlider.value} px`;
+      scheduleRender();
+    });
+
+    overlapShiftSlider.addEventListener("input", () => {
+      document.querySelector("#overlap-shift-output").textContent =
+        `${overlapShiftSlider.value} px`;
+      scheduleRender();
+    });
+
+    const resizeObserver = new ResizeObserver(entries => {
+      const width = Math.round(entries[0].contentRect.width);
+      widthSlider.value = Math.max(Number(widthSlider.min), Math.min(Number(widthSlider.max), width));
+      document.querySelector("#pane-width-output").textContent = `${width} px`;
+      scheduleRender();
+    });
+    resizeObserver.observe(shell);
+    scheduleRender();
+  </script>
+</body>
+</html>

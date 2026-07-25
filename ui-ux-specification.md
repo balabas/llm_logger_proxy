@@ -93,6 +93,12 @@ The first visible level stays compact:
 Full payloads remain available in the code surfaces and expanded update entries. Raw provider
 data and metadata are secondary tabs rather than competing with the default I/O view.
 
+A call may carry a per-request debug label (a step name the caller sets, such as
+`07-rewrite`). It is surfaced on the call's timeline item and on its update card, but only by
+sharing an existing line — the action line of the timeline item, the head line of the update
+card — and truncating rather than wrapping. It never adds a row: the compact first level keeps
+its fixed height whether or not a label is present, and a call without one shows nothing extra.
+
 ### 2.4 Semantic decoration rather than text mutation
 
 Status is expressed through CSS and surrounding labels. This keeps copied prompt/output text
@@ -255,6 +261,28 @@ The Follow toggle owns every movement caused by arrival:
 
 Opening a session is not an arrival: the first render selects the newest call and opens at
 that end whatever Follow says.
+
+#### 4.2.1 Branch view
+
+The Timeline offers two views of the same calls, switched by a **List / Branches** control and
+remembered across sessions:
+
+- **List** — the linear event sequence above.
+- **Branches** — the call tree. Each call is a node; its parent is the request it continued
+  (the declared `prev_req_id`, else the most recent earlier call that produced its parent
+  state). A parent with several children is a branch; a lane with no more children ends. Nodes
+  are laid out on a lane graph — one time axis, lanes offset for concurrent branches — with
+  a node led by its **step name** so a reader identifies calls by name, not number.
+
+The graph orients two ways, also remembered:
+
+- **vertical** — time grows downward, lanes across;
+- **horizontal** — time grows rightward (oldest first), lanes down.
+
+The branch view is a second lens, not a second source of truth: the list still renders
+(hidden) so selection, focus, and live-refresh logic are unchanged, and a graph node click
+selects exactly as a list item would. The active call is highlighted in whichever view is
+shown.
 
 ### 4.3 Mixed Trace
 
@@ -765,6 +793,8 @@ Every UI change should verify:
 - Does a new action cancel the old scroll animation?
 - Is viewport position stable during live insertion and lazy loading?
 - With Follow off, does a timeline resting at the newest end stay put as events arrive?
+- Does the branch view lead each node with its step name, branch on a multi-child parent, and
+  select the same call a list click would?
 
 ### Semantics
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pytest
 import requests
 
 from insequent_logger.config import load_config
@@ -92,6 +93,14 @@ def test_notebook_has_stable_session_and_separate_run():
         "X-LLMTrace-Run": "run-002",
         "X-LLMTrace-Purpose": "rewrite",
     }
+    assert recorder.openai_headers(
+        "rewrite", debug_label="select next line | W1 | START"
+    )["X-LLMTrace-Debug-Label"] == "1 select next line | W1 | START"
+    assert recorder.openai_headers(
+        "table-discard-vote", debug_label="parent vote L12 #1"
+    )["X-LLMTrace-Debug-Label"] == "2 parent vote L12 #1"
+    with pytest.raises(ValueError, match="ASCII HTTP header"):
+        recorder.openai_headers("rewrite", debug_label="select · next")
 
 
 def test_provider_envelopes_are_normalized_to_model_text():
@@ -138,6 +147,77 @@ def test_copied_notebook_uses_session_headers_without_remote_event_logging():
         if cell.get("cell_type") == "code"
     )
     assert "X-LLMTrace-Session" in source
+    assert "MODEL_CALL_PURPOSES" in source
+    assert "TRACE_ITEM_NUMBERS = itertools.count(1)" in source
+    assert 'debug_label = f"{next(TRACE_ITEM_NUMBERS)} {step}"' in source
+    assert "requires a real step name" in source
+    assert "trace step names must be ASCII HTTP header values" in source
+    assert 'step = step or "select next source line"' in source
+    assert 'f"select next line | W{_rw_window} | {cursor_label}"' in source
+    assert 'step=f"w{_rw_window} · {cursor_label}"' not in source
     assert "NotebookRecorder" not in source
     assert "trace.log_event" not in source
     assert "/api/events" not in source
+
+
+class ChatStub(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        raw = json.dumps(
+            {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+def test_debug_label_header_is_stored_and_surfaced(tmp_path):
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), ChatStub)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    store = TraceStore(tmp_path / "debug.llmtrace")
+    proxy = TraceServer(
+        ("127.0.0.1", 0), store, f"http://127.0.0.1:{upstream.server_port}"
+    )
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    try:
+        response = requests.post(
+            f"http://127.0.0.1:{proxy.server_port}/v1/chat/completions",
+            headers={
+                "X-LLMTrace-Session": "notebook",
+                "X-LLMTrace-Debug-Label": "07-rewrite-attempt-2",
+            },
+            json={"model": "local", "messages": [{"role": "user", "content": "hi"}]},
+            timeout=10,
+        )
+        assert response.status_code == 200
+        call_id = int(response.headers["X-LLMTrace-Call"])
+
+        # The label rides in metadata and is surfaced on the timeline row so the
+        # UI can show it without loading the full call.
+        assert store.get_call(call_id)["metadata"]["debug_label"] == "07-rewrite-attempt-2"
+        row = next(item for item in store.timeline() if item.get("id") == call_id)
+        assert row["debug_label"] == "07-rewrite-attempt-2"
+
+        # A request without the header carries no label.
+        plain = requests.post(
+            f"http://127.0.0.1:{proxy.server_port}/v1/chat/completions",
+            headers={"X-LLMTrace-Session": "notebook"},
+            json={"model": "local", "messages": [{"role": "user", "content": "hi"}]},
+            timeout=10,
+        )
+        plain_id = int(plain.headers["X-LLMTrace-Call"])
+        assert "debug_label" not in store.get_call(plain_id)["metadata"]
+        plain_row = next(item for item in store.timeline() if item.get("id") == plain_id)
+        assert "debug_label" not in plain_row
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        store.close()
+        upstream.shutdown()
+        upstream.server_close()
