@@ -459,6 +459,9 @@ class TraceHandler(BaseHTTPRequestHandler):
             self.send_response(response.status_code)
             self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
             self.send_header("Content-Length", str(len(response.content)))
+            # Without an explicit directive a proxied 200 is heuristically
+            # cacheable, and upstream HTML then shadows the viewer at this origin.
+            self.send_header("Cache-Control", response.headers.get("Cache-Control", "no-cache"))
             self.end_headers()
             self.wfile.write(response.content)
         except requests.RequestException as exc:
@@ -826,17 +829,10 @@ class TraceHandler(BaseHTTPRequestHandler):
         headers = {
             key: value
             for key, value in self.headers.items()
-            if key.lower()
-            not in {
-                "host",
-                "content-length",
-                "connection",
-                "x-llmtrace-session",
-                "x-llmtrace-branch",
-                "x-llmtrace-purpose",
-                "x-llmtrace-base-state",
-                "x-llmtrace-run",
-            }
+            if key.lower() not in {"host", "content-length", "connection"}
+            # Trace headers are consumed here, never relayed. Match on the
+            # prefix so headers added to the family stay internal by default.
+            and not key.lower().startswith("x-llmtrace-")
         }
         try:
             response = requests.post(

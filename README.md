@@ -226,6 +226,184 @@ call, surfaced on the timeline row and in the Metadata tab, and shown in the pan
 `<req_id> · state S… ← req <prev_req_id>`. Pair this with a meaningful
 `X-LLMTrace-Debug-Label` per step so each request reads as an explainable step name.
 
+### Request identity (`X-Request-ID`)
+
+Besides the `X-LLMTrace-*` family, Logger reads the conventional request-id headers.
+`X-Request-ID` (or `Request-ID`) on the incoming request is recorded as the call's provider
+request id; if the client sends neither, the same headers are read off the *upstream*
+response instead. A client-supplied value always wins over the upstream one. This is
+independent of `X-LLMTrace-Req-Id`, which declares branch lineage rather than provider identity.
+
+### Header forwarding
+
+What reaches the upstream server depends on which path a request takes.
+
+**Traced completion and reranker requests** are rebuilt rather than relayed. Only three
+headers are forwarded upstream:
+
+| Forwarded | Value |
+| --- | --- |
+| `Content-Type` | Always `application/json`. |
+| `Accept` | Copied from the client, `*/*` if absent. |
+| `Authorization` | Copied only when the client sent one. |
+
+Every other request header — including `X-LLMTrace-*`, `Accept-Encoding` and any custom
+header — is dropped and never reaches the upstream server. Callers that must pass extra
+headers to the provider cannot do so through a traced route.
+
+**Untraced pass-through routes** (`/apply-template`, `/tokenize`, `/embeddings`, …) relay the
+client's headers as-is, minus hop-by-hop headers (`Host`, `Content-Length`, `Connection`) and
+the lineage headers `X-LLMTrace-Session`, `-Branch`, `-Purpose`, `-Base-State`, `-Run`.
+
+On the way back, Logger adds `X-LLMTrace-Call` to every traced response, carrying the integer
+call id that the request was recorded under; use it to correlate a client-side result with a
+row in the viewer. Upstream `Content-Type` is preserved. Proxied responses are returned with
+`Cache-Control: no-cache` unless the upstream sets its own.
+
+### A recorded sequence
+
+The headers below reconstruct five consecutive calls from a real trace
+(`session c90bcfe569dd44648a20f117d897b342`, run `6e4077f44c06`), showing how a
+harness drives a multi-step task through the proxy.
+
+The run opens each step with a stable session and run id, a per-step
+`Debug-Label`, and a caller-generated `Req-Id`:
+
+```http
+POST /v1/chat/completions
+X-LLMTrace-Session: c90bcfe569dd44648a20f117d897b342
+X-LLMTrace-Run: 6e4077f44c06
+X-LLMTrace-Purpose: task
+X-LLMTrace-Req-Id: eb32e4a99db948f2a772f951abec200f
+X-LLMTrace-Debug-Label: CLARIFY:ANSWER_GEN:0******
+```
+
+The step's outcome is not known when the request is sent, so the harness
+finalizes the displayed title once the response has been read:
+
+```http
+POST /_llmtrace/update-title
+Content-Type: application/json
+
+{"req_id":"eb32e4a99db948f2a772f951abec200f",
+ "title":"CLARIFY:ANSWER_GEN:0:TOOL_CALLS:GET_TOC_HEADINGS+GET_TOC_HEADINGS+GET_TOC_HEADINGS"}
+```
+
+Step names in this run were written in Russian; they are shown translated
+throughout this section. That is exactly the case percent-encoding exists for —
+an HTTP header cannot carry non-ASCII text raw, so such a label must be encoded
+and declared as encoded. The value below is the run's original label:
+
+```http
+POST /v1/chat/completions
+X-LLMTrace-Session: c90bcfe569dd44648a20f117d897b342
+X-LLMTrace-Run: 6e4077f44c06
+X-LLMTrace-Req-Id: d858739d95c5452aa590c021faaf5b48
+X-LLMTrace-Debug-Label: EXECUTE:%D0%A1%D0%BE%D0%B1%D1%80%D0%B0%D1%82%D1%8C%20%D0%BF%D0%B5%D1%80%D0%B5%D1%87%D0%B5%D0%BD%D1%8C:ANSWER_GEN:0******
+X-LLMTrace-Debug-Label-Encoding: percent
+```
+
+Every response carries the id the call was stored under:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-LLMTrace-Call: 10943
+```
+
+Note what this run does *not* send. No request sets `X-LLMTrace-Branch`,
+`X-LLMTrace-Base-State`, `X-LLMTrace-Prev-Req-Id` or `X-LLMTrace-Group` — the
+harness supplies identity and lets Logger infer structure. Call `10943` still
+landed on its own branch, `run-6e4077f44c06~parallel-2`, which no header asked
+for: a lane forks whenever another call on the same branch root is still
+recorded as `running`. Here `10943` arrived 0.57s after `10942` finished
+streaming — close enough that the earlier call had not yet been marked
+complete. Inference like this is timing-sensitive by nature; supplying
+`X-LLMTrace-Prev-Req-Id` on each request replaces it with a tree the caller
+states outright.
+
+#### How those headers surface in the viewer
+
+The same two calls, as the interface renders them. Header values do not appear
+verbatim — each one is placed where it answers a different question.
+
+`X-LLMTrace-Title` (or, absent one, `X-LLMTrace-Debug-Label`) leads the Timeline
+row; the call id and branch sit beneath it as secondary text, and each call
+contributes an input row and an output row:
+
+```
+EXECUTE:Collect list of buildings and structures:ANSWER_GEN:0:TOOL_CALLS:GET_TEXT_SUMMARY+GET_TEXT_SUMMARY
+#10944 · run-6e4077f44c06          → input    17,924 in · sent
+EXECUTE:Collect list of buildings and structures:ANSWER_GEN:0:TOOL_CALLS:GET_TEXT_SUMMARY+GET_TEXT_SUMMARY
+#10944 · run-6e4077f44c06          ← output   355 out · 18,279 total · 26 tok/s · ok
+```
+
+The Branch view answers "which step is this", so it leads with the raw
+`Debug-Label` instead of the finalized title — the label names the step, while
+the title reports the outcome:
+
+```
+● EXECUTE:Collect list of buildings and structures:ANSWER_GEN:0******
+  #10943 · run-6e4077f44c06~parallel-2
+● EXECUTE:Collect list of buildings and structures:ANSWER_GEN:0******
+  #10944 · run-6e4077f44c06
+```
+
+`X-LLMTrace-Req-Id` is never used as the visible call number — the `#10944` is
+the proxy's own durable id, since caller ids are usually opaque hashes. The
+req id instead opens the pane header, followed by the state this request
+produced and where its parent came from:
+
+```
+31ca751774f7454abebb5054a46e22b0 · state S10189 ← inferred · 50%
+```
+
+Compare call `10943`, which opened the parallel lane and had no parent to match
+against:
+
+```
+d858739d95c5452aa590c021faaf5b48 · state S10188 ← root
+```
+
+That `← inferred · 50%` is the honest reading of the run: nothing declared the
+lineage, so Logger matched on request similarity and says so. Had the caller
+sent `X-LLMTrace-Prev-Req-Id`, the same slot would read `← req <that id>` with
+no percentage, because a declared predecessor is not a guess.
+
+The Metadata tab shows the stored record as YAML, where the headers appear
+under their stored names:
+
+```yaml
+id: 10944
+created_at: 2026-08-29T01:41:57.895683+00:00
+session_id: c90bcfe569dd44648a20f117d897b342
+status: ok
+chronological_parent_id: 10943
+request_state_id: 10189
+parent_state_id: 10188
+parent_source: inferred
+similarity: 0.5
+req_id: 31ca751774f7454abebb5054a46e22b0
+debug_label: EXECUTE:Collect list of buildings and structures:ANSWER_GEN:0******
+duration_ms: 21645.344
+endpoint: /v1/chat/completions
+http_status: 200
+stream_chunks: 249
+title: EXECUTE:Collect list of buildings and structures:ANSWER_GEN:0:TOOL_CALLS:GET_TEXT_SUMMARY+GET_TEXT_SUMMARY
+usage:
+  input_per_second: 746.7472859442461
+  input_tokens: 17924
+  output_per_second: 25.777457962536612
+  output_tokens: 355
+  total_tokens: 18279
+```
+
+Two things are worth noticing here. The percent-encoding is gone — a label sent
+with `X-LLMTrace-Debug-Label-Encoding: percent` is decoded on the way in and
+stored and displayed as text. And `X-LLMTrace-Run` is deliberately omitted from
+this tab: the run id is already carried by the branch name, so repeating it adds
+nothing.
+
 ## Viewer
 
 The browser interface has four coordinated panes:
