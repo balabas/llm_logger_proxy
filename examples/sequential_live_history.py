@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record a real seven-message conversation through the Insequent proxy."""
+"""Record a real seven-message conversation through the Logger proxy."""
 
 from __future__ import annotations
 

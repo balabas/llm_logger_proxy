@@ -1,4 +1,4 @@
-"""Insequent: compact, reconstructable LLM traces."""
+"""Logger: compact, reconstructable LLM traces."""
 
 from .store import TraceStore
 from .notebook import NotebookRecorder

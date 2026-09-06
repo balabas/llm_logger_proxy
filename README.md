@@ -1,13 +1,13 @@
-# Insequent
+# proxy llm logger
 
-Insequent is a compact tracing proxy and browser viewer for sequential LLM calls. It records
+This is a compact tracing proxy and browser viewer for sequential LLM calls. It records
 how prompts, parameters, outputs, branches, and application state evolve without storing every
 request as an unrelated full snapshot.
 
 It sits between an OpenAI-compatible client and an upstream model server:
 
 ```text
-Application → Insequent proxy → OpenAI-compatible model server
+Application → proxy → OpenAI-compatible model server
                     ↓
               .llmtrace database
                     ↓
@@ -52,8 +52,8 @@ Install the OpenAI Python client if you want to run the client example below:
 
 ## Quick start
 
-Insequent loads [`config.toml`](config.toml) by default. The included configuration expects the
-upstream model server at `http://127.0.0.1:8080` and starts Insequent at
+Logger loads [`config.toml`](config.toml) by default. The included configuration expects the
+upstream model server at `http://127.0.0.1:8080` and starts Logger at
 `http://127.0.0.1:8081`.
 
 ```bash
@@ -86,7 +86,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-Insequent also forwards llama.cpp-style utility routes such as `/apply-template`, `/tokenize`,
+Logger also forwards llama.cpp-style utility routes such as `/apply-template`, `/tokenize`,
 `/detokenize`, and `/health`.
 
 ## Configuration
@@ -193,12 +193,12 @@ event and output plus total tokens on the output event. OpenAI-compatible
 `usage` fields and llama.cpp native `timings.prompt_n` / `timings.predicted_n`
 are supported; unavailable counts are not estimated.
 
-If no base state is supplied, Insequent chooses the best recent parent and labels the
+If no base state is supplied, Logger chooses the best recent parent and labels the
 relationship as inferred.
 
 ### Parallel calls
 
-If a request starts before the best-matching call on its branch finishes, Insequent
+If a request starts before the best-matching call on its branch finishes, Logger
 automatically forks it into a stable branch such as `main~parallel-2`. Later calls are routed
 back to matching branches using request-state similarity and completed assistant-response
 identity.
@@ -323,7 +323,7 @@ be represented as validated deltas against a prior field of the same event kind.
 
 ## Storage retention
 
-After a call or application event finishes, Insequent checkpoints its SQLite database. When
+After a call or application event finishes, Logger checkpoints its SQLite database. When
 the file exceeds `storage.max_mb`, it deletes complete oldest sessions and compacts the file.
 A currently streaming session is never removed mid-call, so the file can temporarily exceed
 the configured limit.

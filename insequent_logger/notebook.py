@@ -8,7 +8,7 @@ import requests
 
 
 class NotebookRecorder:
-    """Small adapter for sending notebook domain events to an Insequent server."""
+    """Small adapter for sending notebook domain events to an Logger server."""
 
     def __init__(
         self,

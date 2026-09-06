@@ -1,4 +1,4 @@
-# Insequent Trace Viewer UI/UX Specification
+# Trace Viewer UI/UX Specification
 
 ## 1. Purpose
 

@@ -1023,7 +1023,7 @@ def serve(
             server.server_close()
         store.close()
         raise
-    print(f"Insequent viewer: http://{host}:{port}/")
+    print(f"Logger viewer: http://{host}:{port}/")
     print(f"OpenAI-compatible proxy: http://{host}:{port}/v1 -> {upstream}/v1")
     if reranker_listener is not None:
         print(
