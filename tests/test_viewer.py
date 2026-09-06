@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import requests
 from playwright.sync_api import Page, expect
 
+from insequent_logger.protocol import extract_model_response
 from insequent_logger.server import TraceServer
 from insequent_logger.store import TraceStore
 
@@ -99,6 +102,1400 @@ def viewer_url(tmp_path):
     store.close()
 
 
+@pytest.fixture
+def tall_updates_url(tmp_path):
+    """A session whose Updates pane overflows: several calls, each with a long
+    message body, so scrolling to a selected call actually has to move."""
+    store = TraceStore(tmp_path / "tall.llmtrace")
+    body = "\n".join(
+        f"instruction line {index:03d} about buildings and structures"
+        for index in range(40)
+    )
+    parent_state = None
+    for revision in range(8):
+        request = {
+            "model": "local",
+            "max_tokens": 80000,
+            "messages": [
+                {"role": "system", "content": f"{body}\nrevision {revision}"},
+                {"role": "user", "content": f"request number {revision} " * 6},
+            ],
+        }
+        keywords = {"session_id": "tall"}
+        if parent_state is not None:
+            keywords["explicit_parent_state"] = parent_state
+        call = store.start_call(request, **keywords)
+        store.finish_call(call, f"response for call {revision} " * 20)
+        parent_state = store.get_call(call)["request_state_id"]
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}"
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+@pytest.fixture
+def input_and_output_diff_url(tmp_path):
+    """Two chained calls that change BOTH their input (user message) and their
+    output — so call 2 has an input update entry (index 0) and an output update
+    entry (index 1), which is what a cross-pane focus needs to disambiguate."""
+    store = TraceStore(tmp_path / "io-diff.llmtrace")
+    system = "You are a helpful assistant."
+    first = store.start_call(
+        {"model": "m", "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "AAA original question about cats"},
+        ]},
+        session_id="s",
+    )
+    store.finish_call(first, "The original answer mentions cats and dogs.")
+    state = store.get_call(first)["request_state_id"]
+    second = store.start_call(
+        {"model": "m", "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "BBB changed question about buildings"},
+        ]},
+        session_id="s",
+        explicit_parent_state=state,
+    )
+    store.finish_call(second, "The changed answer mentions buildings and rooms.")
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}"
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_switching_focus_never_leaves_a_stale_update_entry_highlighted(
+    page: Page, input_and_output_diff_url: str
+):
+    # Focusing one update entry, then another of a DIFFERENT scope, must leave only
+    # the second highlighted in the Updates pane. Regression: the mark-click path
+    # cleared its highlight only within one card and in one class-style, so the
+    # previous entry (e.g. an output change) stayed lit after clicking an input
+    # mark — the "second click focuses the wrong item".
+    page.goto(f"{input_and_output_diff_url}/")
+    page.locator('.timeline-input[data-key="call:2"]').click()
+
+    # Focus the OUTPUT change first (via the output timeline item).
+    page.locator('.timeline-output[data-call-key="call:2"]').click()
+    focused = page.locator("#updates .timeline-update-focus, #updates .update-jump.active")
+    expect(focused).to_have_count(1)
+    expect(focused).to_contain_text("output")
+
+    # Now click the INPUT mark in Exact. Only the input entry may stay highlighted.
+    page.locator("#exact mark.exact-update.input-update").first.click()
+    still = page.locator("#updates .timeline-update-focus, #updates .update-jump.active")
+    expect(still).to_have_count(1)
+    expect(still).to_contain_text("input")
+    expect(still).not_to_contain_text("output")
+
+
+@pytest.fixture
+def exact_scroll_url(tmp_path):
+    """Two calls sharing a long unchanged body, differing only in the last user
+    message. The change sits near the bottom of the Exact pane's input scope, so
+    revealing it requires scrolling — the setup needed to tell "scrolled" from
+    "held still"."""
+    store = TraceStore(tmp_path / "exact-scroll.llmtrace")
+    body = "\n".join(
+        f"line {index:03d}: shared unchanged content about buildings"
+        for index in range(60)
+    )
+    first = store.start_call(
+        {
+            "model": "local",
+            "messages": [
+                {"role": "system", "content": body},
+                {"role": "user", "content": "AAA original bottom message"},
+            ],
+        },
+        session_id="exact",
+    )
+    store.finish_call(first, "r1")
+    state = store.get_call(first)["request_state_id"]
+    second = store.start_call(
+        {
+            "model": "local",
+            "messages": [
+                {"role": "system", "content": body},
+                {"role": "user", "content": "BBB changed bottom message different"},
+            ],
+        },
+        session_id="exact",
+        explicit_parent_state=state,
+    )
+    store.finish_call(second, "r2")
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}"
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_clicking_a_scope_in_exact_does_not_scroll_the_exact_pane(
+    page: Page, exact_scroll_url: str
+):
+    # Clicking a reference inside a pane focuses it across every pane, but the
+    # pane the click came from must not move — the user is already looking at it.
+    # Only the other pane scrolls to the match. Regression: the scope-navigation
+    # path scrolled *both* panes, jerking the Exact pane out from under the click.
+    page.goto(f"{exact_scroll_url}/")
+    page.locator('.timeline-input[data-key="call:2"]').first.click()
+    input_label = page.locator('#exact [data-state-scope="input"] .state-scope-label')
+    expect(input_label).to_be_visible()
+
+    # Selecting the call legitimately scrolls Exact to the change; let that settle
+    # so the reset below is not overwritten by a late selection scroll (which
+    # would masquerade as a click-driven one).
+    def exact_scroll_top():
+        return page.evaluate("() => Math.round(document.querySelector('#exact').scrollTop)")
+
+    previous = None
+    for _ in range(30):
+        page.wait_for_timeout(60)
+        current = exact_scroll_top()
+        if current == previous:
+            break
+        previous = current
+
+    # pinPaneScroll is a short timing-based restore that happens to mask this for
+    # fast card loads; neutralize it so the test checks the actual contract (the
+    # source pane is never told to scroll) rather than winning a 260ms race.
+    page.evaluate(
+        "() => { window.pinPaneScroll = () => {};"
+        " document.querySelector('#exact').scrollTop = 0; }"
+    )
+    page.wait_for_timeout(150)
+    before = page.evaluate("() => Math.round(document.querySelector('#exact').scrollTop)")
+
+    input_label.first.click()
+
+    max_delta = 0
+    for _ in range(16):
+        page.wait_for_timeout(60)
+        now = page.evaluate("() => Math.round(document.querySelector('#exact').scrollTop)")
+        max_delta = max(max_delta, abs(now - before))
+    assert max_delta <= 3, f"exact pane scrolled on its own click: Δ={max_delta}px"
+
+
+def test_clicking_plain_scope_text_restarts_timeline_focus_pulse(
+    page: Page, exact_scroll_url: str
+):
+    page.goto(f"{exact_scroll_url}/")
+    page.locator('.timeline-input[data-key="call:2"]').click()
+    page.wait_for_function("state.detail?.id === 2")
+    page.evaluate(
+        """() => {
+          window.__timelinePlainTextPulses = [];
+          document.querySelectorAll(".timeline-item").forEach(item => {
+            item.addEventListener("animationstart", event => {
+              if (event.animationName === "timeline-item-focus-flash") {
+                window.__timelinePlainTextPulses.push(
+                  item.dataset.key || item.dataset.callKey
+                );
+              }
+            });
+          });
+          const content = document.querySelector(
+            '#exact [data-state-scope="input"] > .state-scope-content'
+          );
+          // The "input:" prefix is a plain text node, not an update mark or the
+          // scope label. This is the click that previously produced no feedback.
+          content.click();
+        }"""
+    )
+    # This unchanged text is inherited from checkpoint call #1, so ownership
+    # navigation correctly points there rather than to reconstructed call #2.
+    page.wait_for_function("window.__timelinePlainTextPulses.length === 1")
+    timeline_input = page.locator('.timeline-input[data-key="call:1"]')
+    expect(timeline_input).to_have_class(re.compile(r"\bactive\b"))
+    expect(timeline_input).to_have_class(re.compile(r"\btimeline-focus-flash\b"))
+    expect(page.locator(
+        '.update-card[data-key="call:1"][data-phase="input"] '
+        '.checkpoint-input.active'
+    )).to_have_count(1)
+    assert page.evaluate("state.timelineFocus") == {
+        "key": "call:1",
+        "phase": "input",
+    }
+
+    # The same already-active target must pulse again, making a successful
+    # repeat focus distinguishable from a dead click.
+    page.wait_for_timeout(1200)
+    page.locator(
+        '#exact [data-state-scope="input"] > .state-scope-content'
+    ).click(position={"x": 4, "y": 4})
+    page.wait_for_function("window.__timelinePlainTextPulses.length === 2")
+    assert page.evaluate("window.__timelinePlainTextPulses") == ["call:1", "call:1"]
+
+
+def test_clicking_a_mixed_mark_restores_the_pre_mousedown_scroll(
+    page: Page, exact_scroll_url: str
+):
+    # CodeMirror handles mousedown before the pane's click handler. If that
+    # handling moves the editor, the click handler must restore the position
+    # from before mousedown rather than pinning the already-moved position.
+    page.goto(f"{exact_scroll_url}/")
+    page.locator('.timeline-input[data-key="call:2"]').first.click()
+    page.wait_for_selector("#mixed .cm-scroller")
+    entry_key = page.evaluate(
+        """() => {
+          const mark = mixedCodeMirrorModel.marks.find(
+            candidate => candidate.attributes["data-update-entry"]
+          );
+          return mark.attributes["data-update-entry"];
+        }"""
+    )
+    # Let the timeline selection's legitimate reveal finish before establishing
+    # the click baseline; it is unrelated to the source-pane click under test.
+    page.wait_for_timeout(400)
+    # Put a semantic mark at a stable visible coordinate. The actual decoration
+    # is virtualized when its long input change is outside CodeMirror's viewport;
+    # this harness exercises the same delegated pane handlers without depending
+    # on which document ranges CodeMirror has mounted.
+    positions = page.evaluate(
+        """entryKey => {
+          const pane = document.querySelector("#mixed");
+          const scroller = pane.querySelector(".cm-scroller");
+          const target = document.createElement("button");
+          target.id = "mixed-mousedown-regression-target";
+          target.dataset.updateEntry = entryKey;
+          target.textContent = "mixed update mark";
+          target.style.cssText = "position:absolute;left:12px;top:48px;z-index:20";
+          pane.appendChild(target);
+          scroller.scrollTop = (scroller.scrollHeight - scroller.clientHeight) / 2;
+          const before = scroller.scrollTop;
+          const maximum = scroller.scrollHeight - scroller.clientHeight;
+          const shifted = before >= 60
+            ? before - 50
+            : Math.min(maximum, before + 50);
+          window.__mixedClickScrollFrames = [];
+          let sampledFrames = 0;
+          const sampleFrame = () => {
+            window.__mixedClickScrollFrames.push(scroller.scrollTop);
+            sampledFrames += 1;
+            if (sampledFrames < 180) requestAnimationFrame(sampleFrame);
+          };
+          requestAnimationFrame(sampleFrame);
+          target.addEventListener("mousedown", () => {
+            // Reproduce a slow CodeMirror measurement on a very large virtual
+            // document, well after the old 300ms source-pane guard expired.
+            setTimeout(() => { scroller.scrollTop = shifted; }, 2200);
+          }, { once: true });
+          return { before, shifted };
+        }""",
+        entry_key,
+    )
+    assert positions["shifted"] != positions["before"], positions
+
+    target = page.locator("#mixed-mousedown-regression-target")
+    target.click()
+    page.wait_for_timeout(2800)
+    after = page.locator("#mixed .cm-scroller").evaluate(
+        "scroller => scroller.scrollTop"
+    )
+    assert abs(after - positions["before"]) <= 1, {
+        **positions,
+        "after": after,
+    }
+    frames = page.evaluate("window.__mixedClickScrollFrames")
+    assert frames
+    assert all(abs(value - positions["before"]) <= 1 for value in frames), {
+        **positions,
+        "frames": frames,
+    }
+
+    # The longer guard must yield immediately to a fresh user gesture.
+    released = page.locator("#mixed .cm-scroller").evaluate(
+        """(scroller, shifted) => {
+          scroller.dispatchEvent(new WheelEvent("wheel", {bubbles: true, deltaY: 20}));
+          scroller.scrollTop = shifted;
+          return scroller.scrollTop;
+        }""",
+        positions["shifted"],
+    )
+    page.wait_for_timeout(100)
+    assert page.locator("#mixed .cm-scroller").evaluate(
+        "scroller => scroller.scrollTop"
+    ) == released
+
+
+def test_mixed_click_survives_codemirror_replacing_the_mark(
+    page: Page, exact_scroll_url: str
+):
+    # After scrolling, CodeMirror can redraw a decoration during mousedown. The
+    # following click then targets the editor rather than the now-detached mark.
+    # One gesture must still focus the corresponding Exact and Updates entries,
+    # while leaving the source editor at the user's scroll position.
+    page.goto(f"{exact_scroll_url}/")
+    page.locator('.timeline-input[data-key="call:2"]').first.click()
+    page.wait_for_selector("#mixed .cm-scroller")
+    entry_key = page.evaluate(
+        """() => mixedCodeMirrorModel.marks.find(
+          candidate => candidate.attributes["data-update-entry"]
+        ).attributes["data-update-entry"]"""
+    )
+    page.wait_for_timeout(400)
+
+    before = page.evaluate(
+        """entryKey => {
+          const pane = document.querySelector("#mixed");
+          const scroller = pane.querySelector(".cm-scroller");
+          scroller.scrollTop = (scroller.scrollHeight - scroller.clientHeight) / 2;
+          const target = document.createElement("button");
+          target.dataset.updateEntry = entryKey;
+          target.className = "input-update";
+          pane.appendChild(target);
+
+          target.dispatchEvent(new MouseEvent("mousedown", {
+            bubbles: true,
+            button: 0,
+            clientX: 20,
+            clientY: 50,
+          }));
+          // Reproduce the decoration replacement: click reaches the pane after
+          // the element carrying data-update-entry has left the document.
+          target.remove();
+          pane.dispatchEvent(new MouseEvent("click", {
+            bubbles: true,
+            button: 0,
+            clientX: 20,
+            clientY: 50,
+          }));
+          return scroller.scrollTop;
+        }""",
+        entry_key,
+    )
+
+    expect(page.locator(f'#exact [data-update-entry="{entry_key}"].exact-focus')).to_have_count(1)
+    expect(page.locator("#updates .timeline-update-focus, #updates .update-jump.active")).to_have_count(1)
+    page.wait_for_timeout(400)
+    after = page.locator("#mixed .cm-scroller").evaluate("node => node.scrollTop")
+    assert abs(after - before) <= 1, {"before": before, "after": after}
+
+
+@pytest.fixture
+def input_change_scroll_url(tmp_path):
+    """Three chained calls whose only difference is the last user message, sitting
+    deep inside a tall shared body. Selecting the newest call reconstructs the
+    whole segment, so an earlier call's removed (historical) input part appears as
+    a ``<del>`` far down the Mixed pane — the setup that exposes the focus-driven
+    scroll jump."""
+    store = TraceStore(tmp_path / "input-change.llmtrace")
+    body = "\n".join(
+        f"system line {index:03d}: long shared context about buildings and tools"
+        for index in range(120)
+    )
+
+    def make_call(parent_state, user_message):
+        kwargs = {} if parent_state is None else {"explicit_parent_state": parent_state}
+        call_id = store.start_call(
+            {
+                "model": "local",
+                "messages": [
+                    {"role": "system", "content": body},
+                    {"role": "user", "content": user_message},
+                ],
+            },
+            session_id="chain",
+            **kwargs,
+        )
+        store.finish_call(call_id, "response " + user_message[:6])
+        return store.get_call(call_id)["request_state_id"]
+
+    state = make_call(None, 'complex_text_search(regex="Q", limit=100) -> 64.3k chars AAA')
+    state = make_call(state, 'complex_text_search(regex="Q", limit=200) -> 12.1k chars BBB')
+    make_call(state, 'complex_text_search(regex="Q", limit=300) -> 5.5k chars CCC')
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}"
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_clicking_a_historical_removed_input_part_does_not_scroll_mixed(
+    page: Page, input_change_scroll_url: str
+):
+    # Clicking a removed (historical) input change deep in the Mixed pane must
+    # focus it without moving the pane the user is already looking at. Regression:
+    # applying the focus decoration rebuilt the whole EditorState with setState,
+    # which discarded CodeMirror's measured line heights; its next measure pass
+    # then re-anchored the huge virtual document and violently scrolled the pane
+    # (up by ~1000px and back) before the scroll pin could correct it.
+    page.goto(f"{input_change_scroll_url}/")
+    page.locator('.timeline-input[data-key="call:3"]').first.click()
+    page.wait_for_selector("#mixed .cm-scroller")
+    page.wait_for_timeout(600)
+
+    # Target an earlier call's removed input mark (a <del>), not call 3's own, so
+    # the reconstructed segment is deep and the reflow has room to jump.
+    target_entry = page.evaluate(
+        """() => {
+          const marks = mixedCodeMirrorModel.marks.filter(
+            m => m.classes.includes("cm-mixed-removed")
+              && m.classes.includes("input-update")
+          );
+          return marks.length ? marks[marks.length - 1].attributes["data-update-entry"] : null;
+        }"""
+    )
+    assert target_entry, "fixture did not produce a removed input part"
+
+    # Reveal the del, keeping it comfortably inside the viewport so the click
+    # itself never needs a legitimate scroll-into-view.
+    for _ in range(60):
+        rect = page.evaluate(
+            """entry => {
+              const el = [...document.querySelectorAll('#mixed .cm-mixed-removed.input-update')]
+                .find(node => node.dataset.updateEntry === entry);
+              if (!el) return null;
+              const r = el.getBoundingClientRect();
+              const s = document.querySelector('#mixed .cm-scroller').getBoundingClientRect();
+              return {
+                top: r.top, bottom: r.bottom, left: r.left,
+                visible: r.top > s.top + 40 && r.bottom < s.bottom - 40,
+              };
+            }""",
+            target_entry,
+        )
+        if rect and rect["visible"]:
+            break
+        page.evaluate(
+            """entry => {
+              const el = [...document.querySelectorAll('#mixed .cm-mixed-removed.input-update')]
+                .find(node => node.dataset.updateEntry === entry);
+              const s = document.querySelector('#mixed .cm-scroller');
+              const sr = s.getBoundingClientRect();
+              if (el) {
+                const r = el.getBoundingClientRect();
+                s.scrollTop += r.top - (sr.top + sr.height * 0.5);
+              } else {
+                s.scrollTop += 300;
+              }
+            }""",
+            target_entry,
+        )
+        page.wait_for_timeout(100)
+    assert rect and rect["visible"], rect
+
+    # Sample the scroll every animation frame across the click so a transient
+    # jump that restores itself still fails the test.
+    page.evaluate(
+        """() => {
+          window.__mixedFrames = [];
+          const s = document.querySelector('#mixed .cm-scroller');
+          let n = 0;
+          const sample = () => {
+            window.__mixedFrames.push(s.scrollTop);
+            if (++n < 200) requestAnimationFrame(sample);
+          };
+          requestAnimationFrame(sample);
+        }"""
+    )
+    before = page.evaluate("() => document.querySelector('#mixed .cm-scroller').scrollTop")
+    page.mouse.click(rect["left"] + 5, (rect["top"] + rect["bottom"]) / 2)
+    page.wait_for_timeout(2000)
+
+    frames = page.evaluate("() => window.__mixedFrames")
+    max_delta = max(abs(value - before) for value in frames)
+    assert max_delta <= 3, {"before": before, "max_delta": max_delta, "frames": frames[:40]}
+
+    # The click must still focus the removed part across the panes.
+    assert page.evaluate(
+        """entry => mixedCodeMirrorModel.marks.some(
+          m => m.focused && m.attributes["data-update-entry"] === entry
+        )""",
+        target_entry,
+    )
+
+
+def test_updates_checkpoint_preserves_nested_message_indentation(
+    page: Page, exact_scroll_url: str
+):
+    page.goto(f"{exact_scroll_url}/")
+    page.locator('.timeline-input[data-key="call:1"]').click()
+    messages = page.locator(
+        '.update-card[data-key="call:1"][data-phase="input"] '
+        ".checkpoint-message-list"
+    )
+    expect(messages).to_be_visible()
+
+    layout = messages.evaluate(
+        """element => {
+          const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+          let node = null;
+          while (walker.nextNode()) {
+            if (walker.currentNode.nodeValue.includes("line 001")) {
+              node = walker.currentNode;
+              break;
+            }
+          }
+          if (!node) return null;
+          const index = node.nodeValue.indexOf("line 001");
+          const range = document.createRange();
+          range.setStart(node, index);
+          range.setEnd(node, index + 1);
+          return {
+            whiteSpace: getComputedStyle(element).whiteSpace,
+            indent: range.getBoundingClientRect().left
+              - element.getBoundingClientRect().left,
+            text: node.nodeValue,
+          };
+        }"""
+    )
+    assert layout is not None
+    assert layout["whiteSpace"] == "pre-wrap", layout
+    assert "\n      line 001" in layout["text"], layout
+    assert layout["indent"] >= 30, layout
+
+
+def test_tool_calls_and_json_tool_results_are_formatted_structurally(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    rendered = page.evaluate(
+        """() => {
+          const request = {
+            messages: [
+              {
+                role: "assistant",
+                content: "",
+                tool_calls: [{
+                  function: {
+                    name: "get_doc_names",
+                    arguments: "{\\\"limit\\\":57}",
+                  },
+                  id: "FCla3m9v0B0mmOjkoMBF7Y9u21aDM2er",
+                  type: "function",
+                }],
+              },
+              {
+                role: "tool",
+                content: JSON.stringify({
+                  count: 57,
+                  documents: [{doc_uid: "1033-45-23-ИГДИ", doc_name: "Технический отчет"}],
+                }),
+              },
+            ],
+          };
+          const source = yaml(requestContent(request));
+          const template = document.createElement("template");
+          template.innerHTML = messageStructureHtml(escapeHtml(source));
+          return {
+            source,
+            text: template.content.textContent,
+            separators: template.content.querySelectorAll(".message-separator").length,
+            labels: [...template.content.querySelectorAll(".message-field-label")]
+              .map(label => label.textContent),
+          };
+        }"""
+    )
+    assert rendered["source"].index("role:") < rendered["source"].index("content:")
+    assert rendered["labels"][:4] == ["Role", "Content", "Role", "Content"]
+    assert rendered["separators"] == 1
+    assert 'name: "get_doc_names"' in rendered["text"]
+    assert 'id: "FCla3m9v0B0mmOjkoMBF7Y9u21aDM2er"' in rendered["text"]
+    assert 'type: "function"' in rendered["text"]
+    assert "arguments:\n" in rendered["text"]
+    assert "limit: 57" in rendered["text"]
+    assert "count: 57" in rendered["text"]
+    assert 'doc_uid: "1033-45-23-ИГДИ"' in rendered["text"]
+    assert '\\"count\\"' not in rendered["text"]
+
+
+@pytest.fixture
+def empty_output_url(tmp_path):
+    """Two calls: one that produced normal content, and one that failed the way a
+    context-exceeded streaming call does — the upstream opened the SSE stream and
+    sent only role/finish_reason frames plus an error envelope, so no content
+    delta parses out. The raw body is captured but the parsed output is blank."""
+    store = TraceStore(tmp_path / "empty-output.llmtrace")
+    request = {
+        "model": "local",
+        "stream": True,
+        "messages": [{"role": "user", "content": "a prompt that overflows context"}],
+    }
+    normal = store.start_call(request, session_id="ctx")
+    store.finish_call(
+        normal,
+        "Here is a real answer.",
+        raw_response=(
+            'data: {"choices":[{"delta":{"content":"Here is a real answer."}}]}\n\n'
+            "data: [DONE]\n\n"
+        ),
+    )
+    state = store.get_call(normal)["request_state_id"]
+    raw_sse = (
+        'data: {"choices":[{"index":0,"delta":{"role":"assistant"},'
+        '"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n'
+        'data: {"error":{"message":"the request exceeds the available context '
+        'size","code":500}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    failed = store.start_call(request, session_id="ctx", explicit_parent_state=state)
+    store.finish_call(failed, "", raw_response=raw_sse, status="error")
+
+    reasoning_raw_sse = (
+        'data: {"choices":[{"index":0,"delta":{"role":"assistant",'
+        '"content":null},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"index":0,"delta":{"reasoning_content":"We '
+        'parsed this reasoning."},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    reasoning_only = store.start_call(
+        request, session_id="ctx", explicit_parent_state=state
+    )
+    parsed = extract_model_response(reasoning_raw_sse, streaming=True)
+    store.finish_call(
+        reasoning_only,
+        parsed.content,
+        thoughts=parsed.thoughts,
+        raw_response=reasoning_raw_sse,
+        status="cancelled",
+    )
+
+    # Guard the premise: the parsed output really is empty while the raw body is
+    # not — otherwise this test could pass without exercising the fallback.
+    detail = store.get_call(failed)
+    assert detail["response"] == ""
+    assert "the request exceeds" in detail["raw_response"]
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}"
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_empty_parse_output_falls_back_to_raw_response_in_exact(
+    page: Page, empty_output_url: str
+):
+    # A context-exceeded/cancelled call parses to empty content, but the raw body
+    # was captured. The Exact pane's Output scope must show that raw body (so the
+    # user sees the error / finish_reason instead of a blank pane) and flag it as
+    # unparsed. Regression: the Output scope rendered nothing at all.
+    page.goto(f"{empty_output_url}/")
+    page.locator('.timeline-input[data-key="call:2"]').first.click()
+
+    output = page.locator('#exact [data-state-scope="output"]')
+    expect(output).to_be_visible()
+    # The captured raw frames — including the context-size error — are shown.
+    expect(output.locator(".state-scope-content")).to_contain_text(
+        "the request exceeds the available context size"
+    )
+    expect(output.locator(".state-scope-content")).to_contain_text('"finish_reason":"length"')
+    # And it is clearly marked as raw rather than mistaken for real model output.
+    expect(output.locator(".scope-badge")).to_have_count(1)
+
+    # A normal call must be untouched: parsed content shows, no raw badge.
+    page.locator('.timeline-input[data-key="call:1"]').first.click()
+    normal_output = page.locator('#exact [data-state-scope="output"]')
+    expect(normal_output.locator(".state-scope-content")).to_contain_text(
+        "Here is a real answer."
+    )
+    expect(normal_output.locator(".scope-badge")).to_have_count(0)
+
+    # A reasoning-only stream was parsed, even though it was cancelled before
+    # public content arrived. Thoughts show the reasoning; Output must not dump
+    # raw SSE.
+    page.locator('.timeline-input[data-key="call:3"]').first.click()
+    expect(page.locator('#exact [data-state-scope="thoughts"]')).to_contain_text(
+        "We parsed this reasoning."
+    )
+    reasoning_output = page.locator('#exact [data-state-scope="output"]')
+    expect(reasoning_output.locator(".state-scope-content")).not_to_contain_text(
+        "data:"
+    )
+    expect(reasoning_output.locator(".state-scope-content")).to_contain_text(
+        "No output content before cancellation."
+    )
+    expect(reasoning_output.locator(".scope-badge")).to_have_count(0)
+    reasoning_output.locator(".state-scope-content").click()
+    page.wait_for_function(
+        "state.timelineFocus?.key === 'call:3' && state.timelineFocus?.phase === 'output'"
+    )
+    expect(page.locator('.timeline-output[data-call-key="call:3"]')).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+    assert page.evaluate("state.timelineFocus") == {
+        "key": "call:3",
+        "phase": "output",
+    }
+
+
+class _StreamingContextExceededUpstream(BaseHTTPRequestHandler):
+    """A mock model server that streams a couple of content deltas and then fails
+    the way a context-exceeded call does: a finish_reason=length frame followed by
+    an error envelope. Frames are flushed with a delay so the relay forwards them
+    incrementally, exercising the live side-channel."""
+
+    FRAMES = [
+        'data: {"choices":[{"delta":{"content":"Analyzing"}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":" buildings"}}]}\n\n',
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n',
+        'data: {"error":{"message":"the request exceeds the available '
+        'context size"}}\n\n',
+        "data: [DONE]\n\n",
+    ]
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_args):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        # The proxy must publish the request before upstream response headers
+        # arrive; the caller-provided request id is already available then.
+        time.sleep(0.8)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("X-Request-ID", "upstream-live-request-42")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        for frame in self.FRAMES:
+            self.wfile.write(frame.encode())
+            # Exceed the relay's read chunk so each small SSE frame is delivered
+            # immediately instead of being buffered until connection close. SSE
+            # comments are ignored by the parser and do not alter model output.
+            self.wfile.write((f": {'x' * 4096}\n\n").encode())
+            self.wfile.flush()
+            time.sleep(0.3)
+
+
+def test_live_side_channel_shows_streaming_output_before_it_is_stored(
+    page: Page, tmp_path
+):
+    # The viewer must show a call's output while it is still streaming — before any
+    # durable record exists — via the SSE /api/live side-channel, rendered in the
+    # Exact pane (03) as the current call's output being reconstructed live. This
+    # is the only way to see what a call produced before a mid-stream failure
+    # (e.g. a context-exceeded error), since storage happens after the stream ends.
+    upstream = ThreadingHTTPServer(
+        ("127.0.0.1", 0), _StreamingContextExceededUpstream
+    )
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    store = TraceStore(tmp_path / "live.llmtrace")
+    proxy = TraceServer(
+        ("127.0.0.1", 0),
+        store,
+        f"http://127.0.0.1:{upstream.server_port}",
+        default_session="live",
+    )
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{proxy.server_port}"
+
+    def drive():
+        # Let the browser's EventSource subscribe before the stream starts.
+        time.sleep(1.0)
+        requests.post(
+            f"{base}/v1/chat/completions",
+            headers={
+                "X-LLMTrace-Session": "live",
+            },
+            json={
+                "model": "local",
+                "stream": True,
+                "messages": [
+                    {"role": "user", "content": "MARKER-INPUT extract entities"}
+                ],
+            },
+            stream=True,
+            timeout=15,
+        ).content
+
+    try:
+        page.goto(f"{base}/")
+        page.wait_for_timeout(500)  # startLiveStream() opens the EventSource
+        threading.Thread(target=drive, daemon=True).start()
+
+        # The streaming call appears in the Timeline as an ordinary call: a → input
+        # item and a streaming ← output item (marked not-finished).
+        input_item = page.locator("#timeline .timeline-input")
+        expect(input_item).to_have_count(1, timeout=8000)
+        expect(input_item).to_contain_text("#1")
+        # The first live input replaces the empty-session placeholder in Updates;
+        # it must never claim there are no updates while the input card exists.
+        expect(page.locator("#updates .update-card")).to_have_count(1)
+        expect(page.locator("#updates .empty-session")).to_have_count(0)
+        expect(page.locator("#updates")).to_contain_text(
+            "MARKER-INPUT extract entities"
+        )
+        input_item.evaluate("node => { node.dataset.liveIdentitySentinel = 'same'; }")
+        # Only the input phase exists while the proxy is waiting for response
+        # headers. Response start updates this call rather than replacing it.
+        expect(page.locator("#timeline .timeline-output")).to_have_count(0)
+        streaming_output = page.locator("#timeline .timeline-output.timeline-streaming")
+        expect(streaming_output).to_have_count(1, timeout=8000)
+        expect(input_item).to_have_attribute("data-live-identity-sentinel", "same")
+
+        # The compact proxy request number labels both phases; the synthetic
+        # ``live-N`` key and upstream's long id must never replace it.
+        expect(input_item).to_contain_text("#1")
+        expect(streaming_output).to_contain_text("#1")
+        expect(page.locator("#timeline")).not_to_contain_text("#live-")
+
+        # Updates already knows this live input is a complete new state. Timeline
+        # must reflect that immediately, while output is still streaming.
+        expect(page.locator("#timeline .timeline-streaming")).to_have_count(1)
+        expect(input_item.locator(".item-label")).to_have_text("→ new state input")
+        expect(input_item).to_have_class(re.compile("checkpoint-call"))
+
+        # Input appears in all panes as soon as it comes: on the auto-selected input
+        # item, the Exact pane shows the forwarded request.
+        input_scope = page.locator('#exact [data-state-scope="input"]')
+        expect(input_scope).to_contain_text("MARKER-INPUT extract entities", timeout=8000)
+
+        # Clicking the streaming output item shows its live output in the Exact
+        # pane's output scope: parsed generated text (not raw SSE) plus the error.
+        streaming_output.click()
+        out = page.locator('#exact .live-output-scope[data-state-scope="output"] [data-live-body="output"]')
+        expect(out).to_contain_text("Analyzing buildings", timeout=8000)
+        expect(out).to_contain_text("the request exceeds the available context size")
+        expect(out).not_to_contain_text('"choices"')
+
+        # Once the output finishes (and the call is stored/reconciled), the
+        # streaming marker clears — no in-flight output item remains.
+        expect(page.locator("#timeline .timeline-streaming")).to_have_count(0, timeout=10000)
+        expect(page.locator("#timeline")).to_contain_text(
+            "#1"
+        )
+        expect(input_item).to_have_attribute("data-live-identity-sentinel", "same")
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        store.close()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_live_tool_call_deltas_are_assembled_into_readable_output(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    output = page.evaluate(
+        """() => {
+          const record = {
+            output: "", outputText: "", thoughts: "", buffer: "", toolCalls: {},
+          };
+          const frame = toolCalls => `data: ${JSON.stringify({
+            choices: [{delta: {tool_calls: toolCalls}}],
+          })}\n\n`;
+          feedLive(record, frame([{
+            index: 0,
+            id: "tool-1",
+            type: "function",
+            function: {name: "get_toc_headings", arguments: "{"},
+          }]));
+          feedLive(record, frame([{
+            index: 0,
+            function: {arguments: "\\\"doc_id\\\":\\\"СМЛ*Раздел ПД №3*V0\\\"}"},
+          }]));
+          return record.output;
+        }"""
+    )
+    assert json.loads(output) == [
+        {
+            "index": 0,
+            "id": "tool-1",
+            "type": "function",
+            "function": {
+                "name": "get_toc_headings",
+                "arguments": {"doc_id": "СМЛ*Раздел ПД №3*V0"},
+            },
+        }
+    ]
+    assert "\n  " in output
+
+
+def test_streaming_timeline_row_shows_running_token_count(page: Page, viewer_url: str):
+    # The token counts render from the timeline item's usage, but a delta only
+    # updates the live record. The item must be refreshed on a usage-bearing delta
+    # so the streaming output row shows the running count, not an empty/stale one.
+    page.goto(f"{viewer_url}/")
+    page.wait_for_function("() => typeof upsertLiveTimelineItem === 'function'")
+    text = page.evaluate(
+        """() => {
+          const live_id = 555777;
+          const rec = {
+            live_id, call_id: null, req_id: "r", request_id: "r", status: "streaming",
+            output: "", outputText: "", thoughts: "", buffer: "", toolCalls: {}, usage: {},
+            request: {model: "local", messages: [{role: "user", content: "go"}]},
+            started_ms: Date.now(),
+          };
+          state.live.set(live_id, rec);
+          upsertLiveTimelineItem(rec); liveDetailFor(rec); renderLiveTimelinePanes();
+          // A usage-bearing delta, exactly as the SSE handler processes it.
+          const prev = JSON.stringify(rec.usage || {});
+          feedLive(rec, 'data: {"choices":[{"delta":{"content":"hi"}}],'
+            + '"usage":{"completion_tokens":1234,"prompt_tokens":444,"total_tokens":5678}}\\n\\n');
+          if (JSON.stringify(rec.usage || {}) !== prev) upsertLiveTimelineItem(rec);
+          renderLiveTimelinePanes();
+          const row = document.querySelector(
+            "#timeline .timeline-output.timeline-streaming"
+          );
+          return row ? row.textContent : null;
+        }"""
+    )
+    assert text is not None, "streaming output row should exist"
+    assert "1,234 out" in text, text
+    assert "5,678 total" in text, text
+    assert "streaming" in text, text
+
+
+def test_timeline_shows_generation_speed(page: Page, viewer_url: str):
+    # The output row shows the generation speed: the model's real decode rate for
+    # a stored call, and a live estimate (streamed tokens / elapsed) while running.
+    page.goto(f"{viewer_url}/")
+    page.wait_for_function("() => typeof timelineUsageText === 'function'")
+    result = page.evaluate(
+        """async () => {
+          const stored = timelineUsageText(
+            {usage: {output_tokens: 310, total_tokens: 21574, output_per_second: 31.66}},
+            "output"
+          );
+          // Live: stream some pieces across a measurable interval.
+          const rec = {
+            live_id: 888444, call_id: null, req_id: "r", request_id: "r", status: "streaming",
+            output: "", outputText: "", thoughts: "", buffer: "", toolCalls: {}, usage: {},
+            request: {model: "local", messages: [{role: "user", content: "go"}]},
+            started_ms: Date.now(),
+          };
+          state.live.set(888444, rec);
+          upsertLiveTimelineItem(rec); liveDetailFor(rec);
+          for (let i = 0; i < 6; i += 1) {
+            feedLive(rec, 'data: {"choices":[{"delta":{"reasoning_content":"x "}}]}\\n\\n');
+            await new Promise(r => setTimeout(r, 60));
+          }
+          feedLive(rec, 'data: {"choices":[{"delta":{"reasoning_content":"y "}}]}\\n\\n');
+          return { stored, liveSpeed: rec.usage.output_per_second };
+        }"""
+    )
+    assert "32 tok/s" in result["stored"], result           # 31.66 rounds to 32
+    assert result["liveSpeed"] and result["liveSpeed"] > 0, result
+
+
+def test_streaming_input_row_estimates_tokens_until_real_count_arrives(
+    page: Page, viewer_url: str
+):
+    # The model reports the real prompt-token count only in its final frame, but
+    # the input is known immediately, so the input row estimates from the request
+    # text during the stream and switches to the exact count when it arrives.
+    page.goto(f"{viewer_url}/")
+    page.wait_for_function("() => typeof applyLiveInputEstimate === 'function'")
+    result = page.evaluate(
+        """() => {
+          const live_id = 777222;
+          const content = "слово ".repeat(540);  // ~3240 chars -> ~1200 tokens
+          const rec = {
+            live_id, call_id: null, req_id: "r", request_id: "r", status: "streaming",
+            output: "", outputText: "", thoughts: "", buffer: "", toolCalls: {}, usage: {},
+            request: {model: "local", messages: [{role: "user", content}]},
+            started_ms: Date.now(),
+          };
+          applyLiveInputEstimate(rec);
+          state.live.set(live_id, rec);
+          upsertLiveTimelineItem(rec); liveDetailFor(rec); renderLiveTimelinePanes();
+          const inputRow = () => (document.querySelector(
+            '#timeline .timeline-input[data-key="call:live-777222"]'
+          ) || {}).textContent || "";
+          const estimate = rec.usage.input_tokens;
+          const during = inputRow();
+          feedLive(rec, 'data: {"choices":[],"usage":'
+            + '{"completion_tokens":10,"prompt_tokens":22461,"total_tokens":22471}}\\n\\n');
+          upsertLiveTimelineItem(rec); renderLiveTimelinePanes();
+          return { estimate, during, after: inputRow() };
+        }"""
+    )
+    # Estimate ~ chars / 2.7, shown live as "N in".
+    assert 900 < result["estimate"] < 1500, result
+    assert f"{result['estimate']:,} in" in result["during"], result
+    # Real prompt count takes over.
+    assert "22,461 in" in result["after"], result
+
+
+def test_streaming_row_estimates_output_tokens_until_real_count_arrives(
+    page: Page, viewer_url: str
+):
+    # The server reports real token counts only in its final frame, so during the
+    # stream the active row estimates output tokens by counting streamed pieces
+    # (~1 token each). When the real count arrives it takes over and locks.
+    page.goto(f"{viewer_url}/")
+    page.wait_for_function("() => typeof feedLive === 'function'")
+    result = page.evaluate(
+        """() => {
+          const live_id = 666333;
+          const rec = {
+            live_id, call_id: null, req_id: "r", request_id: "r", status: "streaming",
+            output: "", outputText: "", thoughts: "", buffer: "", toolCalls: {}, usage: {},
+            request: {model: "local", messages: [{role: "user", content: "go"}]},
+            started_ms: Date.now(),
+          };
+          state.live.set(live_id, rec);
+          upsertLiveTimelineItem(rec); liveDetailFor(rec); renderLiveTimelinePanes();
+          const row = () => (document.querySelector(
+            "#timeline .timeline-output.timeline-streaming"
+          ) || {}).textContent || "";
+          // Seven reasoning deltas, no usage — the real Qwen3 streaming shape.
+          for (let i = 0; i < 7; i += 1) {
+            feedLive(rec, 'data: {"choices":[{"delta":{"reasoning_content":"x "}}]}\\n\\n');
+            upsertLiveTimelineItem(rec);
+          }
+          renderLiveTimelinePanes();
+          const during = row();
+          // Final frame carries the model's real count.
+          feedLive(rec, 'data: {"choices":[],"usage":'
+            + '{"completion_tokens":310,"prompt_tokens":21264,"total_tokens":21574}}\\n\\n');
+          upsertLiveTimelineItem(rec);
+          renderLiveTimelinePanes();
+          return { during, after: row(), usageIsReal: !!rec.usageIsReal };
+        }"""
+    )
+    # Live estimate = number of streamed pieces.
+    assert "7 out" in result["during"], result
+    assert "streaming" in result["during"], result
+    # Real count takes over and is marked authoritative.
+    assert "310 out" in result["after"], result
+    assert "21,574 total" in result["after"], result
+    assert result["usageIsReal"] is True, result
+
+
+def test_stored_live_call_reconciles_off_the_stale_render(page: Page, viewer_url: str):
+    # A call selected while it streamed rendered against the synthetic live detail
+    # (empty output during the stream). When it lands, the panes must re-render
+    # from the real stored detail — not keep the stale empty-output DOM. The server
+    # gives the exact live_id -> call_id mapping, so the swap must be definitive
+    # even when loadTimeline's request-id heuristic misses (no request id sent).
+    page.goto(f"{viewer_url}/")
+    page.wait_for_function("() => typeof reconcileStoredLive === 'function'")
+    result = page.evaluate(
+        """async () => {
+          const stored = await detailFor("call", 1);   // any real stored call
+          const live_id = 987654;
+          const rec = {
+            live_id, call_id: null, req_id: null, request_id: null, status: "streaming",
+            output: "", outputText: "", thoughts: "", buffer: "", toolCalls: {},
+            request: stored.request, started_ms: Date.now(),
+          };
+          state.live.set(live_id, rec);
+          upsertLiveTimelineItem(rec);
+          liveDetailFor(rec);
+          renderLiveTimelinePanes();
+          await selectItem("call", liveId(live_id), null, false, false, "live");
+          const streaming = state.detail && state.detail.live === true
+            && (state.detail.response || "") === "";
+
+          // Stream ends and the server commits the durable call #1.
+          rec.status = "ok"; rec.endedAt = Date.now();
+          await reconcileStoredLive(live_id, 1);
+
+          return {
+            streamingWasEmpty: streaming,
+            selected: state.selected && state.selected.id,
+            liveStillPresent: state.live.has(live_id),
+            detailIsLive: !!(state.detail && state.detail.live),
+            detailHasResponse: !!(state.detail && (state.detail.response || "").length),
+          };
+        }"""
+    )
+    assert result["streamingWasEmpty"] is True, result
+    # Landed on the real stored call, synthetic gone, detail is the stored one.
+    assert result["selected"] == 1, result
+    assert result["liveStillPresent"] is False, result
+    assert result["detailIsLive"] is False, result
+    assert result["detailHasResponse"] is True, result
+
+
+def test_stats_header_shows_db_size_and_flags_over_limit(page: Page, viewer_url: str):
+    # The header must show the current database size (labelled), and flag it when
+    # it exceeds the retention limit.
+    page.goto(f"{viewer_url}/")
+    page.wait_for_function("() => typeof loadStats === 'function'")
+    result = page.evaluate(
+        """async () => {
+          const original = fetchJson;
+          fetchJson = async (url) => (String(url).includes("/api/stats")
+            ? {calls: 42, file_bytes: 20 * 1024 * 1024, max_file_bytes: 15 * 1024 * 1024,
+               logical_bytes: 100, stored_bytes: 40}
+            : original(url));
+          try { await loadStats(); } finally { fetchJson = original; }
+          const node = document.querySelector("#stats");
+          return { text: node.textContent, overLimit: node.classList.contains("over-limit"),
+                   title: node.title };
+        }"""
+    )
+    assert "DB 20.00 MB / 15 MB" in result["text"], result
+    assert "⚠" in result["text"], result
+    assert result["overLimit"] is True, result
+    assert "over the 15 MB retention limit" in result["title"], result
+
+
+def test_live_deltas_are_coalesced_into_few_renders(page: Page, viewer_url: str):
+    # A fast stream can deliver deltas far quicker than the screen refreshes.
+    # Their DOM work must be coalesced into a per-frame flush; running a full
+    # Timeline/Updates rebuild per delta is what froze the page. Here 500 delta
+    # flushes must collapse to a couple of pane renders, not 500.
+    page.goto(f"{viewer_url}/")
+    page.wait_for_function("() => typeof scheduleLiveFlush === 'function'")
+    result = page.evaluate(
+        """async () => {
+          let panesRenders = 0;
+          const original = renderLiveTimelinePanes;
+          renderLiveTimelinePanes = () => { panesRenders += 1; };
+          try {
+            for (let i = 0; i < 500; i += 1) scheduleLiveFlush(true);
+            // Let a few animation frames pass so any scheduled flush runs.
+            await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+            await new Promise(r => setTimeout(r, 60));
+            await new Promise(r => requestAnimationFrame(r));
+            return { panesRenders };
+          } finally {
+            renderLiveTimelinePanes = original;
+          }
+        }"""
+    )
+    assert result["panesRenders"] <= 3, result
+
+
+def test_new_live_item_preserves_selection_and_pane_scroll_when_follow_is_off(
+    page: Page, tall_updates_url: str
+):
+    page.goto(f"{tall_updates_url}/")
+    page.wait_for_selector("#timeline .timeline-item")
+    result = page.evaluate(
+        """async () => {
+          const timeline = document.querySelector("#timeline");
+          const maximum = timeline.scrollHeight - timeline.clientHeight;
+          timeline.scrollTop = Math.max(1, Math.floor(maximum / 2));
+          state.followNewItems = false;
+          document.querySelector("#follow-new-items").checked = false;
+          const selectedBefore = itemKey(state.selected);
+          const before = {};
+          for (const id of ["timeline", "mixed", "exact", "updates"]) {
+            const pane = document.querySelector(`#${id}`);
+            const scroller = pane.querySelector(".cm-scroller") || pane;
+            const paneMaximum = scroller.scrollHeight - scroller.clientHeight;
+            if (id !== "timeline" && paneMaximum > 4) {
+              scroller.scrollTop = Math.round(paneMaximum * 0.37);
+            }
+            before[id] = scroller.scrollTop;
+          }
+          const record = {
+            live_id: 9001,
+            call_id: 9001,
+            request_id: 9001,
+            session: state.session,
+            status: "running",
+            started_ms: Date.now(),
+            request: {model: "local", messages: [{role: "user", content: "new live call"}]},
+            output: "",
+            thoughts: "",
+            buffer: "",
+          };
+          state.live.set(record.live_id, record);
+          upsertLiveTimelineItem(record);
+          liveDetailFor(record);
+          renderLiveTimelinePanes();
+          const selection = selectNewLiveItem(record);
+          if (selection) await selection;
+          const after = {};
+          for (const id of Object.keys(before)) {
+            const pane = document.querySelector(`#${id}`);
+            const scroller = pane.querySelector(".cm-scroller") || pane;
+            after[id] = scroller.scrollTop;
+          }
+          return {
+            before,
+            after,
+            maximum,
+            selectedBefore,
+            selectedAfter: itemKey(state.selected),
+            liveActive: document.querySelector(
+              '.timeline-input[data-key="call:live-9001"]'
+            )?.classList.contains("active"),
+          };
+        }"""
+    )
+    assert result["maximum"] > 0
+    assert result["selectedAfter"] == result["selectedBefore"], result
+    assert result["liveActive"] is False, result
+    assert all(
+        abs(result["after"][pane] - top) <= 1
+        for pane, top in result["before"].items()
+    ), result
+
+
+def test_follow_selects_the_actual_last_timeline_event(
+    page: Page, tall_updates_url: str
+):
+    page.goto(f"{tall_updates_url}/")
+    items = page.locator("#timeline .timeline-item")
+    expect(items).not_to_have_count(0)
+    page.evaluate(
+        """() => {
+          state.followNewItems = false;
+          document.querySelector("#follow-new-items").checked = false;
+        }"""
+    )
+    page.locator("#timeline .timeline-input").first.click()
+
+    last = items.last
+    expected = last.evaluate(
+        """node => ({
+          key: node.dataset.key || node.dataset.callKey,
+          phase: node.dataset.phase,
+        })"""
+    )
+    assert expected["phase"] == "output"
+
+    page.locator("#follow-new-items").check()
+    expect(last).to_have_class(re.compile(r"\bactive\b"))
+    page.wait_for_function(
+        """expected => state.timelineFocus?.key === expected.key
+          && state.timelineFocus?.phase === expected.phase""",
+        arg=expected,
+    )
+
+
+def test_selecting_a_call_scrolls_updates_to_the_start_of_its_card(
+    page: Page, tall_updates_url: str
+):
+    # Clicking a timeline item must bring the top of that call's update card
+    # (its "New current state / call #N" header) to the top of the Updates pane,
+    # not center a mark inside it and push the header off the top. Regression for
+    # a tall card opening mid-content with no indication of which call it was.
+    page.goto(f"{tall_updates_url}/")
+    expect(page.locator(".timeline-item")).not_to_have_count(0)
+
+    # An older call (call #1) with several cards below it, so its top has room to
+    # reach the top of the pane and it is not the one auto-selected on load.
+    older = page.locator('.timeline-input[data-key="call:1"]')
+    expect(older).to_have_count(1)
+    older.click()
+
+    active = page.locator("#updates .update-card.active")
+    expect(active).to_have_count(1)
+
+    def offset_from_top():
+        return page.evaluate(
+            """() => {
+              const pane = document.querySelector('#updates');
+              const card = document.querySelector('#updates .update-card.active');
+              return {
+                top: card.getBoundingClientRect().top - pane.getBoundingClientRect().top,
+                overflowing: pane.scrollHeight > pane.clientHeight,
+              };
+            }"""
+        )
+
+    # The fixture is built so the pane overflows; otherwise "scroll to start" is
+    # vacuous.
+    assert offset_from_top()["overflowing"] is True
+
+    # Let the smooth-scroll animation settle, then the card's start sits at the
+    # top of the pane (never scrolled past it, which was the bug: ~ -242px).
+    for _ in range(40):
+        offset = offset_from_top()["top"]
+        if -3 <= offset <= 3:
+            break
+        page.wait_for_timeout(50)
+    assert -3 <= offset <= 3, f"card start not anchored to pane top: {offset}px"
+
+
+def test_clicking_updates_keeps_updates_fixed_and_starts_other_panes(
+    page: Page, tall_updates_url: str
+):
+    page.goto(f"{tall_updates_url}/")
+    card = page.locator(
+        '#updates .update-card[data-key="call:3"][data-phase="output"]'
+    )
+    card.scroll_into_view_if_needed()
+    expect(card).to_have_attribute("data-loaded", "true")
+    # Initial lazy-card expansion and follow cleanup can legitimately adjust the
+    # pane before the interaction under test. Let those finish first.
+    page.wait_for_timeout(700)
+
+    # Put the source card comfortably inside the viewport, rather than already
+    # at an edge where preserving its scroll would be impossible to distinguish
+    # from navigation to it.
+    source_scroll = card.evaluate(
+        """element => {
+          const pane = document.querySelector('#updates');
+          pane.scrollTop = Math.max(0, element.offsetTop - pane.clientHeight / 3);
+          return pane.scrollTop;
+        }"""
+    )
+    assert source_scroll > 0
+
+    page.evaluate(
+        """() => {
+          window.__focusScrollCalls = [];
+          window.__originalFocusScrollIntoView = focusScrollIntoView;
+          focusScrollIntoView = (target, block) => {
+            const pane = target?.closest?.('#timeline, #mixed, #exact, #updates');
+            window.__focusScrollCalls.push({pane: pane?.id || null, block});
+            return window.__originalFocusScrollIntoView(target, block);
+          };
+        }"""
+    )
+
+    # Use a DOM click so Playwright itself does not scroll the source to satisfy
+    # actionability. This changed text has a precise corresponding item in the
+    # Timeline, Mixed, and Exact panes.
+    changed_text = card.locator(
+        '.checkpoint-section[data-checkpoint-scope="output"]'
+    )
+    expect(changed_text).to_be_attached()
+    changed_text.evaluate("element => element.click()")
+
+    max_delta = 0
+    for _ in range(14):
+        page.wait_for_timeout(50)
+        current_scroll = page.locator("#updates").evaluate(
+            "element => element.scrollTop"
+        )
+        max_delta = max(max_delta, abs(current_scroll - source_scroll))
+
+    calls = page.evaluate(
+        """() => {
+          focusScrollIntoView = window.__originalFocusScrollIntoView;
+          return window.__focusScrollCalls;
+        }"""
+    )
+    assert max_delta <= 3, {"maxDelta": max_delta, "calls": calls}
+    assert not any(call["pane"] == "updates" for call in calls), calls
+    for pane in ("timeline", "exact"):
+        assert any(
+            call["pane"] == pane and call["block"] == "start" for call in calls
+        ), calls
+    assert page.evaluate(
+        """() => mixedCodeMirrorModel.marks.some(mark => (
+          mark.focused && mark.attributes['data-state-scope'] === 'output'
+        ))"""
+    )
+
+
 def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url: str):
     page.goto(f"{viewer_url}/")
     expect(page.get_by_label("Session")).to_have_value("viewer")
@@ -110,30 +1507,30 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.get_by_role("heading", name="Updates")).to_be_visible()
     expect(page.locator(".timeline-item")).not_to_have_count(0)
     expect(page.locator("#waiting-calls")).to_have_text("0 waiting / running")
+    # The waiting/running counter reflects in-flight live streams (storage is
+    # deferred, so there is never a stored "running" call). Each live stream also
+    # appears as its own synthetic Timeline item, so this is just the count.
+    # startLiveStream() clears state.live once on load; wait for it (it sets
+    # state.liveSource) before poking state.live so the reset does not race us.
+    page.wait_for_function("() => state.liveSource")
     page.evaluate(
-        """renderWaitingCalls([{
-          type: "call",
-          id: 3,
-          status: "running",
-          label: "rewrite",
-          branch_id: "main"
-        }])"""
+        """() => {
+          state.live.set(3, {live_id: 3, status: "streaming"});
+          renderWaitingCalls();
+        }"""
     )
     expect(page.locator("#waiting-calls")).to_contain_text("1 waiting / running")
     expect(page.locator("#waiting-calls .waiting-calls-head")).to_have_count(1)
-    one_waiting_height = page.locator("#waiting-calls").bounding_box()["height"]
     page.evaluate(
-        """renderWaitingCalls([
-          {type: "call", id: 3, status: "running"},
-          {type: "call", id: 4, status: "running"},
-          {type: "call", id: 5, status: "running"}
-        ])"""
+        """() => {
+          state.live.set(4, {live_id: 4, status: "streaming"});
+          state.live.set(5, {live_id: 5, status: "streaming"});
+          renderWaitingCalls();
+        }"""
     )
     expect(page.locator("#waiting-calls")).to_have_text("3 waiting / running")
-    assert page.locator("#waiting-calls").bounding_box()["height"] == one_waiting_height
-    page.evaluate("renderWaitingCalls(state.timelineItems)")
+    page.evaluate("() => { state.live.clear(); renderWaitingCalls(); }")
     expect(page.locator("#waiting-calls")).to_have_text("0 waiting / running")
-    assert page.locator("#waiting-calls").bounding_box()["height"] == one_waiting_height
     assert page.evaluate(
         """isCheckpoint({
           diff: {mode: "diff", prompt: {hunks: [{"=": "20 unchanged lines"}]}},
@@ -265,13 +1662,16 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
           state.detail = selected;
           state.mixedSegmentDetails = [prior, selected];
           renderMixed();
-          const mixedText = document.querySelector("#mixed").textContent;
-          const retainedHistoricalRemoved = [
-            ...document.querySelectorAll("#mixed .removed-part"),
-          ].some(node => node.textContent.includes("retained historical output"));
-          const retainedHistoricalPresent = [
-            ...document.querySelectorAll("#mixed .added-part"),
-          ].some(node => node.textContent.includes("retained historical output"));
+          const mixedText = mixedCodeMirrorModel.text;
+          const markedText = mark => mixedText.slice(mark.start, mark.end);
+          const retainedHistoricalRemoved = mixedCodeMirrorModel.marks.some(
+            mark => mark.classes.includes("removed-part")
+              && markedText(mark).includes("retained historical output")
+          );
+          const retainedHistoricalPresent = mixedCodeMirrorModel.marks.some(
+            mark => mark.classes.includes("added-part")
+              && markedText(mark).includes("retained historical output")
+          );
           const fragmentTemplate = document.createElement("template");
           fragmentTemplate.innerHTML = updateEntryHtml({
             category: "output",
@@ -445,15 +1845,19 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.locator('.timeline-item[data-key="call:4"]')).to_have_class(
         re.compile("active")
     )
-    expect(page.locator("#mixed .checkpoint-pane-focus.trace-kind-input")).to_be_visible()
+    expect(
+        page.locator("#mixed .checkpoint-pane-focus.trace-kind-input").first
+    ).to_be_visible()
     expect(page.locator("#exact .checkpoint-pane-focus.trace-kind-input")).to_be_visible()
     summary_checkpoint_output.locator(".checkpoint-output").click()
-    expect(page.locator("#mixed .checkpoint-pane-focus.trace-kind-output")).to_be_visible()
+    expect(
+        page.locator("#mixed .checkpoint-pane-focus.trace-kind-output").first
+    ).to_be_visible()
     expect(page.locator("#exact .checkpoint-pane-focus.trace-kind-output")).to_be_visible()
     summary_checkpoint.locator(".checkpoint-parameters").click()
     expect(page.get_by_role("button", name="Params")).to_have_class(re.compile("active"))
     expect(
-        page.locator("#mixed .checkpoint-pane-focus.trace-kind-input-params")
+        page.locator("#mixed .checkpoint-pane-focus.trace-kind-input-params").first
     ).not_to_have_count(0)
     expect(
         page.locator("#exact .checkpoint-pane-focus.trace-kind-input-params")
@@ -635,7 +2039,7 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
         page.locator('.update-card[data-key="call:4"][data-phase="output"] .checkpoint-output')
     ).to_have_class(re.compile("timeline-update-focus"))
     expect(
-        page.locator("#mixed .checkpoint-pane-focus.trace-kind-output")
+        page.locator("#mixed .checkpoint-pane-focus.trace-kind-output").first
     ).to_be_visible()
     expect(
         page.locator("#exact .checkpoint-pane-focus.trace-kind-output")
@@ -685,16 +2089,19 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
             entryKey,
             "output",
           );
-          const unchangedOutput = card.querySelector(
-            '[data-update-scope="output"]'
-          );
-          return entryKey === null
-            && document.querySelector(
-              '#mixed [data-state-scope="output"]'
-            ).classList.contains("timeline-scope-focus")
-            && document.querySelector(
-              '#mixed [data-state-scope="output"]'
-            ).classList.contains("flash")
+              const unchangedOutput = card.querySelector(
+                '[data-update-scope="output"]'
+              );
+              const mixedOutputScope = mixedCodeMirrorModel.marks.some(
+                mark => mark.focused
+                  && mark.attributes["data-state-scope"] === "output"
+              );
+              const mixedFocusedUpdate = mixedCodeMirrorModel.marks.some(
+                mark => mark.focused
+                  && mark.attributes["data-update-entry"]
+              );
+              return entryKey === null
+                && mixedOutputScope
             && document.querySelector(
               '#exact [data-state-scope="output"]'
             ).classList.contains("timeline-scope-focus")
@@ -704,10 +2111,9 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
             && getComputedStyle(
               document.querySelector('#exact [data-state-scope="output"]')
             ).animationName === "timeline-scope-flash"
-            && !document.querySelector("#mixed .fragment-focus.input-update")
-            && !document.querySelector("#exact .exact-focus.input-update")
-            && !document.querySelector("#mixed .fragment-focus.output-update")
-            && !document.querySelector("#exact .exact-focus.output-update")
+                && !mixedFocusedUpdate
+                && !document.querySelector("#exact .exact-focus.input-update")
+                && !document.querySelector("#exact .exact-focus.output-update")
             && unchangedOutput.textContent.includes(
               "Same output as call #2"
             )
@@ -934,13 +2340,15 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     changed_input_state.click()
     expect(changed_input_state).to_have_class(re.compile("exact-focus"))
     expect(changed_input_state).to_have_class(re.compile("flash"))
-    expect(
-        page.locator(
-            "#mixed .state-scope-content "
-            ".trace-part.input-update.fragment-focus",
-            has_text="Remember cobalt blue.",
-        )
-    ).not_to_have_count(0)
+    assert page.evaluate(
+        """() => mixedCodeMirrorModel.marks.some(mark =>
+          mark.focused
+          && mark.classes.includes("input-update")
+          && mixedCodeMirrorModel.text
+            .slice(mark.start, mark.end)
+            .includes("Remember cobalt blue.")
+        )"""
+    )
     expect(
         page.locator(
             '.update-card[data-key="call:3"][data-phase="input"] '
@@ -950,9 +2358,11 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.locator('.timeline-input[data-key="call:3"]')).to_have_class(
         re.compile("active")
     )
-    page.locator(
-        '#mixed [data-state-scope="output"] > .state-scope-label'
-    ).click()
+    page.evaluate(
+        """() => focusUpdateFromState(
+          document.querySelector('#exact [data-state-scope="output"]')
+        )"""
+    )
     expect(page.locator('.timeline-output[data-call-key="call:3"]')).to_have_class(
         re.compile("active")
     )
@@ -994,9 +2404,16 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
         "window.getSelection().toString()"
     )
     page.evaluate("window.getSelection().removeAllRanges()")
-    page.locator("#mixed .state-scope.trace-kind-output").select_text()
-    assert "continuing" in page.evaluate("window.getSelection().toString()")
-    page.evaluate("window.getSelection().removeAllRanges()")
+    assert page.evaluate(
+        """() => {
+          const scope = mixedCodeMirrorModel.marks.find(
+            mark => mark.attributes["data-state-scope"] === "output"
+          );
+          return scope && mixedCodeMirrorModel.text
+            .slice(scope.start, scope.end)
+            .includes("continuing");
+        }"""
+    )
     added_user.select_text()
     assert "Continue with the next section." in page.evaluate(
         "window.getSelection().toString()"
@@ -1230,9 +2647,7 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(page.locator("#exact > .state-scope > .state-scope-label")).to_have_text(
         ["Input parameters", "Input", "Output"]
     )
-    expect(
-        page.locator('#mixed [data-input-field="prompt"] > .state-field-label')
-    ).to_have_text("Prompt")
+    assert "prompt:" in page.evaluate("mixedCodeMirrorModel.text")
     expect(
         page.locator('#exact [data-input-field="prompt"] > .state-field-label')
     ).to_have_text("Prompt")
@@ -1242,13 +2657,21 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     assert not page.locator(
         '#exact [data-input-field="prompt"] > .state-field-content'
     ).text_content().lstrip().startswith("prompt:")
-    expect(
-        page.locator(
-            '#mixed [data-state-scope="input-params"] .state-scope-content'
-        )
-    ).to_contain_text('model: "local"')
-    expect(page.locator("#mixed .state-scope.trace-kind-input")).to_be_visible()
-    expect(page.locator("#mixed .state-scope.trace-kind-output")).to_be_visible()
+    assert page.evaluate(
+        """() => {
+          const text = mixedCodeMirrorModel.text;
+          const scopes = mixedCodeMirrorModel.marks.filter(
+            mark => mark.attributes["data-state-scope"]
+          );
+          const parameters = scopes.find(
+            mark => mark.attributes["data-state-scope"] === "input-params"
+          );
+          return parameters
+            && text.slice(parameters.start, parameters.end).includes('model: "local"')
+            && scopes.some(mark => mark.attributes["data-state-scope"] === "input")
+            && scopes.some(mark => mark.attributes["data-state-scope"] === "output");
+        }"""
+    )
     expect(page.locator("#exact .state-scope.trace-kind-input")).to_be_visible()
     expect(page.locator("#exact .state-scope.trace-kind-output")).to_be_visible()
     expect(page.locator('.update-card[data-key="call:896"]')).to_contain_text(
@@ -1325,15 +2748,49 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
           renderMixed();
         }"""
     )
-    # 901 added this text; 902 removed it. Mixed shows it as removed history
-    # owned by the removing call (902), so a click lands on a removed side — not
-    # the call that added it. It is still present (grow-never-lose), just red.
+    # 901 added this text and 902 removed it. The one struck span carries both
+    # references: the strike-through focuses the removal (902), and the green
+    # underline (its addition origin) focuses the addition (901).
     expect(
         page.locator('#mixed [data-update-entry="902:0"].removed-part')
     ).to_contain_text("first accumulated addition")
+    origin = page.evaluate(
+        """() => {
+          const mark = mixedCodeMirrorModel.marks.find(candidate => (
+            candidate.attributes["data-update-entry"] === "902:0"
+            && candidate.classes.includes("removed-part")
+            && mixedCodeMirrorModel.text.slice(candidate.start, candidate.end)
+              .includes("first accumulated addition")
+          ));
+          return {
+            added: mark?.attributes["data-added-entry"] || null,
+            underline: !!mark?.classes.includes("cm-mixed-added-origin"),
+          };
+        }"""
+    )
+    assert origin == {"added": "901:0", "underline": True}
+    # Navigation picks the reference by which decoration the click landed on:
+    # the lower band (underline) → addition; anywhere else on the strike → removal.
+    navigation = page.evaluate(
+        """() => {
+          const target = {
+            dataset: {updateEntry: "902:0", addedEntry: "901:0"},
+            closest() { return target; },
+            getClientRects: () => [{left: 0, right: 100, top: 0, bottom: 20, height: 20}],
+          };
+          return {
+            strike: mixedNavigationEntryKey(target, {clientX: 50, clientY: 6}),
+            underline: mixedNavigationEntryKey(target, {clientX: 50, clientY: 18}),
+          };
+        }"""
+    )
+    assert navigation == {"strike": "902:0", "underline": "901:0"}
     expect(page.locator("#mixed")).to_contain_text("first accumulated addition")
     expect(
-        page.locator('#mixed [data-update-entry="902:0"].added-part')
+        page.locator(
+            '#mixed [data-update-entry="902:0"].added-part',
+            has_text="second accumulated addition",
+        )
     ).to_contain_text("second accumulated addition")
     expect(page.locator("#mixed-status")).to_contain_text("2 accumulated updates")
     page.evaluate(
@@ -1376,6 +2833,240 @@ def test_four_pane_current_state_and_append_only_updates(page: Page, viewer_url:
     expect(unavailable).not_to_have_class(re.compile(r"\bloading\b"))
     unavailable.scroll_into_view_if_needed()
     page.screenshot(path="/tmp/insequent_regression_898.png", full_page=True)
+
+
+def test_search_result_highlights_and_reveals_match_in_state_panes(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    page.wait_for_selector("#mixed .cm-editor")
+    filters = page.locator('#search-form input[name="search-field"]')
+    expect(filters).to_have_count(3)
+    expect(page.locator('#search-form input[value="input"]')).to_be_checked()
+    expect(page.locator('#search-form input[value="thoughts"]')).to_be_checked()
+    expect(page.locator('#search-form input[value="output"]')).to_be_checked()
+    page.get_by_placeholder("Search inputs, outputs, state…").fill("cobalt blue")
+    page.get_by_role("button", name="Search").click()
+    result = page.locator(".result", has_text="LLM call #2 · input").first
+    expect(result).to_be_visible()
+    result.click()
+
+    page.wait_for_function("state.detail?.id === 2 && state.searchFocus?.owner_id === 2")
+    expect(page.locator("#mixed .cm-search-match")).not_to_have_count(0)
+    expect(page.locator("#exact .search-text-match")).not_to_have_count(0)
+    expect(page.locator("#updates .search-text-match")).not_to_have_count(0)
+    expect(page.locator("#mixed .cm-search-match-selected")).to_be_visible()
+    expect(page.locator("#exact .search-text-match-selected")).to_be_visible()
+    expect(page.locator("#updates .search-text-match-selected")).to_be_visible()
+    expect(page.locator('.timeline-input[data-key="call:2"]')).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+
+    for pane, match in (
+        ("mixed", ".cm-search-match-selected"),
+        ("exact", ".search-text-match-selected"),
+        ("updates", ".search-text-match-selected"),
+    ):
+        page.wait_for_function(
+            """([paneId, selector]) => {
+              const container = document.querySelector(`#${paneId}`);
+              const target = container.querySelector(selector);
+              if (!target) return false;
+              const paneRect = container.getBoundingClientRect();
+              const targetRect = target.getBoundingClientRect();
+              return targetRect.bottom >= paneRect.top
+                && targetRect.top <= paneRect.bottom;
+            }""",
+            arg=[pane, match],
+        )
+
+
+def test_first_search_result_click_scrolls_without_needing_a_second_click(
+    page: Page, exact_scroll_url: str
+):
+    page.goto(f"{exact_scroll_url}/")
+    page.wait_for_selector("#mixed .cm-editor")
+    search = page.get_by_placeholder("Search inputs, outputs, state…")
+
+    # Call 2 is already selected when the viewer opens. Move all state panes away
+    # from the match so this exercises repeat selection of the same call, which
+    # is where the first search click intermittently used to lose its focus.
+    page.evaluate(
+        """() => {
+          for (const id of ["mixed", "exact", "updates"]) {
+            const pane = document.querySelector(`#${id}`);
+            const scroller = pane.querySelector(".cm-scroller") || pane;
+            scroller.scrollTop = 0;
+          }
+        }"""
+    )
+    search.fill("BBB changed bottom message different")
+    page.get_by_role("button", name="Search", exact=True).click()
+    result = page.locator(".result", has_text="LLM call #2 · input").first
+    expect(result).to_be_visible()
+    result.click()
+
+    page.wait_for_function("state.searchFocus?.owner_id === 2")
+    for pane, match in (
+        ("mixed", ".cm-search-match-selected"),
+        ("exact", ".search-text-match-selected"),
+        ("updates", ".search-text-match-selected"),
+    ):
+        page.wait_for_function(
+            """([paneId, selector]) => {
+              const container = document.querySelector(`#${paneId}`);
+              const target = container.querySelector(selector);
+              if (!target) return false;
+              const paneRect = container.getBoundingClientRect();
+              const targetRect = target.getBoundingClientRect();
+              return targetRect.bottom >= paneRect.top
+                && targetRect.top <= paneRect.bottom;
+            }""",
+            arg=[pane, match],
+        )
+
+
+def test_focus_after_clearing_search_is_not_overwritten_by_scroll_restore(
+    page: Page, exact_scroll_url: str
+):
+    page.goto(f"{exact_scroll_url}/")
+    page.wait_for_selector("#mixed .cm-editor")
+    search = page.get_by_placeholder("Search inputs, outputs, state…")
+
+    # Put Exact near the beginning through search focus. Clearing the query
+    # schedules a few restoration passes to counter DOM scroll anchoring; the
+    # immediately following call focus must supersede those stale restorations.
+    search.fill("line 000: shared unchanged content")
+    page.get_by_role("button", name="Search", exact=True).click()
+    page.locator(".result", has_text="LLM call #2 · input").first.click()
+    page.wait_for_function("state.searchFocus?.owner_id === 2")
+    page.wait_for_timeout(300)
+
+    page.evaluate(
+        """() => {
+          const search = document.querySelector("#search");
+          search.value = "";
+          search.dispatchEvent(new Event("input", {bubbles: true}));
+          document.querySelector('.timeline-input[data-key="call:2"]').click();
+        }"""
+    )
+    page.wait_for_timeout(350)
+    focused = page.locator("#exact .exact-focus").first
+    expect(focused).to_have_count(1)
+    visibility = page.evaluate(
+        """() => {
+          const pane = document.querySelector("#exact");
+          const target = pane.querySelector(".exact-focus");
+          const paneRect = pane.getBoundingClientRect();
+          const targetRect = target.getBoundingClientRect();
+          const mixedFocus = mixedCodeMirrorModel.marks.find(mark => mark.focused);
+          const viewport = mixedCodeMirrorView.viewport;
+          return {
+            exact: targetRect.bottom >= paneRect.top && targetRect.top <= paneRect.bottom,
+            mixed: Boolean(
+              mixedFocus
+              && mixedFocus.start <= viewport.to
+              && mixedFocus.end >= viewport.from
+            ),
+          };
+        }"""
+    )
+    assert visibility == {"exact": True, "mixed": True}, (
+        "the stale search-clear restore hid the first-click focus",
+        visibility,
+    )
+
+
+def test_clearing_search_does_not_scroll_any_pane(
+    page: Page, exact_scroll_url: str
+):
+    page.goto(f"{exact_scroll_url}/")
+    page.wait_for_selector("#mixed .cm-editor")
+    search = page.get_by_placeholder("Search inputs, outputs, state…")
+    search.fill("buildings")
+    page.get_by_role("button", name="Search").click()
+    page.locator(".result", has_text="LLM call #2 · input").first.click()
+    page.wait_for_function("state.searchFocus?.owner_id === 2")
+    page.wait_for_timeout(300)
+
+    positions = page.evaluate(
+        """() => {
+          const positions = {};
+          for (const id of ["timeline", "mixed", "exact", "updates"]) {
+            const pane = document.querySelector(`#${id}`);
+            const scroller = pane.querySelector(".cm-scroller") || pane;
+            const maximum = scroller.scrollHeight - scroller.clientHeight;
+            if (maximum <= 4) continue;
+            scroller.scrollTop = Math.round(maximum * 0.37);
+            positions[id] = scroller.scrollTop;
+          }
+          return positions;
+        }"""
+    )
+    assert "mixed" in positions, positions
+
+    search.fill("")
+    expect(page.locator(".search-text-match, .cm-search-match")).to_have_count(0)
+    page.wait_for_timeout(150)
+    after = page.evaluate(
+        """positions => Object.fromEntries(
+          Object.keys(positions).map(id => {
+            const pane = document.querySelector(`#${id}`);
+            const scroller = pane.querySelector(".cm-scroller") || pane;
+            return [id, scroller.scrollTop];
+          })
+        )""",
+        positions,
+    )
+    assert all(abs(after[pane] - top) <= 1 for pane, top in positions.items()), {
+        "before": positions,
+        "after": after,
+    }
+
+
+def test_many_search_results_keep_visible_space_above_timeline(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    page.wait_for_selector(".timeline-item")
+    layout = page.evaluate(
+        """() => {
+          const timeline = document.querySelector("#timeline");
+          const sourceItem = timeline.querySelector(".timeline-item");
+          while (timeline.children.length < 200) {
+            timeline.appendChild(sourceItem.cloneNode(true));
+          }
+          const results = document.querySelector("#search-results");
+          results.innerHTML = `
+            <div class="search-results-head">
+              <strong>46 matches</strong><button>×</button>
+            </div>
+          ` + Array.from({length: 46}, (_, index) => `
+            <div class="result">
+              <small>LLM call #${index + 1} · output</small>
+              visible result ${index + 1}
+            </div>
+          `).join("");
+          results.classList.remove("hidden");
+          const pane = document.querySelector(".timeline-pane");
+          const head = results.querySelector(".search-results-head");
+          const first = results.querySelector(".result");
+          const bounds = node => node.getBoundingClientRect();
+          return {
+            paneHeight: bounds(pane).height,
+            resultsHeight: bounds(results).height,
+            visibleContentHeight: bounds(first).bottom - bounds(head).top,
+            firstInsideResults: bounds(first).bottom <= bounds(results).bottom,
+            timelineHeight: bounds(timeline).height,
+            resultsScrollable: results.scrollHeight > results.clientHeight,
+          };
+        }"""
+    )
+    assert layout["firstInsideResults"] is True, layout
+    assert layout["resultsHeight"] >= layout["visibleContentHeight"], layout
+    assert layout["resultsHeight"] <= layout["paneHeight"] * 0.46, layout
+    assert layout["timelineHeight"] > 100, layout
+    assert layout["resultsScrollable"] is True, layout
 
 
 @pytest.fixture
@@ -1713,14 +3404,15 @@ def test_repeated_prompt_lines_are_placed_by_recorded_position(
         entries.nth(index).click()
         page.wait_for_timeout(200)
         focused = page.evaluate(
-            """() => [...document.querySelectorAll('#mixed .fragment-focus')]
-                 .map(node => node.dataset.updateEntry)"""
+            """() => mixedCodeMirrorModel.marks
+                 .filter(mark => mark.focused)
+                 .map(mark => mark.attributes["data-update-entry"])"""
         )
-        # A recorded replacement legitimately lights both of its halves, but
-        # never a second entry's text, and never nothing at all.
+        # The clicked entry remains represented even while CodeMirror also
+        # decorates the selected phase.
         keys = set(focused)
-        assert len(keys) == 1, focused
-        key = keys.pop()
+        key = f"{call_id}:{entries.nth(index).get_attribute('data-update-index')}"
+        assert key in keys, focused
         assert key not in seen
         seen.add(key)
 
@@ -1791,9 +3483,15 @@ def positional_viewer_url(tmp_path):
 
 def marked_entries(page, pane):
     return page.evaluate(
-        """(id) => [...document.querySelectorAll('#' + id + ' [data-update-entry]')].map(
-             node => node.dataset.updateEntry
-               + (node.dataset.outputFragment ? '/f' + node.dataset.outputFragment : ''))""",
+        """(id) => id === "mixed"
+          ? mixedCodeMirrorModel.marks
+              .filter(mark => mark.attributes["data-update-entry"])
+              .map(mark => mark.attributes["data-update-entry"]
+                + (mark.attributes["data-output-fragment"]
+                  ? "/f" + mark.attributes["data-output-fragment"] : ""))
+          : [...document.querySelectorAll('#' + id + ' [data-update-entry]')].map(
+              node => node.dataset.updateEntry
+                + (node.dataset.outputFragment ? '/f' + node.dataset.outputFragment : ''))""",
         pane,
     )
 
@@ -1946,8 +3644,9 @@ def test_mixed_never_loses_a_change_to_an_overlapping_span(
           const entry = entries.find(item => item.fragments);
           return entry.fragments
             .map((fragment, index) => index)
-            .filter(index => !document.querySelector(
-              `#mixed [data-update-entry="${{entry.entryKey}}"][data-output-fragment="${{index}}"]`,
+            .filter(index => !mixedCodeMirrorModel.marks.some(mark =>
+              mark.attributes["data-update-entry"] === entry.entryKey
+              && Number(mark.attributes["data-output-fragment"]) === index
             ));
         }}"""
     )
@@ -1958,10 +3657,172 @@ def test_mixed_never_loses_a_change_to_an_overlapping_span(
         fragments.nth(index).click()
         page.wait_for_timeout(150)
         focused = page.evaluate(
-            """() => [...document.querySelectorAll('#mixed .fragment-focus')]
-                 .map(node => node.dataset.outputFragment)"""
+            """() => mixedCodeMirrorModel.marks
+                 .filter(mark => mark.focused)
+                 .map(mark => mark.attributes["data-output-fragment"])"""
         )
         assert focused, f"fragment {index} focused nothing in Mixed"
+
+
+def test_mixed_replacement_places_new_text_after_all_removed_text(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    page.wait_for_selector("#mixed .cm-editor")
+    result = page.evaluate(
+        """() => {
+          const common = [
+            {role: "system", content: "stable system context"},
+            {role: "user", content: "stable user context"},
+          ];
+          const oldMessages = [
+            {role: "assistant", content: "OLD FIRST"},
+            {role: "tool", content: "OLD SECOND"},
+          ];
+          const newMessages = [
+            {role: "assistant", content: "NEW REPLACEMENT"},
+          ];
+          const detail = {
+            ...state.detail,
+            id: 99001,
+            request: {model: "local", messages: [...common, ...newMessages]},
+            response: "unchanged output",
+            thoughts: "",
+            diff: {
+              mode: "diff",
+              parameters: {},
+              messages: [
+                {op: "=", old: [0, 2], new: [0, 2]},
+                {
+                  op: "~", old: [2, 4], new: [2, 3],
+                  old_messages: oldMessages,
+                  new_messages: newMessages,
+                  messages: newMessages,
+                },
+              ],
+            },
+            output_diff: {mode: "unchanged", changes: []},
+            thoughts_diff: {mode: "unchanged", changes: []},
+          };
+          state.detail = detail;
+          state.selected = {type: "call", id: detail.id};
+          state.mixedSegmentDetails = [detail];
+          renderMixed();
+          renderExact();
+          const marks = mixedCodeMirrorModel.marks
+            .filter(mark => mark.classes.includes("input-update") && (
+              mark.classes.includes("removed-part")
+              || mark.classes.includes("added-part")
+            ))
+            .sort((left, right) => left.start - right.start || left.end - right.end)
+            .map(mark => ({
+              kind: mark.classes.includes("removed-part") ? "red" : "green",
+              text: mixedCodeMirrorModel.text.slice(mark.start, mark.end),
+            }));
+          return {
+            marks,
+            exactRemoved: document.querySelectorAll("#exact .removed-part").length,
+          };
+        }"""
+    )
+    assert [mark["kind"] for mark in result["marks"]] == ["red", "red", "green"]
+    assert "OLD FIRST" in result["marks"][0]["text"]
+    assert "OLD SECOND" in result["marks"][1]["text"]
+    assert "NEW REPLACEMENT" in result["marks"][2]["text"]
+    assert result["exactRemoved"] == 0
+
+
+def test_mixed_overlapping_history_is_removed_before_current_addition(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    page.wait_for_selector("#mixed .cm-editor")
+    parts = page.evaluate(
+        """() => {
+          const current = {
+            entryKey: "current:0",
+            operation: "+",
+            newText: "NEW REPLACEMENT",
+            needle: "NEW REPLACEMENT",
+            needles: ["NEW REPLACEMENT"],
+            scope: "output",
+            category: "output",
+          };
+          const replacedHistory = {
+            entryKey: "earlier:0",
+            operation: "+",
+            newText: "NEW REPLACEMENT",
+            needle: "NEW REPLACEMENT",
+            needles: ["NEW REPLACEMENT"],
+            scope: "output",
+            category: "output",
+            fromEarlierCall: true,
+          };
+          const template = document.createElement("template");
+          template.innerHTML = mixedStateHtml(
+            "NEW REPLACEMENT",
+            [current, replacedHistory],
+          );
+          return [...template.content.querySelectorAll("del, ins")].map(node => ({
+            kind: node.tagName === "DEL" ? "red" : "green",
+            text: node.textContent,
+          }));
+        }"""
+    )
+    assert [part["kind"] for part in parts] == ["red", "green"]
+    assert [part["text"] for part in parts] == [
+        "NEW REPLACEMENT",
+        "NEW REPLACEMENT",
+    ]
+
+
+def test_first_mixed_click_works_with_an_existing_text_selection(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    page.wait_for_selector("#mixed .cm-editor")
+    page.locator('.timeline-input[data-key="call:3"]').click()
+    mark = page.locator("#mixed .cm-mixed-added[data-update-entry]").first
+    expect(mark).to_be_visible()
+    clicked = mark.evaluate(
+        """node => {
+          const scroller = document.querySelector("#mixed .cm-scroller");
+          scroller.scrollTop = Math.min(40, scroller.scrollHeight - scroller.clientHeight);
+          const before = scroller.scrollTop;
+          const text = node.firstChild;
+          const range = document.createRange();
+          range.setStart(text, 0);
+          range.setEnd(text, Math.min(3, text.length));
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          const rect = node.getBoundingClientRect();
+          const init = {
+            bubbles: true,
+            button: 0,
+            clientX: rect.left + 2,
+            clientY: rect.top + 2,
+          };
+          node.dispatchEvent(new MouseEvent("mousedown", init));
+          node.dispatchEvent(new MouseEvent("mouseup", init));
+          node.dispatchEvent(new MouseEvent("click", init));
+          return {entryKey: node.dataset.updateEntry, before};
+        }"""
+    )
+    expect(
+        page.locator(
+            f'#exact [data-update-entry="{clicked["entryKey"]}"].exact-focus'
+        )
+    ).not_to_have_count(0)
+    expect(
+        page.locator(
+            f'#updates .update-jump.active[data-update-index="{clicked["entryKey"].split(":")[-1]}"]'
+        )
+    ).not_to_have_count(0)
+    page.wait_for_timeout(350)
+    assert page.locator("#mixed .cm-scroller").evaluate("node => node.scrollTop") == pytest.approx(
+        clicked["before"], abs=1
+    )
 
 
 @pytest.fixture
@@ -2000,6 +3861,7 @@ def test_clicking_one_half_of_a_transition_focuses_only_that_half(
 ):
     url, call_id = transition_viewer_url
     page.goto(f"{url}/")
+    page.wait_for_selector("#mixed .cm-editor")
     page.locator(f'.timeline-output[data-call-key="call:{call_id}"]').click()
     card = page.locator(f'.update-card[data-key="call:{call_id}"][data-phase="output"]')
     pair = card.locator(".fragment-change").filter(has=page.locator("del")).first
@@ -2008,38 +3870,146 @@ def test_clicking_one_half_of_a_transition_focuses_only_that_half(
 
     def focused_tags():
         return page.evaluate(
-            """() => [...document.querySelectorAll('#mixed .fragment-focus')]
-                 .map(node => node.tagName)"""
+            """() => mixedCodeMirrorModel.marks
+                 .filter(mark => mark.focused && (
+                   mark.classes.includes("removed-part")
+                   || mark.classes.includes("added-part")
+                 ))
+                 .map(mark => mark.classes.includes("removed-part") ? "DEL" : "INS")"""
         )
 
     # Clicking the removed half asks about removed text, and Exact State holds
     # no removed text, so nothing is flashed there either.
     pair.locator("del").first.click()
     page.wait_for_timeout(250)
-    assert set(focused_tags()) == {"DEL"}, focused_tags()
+    assert "DEL" in set(focused_tags()), focused_tags()
+    assert page.locator(
+        "#mixed .cm-mixed-removed.fragment-focus"
+    ).first.evaluate("node => getComputedStyle(node).animationName") == (
+        "mixed-removed-focus-pulse"
+    )
+    assert page.locator(
+        "#mixed .cm-mixed-removed.fragment-focus"
+    ).first.evaluate("node => getComputedStyle(node).outlineOffset") == "-1px"
     assert page.locator("#exact .exact-focus").count() == 0
+
+    # Clicking a decoration which is already visible in Mixed must not navigate
+    # CodeMirror to the beginning of a large, multiline mark. Other panes still
+    # use this navigation path to reveal their corresponding Mixed fragment.
+    navigation = page.evaluate(
+        """async () => {
+          const view = mixedCodeMirrorView;
+          const originalDispatch = view.dispatch.bind(view);
+          const originalFocusScrollIntoView = focusScrollIntoView;
+          let codeMirrorScrolls = 0;
+          let genericMixedScrolls = 0;
+          view.dispatch = (...transactions) => {
+            if (transactions.some(transaction => transaction?.scrollIntoView)) {
+              codeMirrorScrolls += 1;
+            }
+            return originalDispatch(...transactions);
+          };
+          focusScrollIntoView = (target, ...args) => {
+            if (target && document.querySelector("#mixed").contains(target)) {
+              genericMixedScrolls += 1;
+            }
+            return originalFocusScrollIntoView(target, ...args);
+          };
+          const before = view.scrollDOM.scrollTop;
+          document.querySelector(
+            "#mixed .cm-mixed-removed[data-update-entry]"
+          ).click();
+          await new Promise(resolve => setTimeout(resolve, 120));
+          view.dispatch = originalDispatch;
+          focusScrollIntoView = originalFocusScrollIntoView;
+          return {
+            codeMirrorScrolls,
+            genericMixedScrolls,
+            before,
+            after: view.scrollDOM.scrollTop,
+          };
+        }"""
+    )
+    assert navigation["codeMirrorScrolls"] == 0, navigation
+    assert navigation["genericMixedScrolls"] == 0, navigation
+    assert navigation["after"] == navigation["before"], navigation
 
     # Focus is the last style layer: it has to be visible on top of the kind and
     # operation decoration, which carry their own outline.
-    decoration = page.evaluate(
-        """() => {
-          const node = document.querySelector('#mixed .fragment-focus');
-          const style = getComputedStyle(node);
-          return [style.outlineWidth, style.outlineColor, style.animationName];
-        }"""
-    )
-    assert decoration[0] == "2px", decoration
-    assert decoration[1] == "rgb(255, 240, 166)", decoration
-    assert decoration[2] == "removed-flash", decoration
+    page.wait_for_selector("#mixed .cm-editor")
 
     pair.locator("ins").first.click()
     page.wait_for_timeout(250)
-    assert set(focused_tags()) == {"INS"}, focused_tags()
+    assert "INS" in set(focused_tags()), focused_tags()
 
     # Clicking the entry itself, away from either half, still focuses both.
     pair.locator(".fragment-location").click()
     page.wait_for_timeout(250)
     assert set(focused_tags()) == {"DEL", "INS"}, focused_tags()
+
+    # Exact contains the current value only. Clicking its changed mark must
+    # therefore navigate to Mixed's added/current half, not the removed half
+    # which commonly appears first in document order.
+    entry_index = pair.locator(
+        "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), "
+        "' update-jump ')]"
+    ).get_attribute("data-update-index")
+    exact_target = page.locator(
+        f'#exact [data-update-entry="{call_id}:{entry_index}"]'
+    ).first
+    expect(exact_target).to_be_visible()
+    exact_self_navigation = page.evaluate(
+        """async (selector) => {
+          const pane = document.querySelector("#exact");
+          const target = document.querySelector(selector);
+          const before = pane.scrollTop;
+          const originalFocusScrollIntoView = focusScrollIntoView;
+          let genericExactScrolls = 0;
+          focusScrollIntoView = (element, ...args) => {
+            if (element && pane.contains(element)) genericExactScrolls += 1;
+            return originalFocusScrollIntoView(element, ...args);
+          };
+          target.click();
+          await new Promise(resolve => setTimeout(resolve, 400));
+          focusScrollIntoView = originalFocusScrollIntoView;
+          return {
+            before,
+            after: pane.scrollTop,
+            genericExactScrolls,
+          };
+        }""",
+        arg=f'#exact [data-update-entry="{call_id}:{entry_index}"]',
+    )
+    assert exact_self_navigation["genericExactScrolls"] == 0, exact_self_navigation
+    assert exact_self_navigation["after"] == exact_self_navigation["before"], (
+        exact_self_navigation
+    )
+    assert set(focused_tags()) == {"INS"}, focused_tags()
+    exact_navigation = page.evaluate(
+        """() => {
+          const focused = mixedCodeMirrorModel.marks.find(
+            mark => mark.focused && mark.classes.includes("cm-mixed-added")
+          );
+          const viewport = mixedCodeMirrorView.viewport;
+          const selection = mixedCodeMirrorView.state.selection.main;
+          return {
+            collapsedAtFocusedStart: Boolean(
+              focused
+              && selection.from === focused.start
+              && selection.to === focused.start
+            ),
+            focusedInViewport: Boolean(
+              focused
+              && focused.start >= viewport.from
+              && focused.start <= viewport.to
+            ),
+          };
+        }"""
+    )
+    assert exact_navigation == {
+        "collapsedAtFocusedStart": True,
+        "focusedInViewport": True,
+    }
 
     # Kind outlines on stacked inline marks must sit inside their own box, or a
     # dense stack of marks bleeds its outlines into the neighbouring lines.
@@ -2080,8 +4050,9 @@ def test_second_click_joins_the_first_selection_instead_of_cancelling_it(
     )
     last_index = entries.nth(entries.count() - 1).get_attribute("data-update-index")
     page.wait_for_function(
-        """(key) => [...document.querySelectorAll('#mixed .fragment-focus')]
-             .some(node => node.dataset.updateEntry === key)""",
+        """(key) => mixedCodeMirrorModel.marks.some(
+             mark => mark.focused && mark.attributes["data-update-entry"] === key
+           )""",
         arg=f"{call_id}:{last_index}",
         timeout=5000,
     )
@@ -2092,13 +4063,14 @@ def test_switching_phase_on_one_call_clears_the_other_phase_focus(
 ):
     url, call_id = transition_viewer_url
     page.goto(f"{url}/")
+    page.wait_for_selector("#mixed .cm-editor")
 
     # This call changed both its input and its output.
     page.locator(f'.timeline-input[data-key="call:{call_id}"]').click()
     page.wait_for_timeout(300)
     assert page.evaluate(
-        """() => document.querySelectorAll(
-             '#mixed [data-state-scope="input"] .fragment-focus'
+        """() => mixedCodeMirrorModel.marks.filter(
+             mark => mark.focused && mark.scope === "input"
            ).length"""
     ) > 0
 
@@ -2109,18 +4081,34 @@ def test_switching_phase_on_one_call_clears_the_other_phase_focus(
     page.wait_for_timeout(400)
     state = page.evaluate(
         """() => {
-          const inputFocus = document.querySelectorAll(
-            '#mixed [data-state-scope="input"] .fragment-focus'
+          const inputFocus = mixedCodeMirrorModel.marks.filter(
+            mark => mark.focused && mark.scope === "input"
           ).length;
-          const outputFocus = document.querySelectorAll(
-            '#mixed [data-state-scope="output"] .fragment-focus'
+          const outputFocus = mixedCodeMirrorModel.marks.filter(
+            mark => mark.focused && mark.scope === "output"
           );
-          const pane = document.querySelector('#mixed').getBoundingClientRect();
-          const rect = outputFocus[0] && outputFocus[0].getBoundingClientRect();
+          const outputEntries = updateEntries(state.detail).filter(
+            entry => entry.scope === "output" || entry.scope === "thoughts"
+          );
+          const primaryEntry = outputEntries.find(
+            entry => entry.scope === "output"
+          ) || outputEntries[0];
+          const primaryMark = mixedCodeMirrorModel.marks.find(
+            mark => mark.attributes["data-update-entry"] === primaryEntry?.entryKey
+          );
+          const viewport = mixedCodeMirrorView.viewport;
           return {
             inputFocus,
             outputFocus: outputFocus.length,
-            outputInView: rect ? (rect.top < pane.bottom && rect.bottom > pane.top) : false,
+            outputInView: outputFocus.some(
+              mark => mark.start <= viewport.to && mark.end >= viewport.from
+            ),
+            primaryEntryKey: primaryEntry?.entryKey,
+            primaryInView: Boolean(
+              primaryMark
+              && primaryMark.start <= viewport.to
+              && primaryMark.end >= viewport.from
+            ),
             exactStale: document.querySelectorAll(
               '#exact [data-state-scope="input"] .exact-focus'
             ).length,
@@ -2130,7 +4118,32 @@ def test_switching_phase_on_one_call_clears_the_other_phase_focus(
     assert state["inputFocus"] == 0, state
     assert state["outputFocus"] > 0, state
     assert state["outputInView"] is True, state
+    assert state["primaryInView"] is True, state
     assert state["exactStale"] == 0, state
+
+    # Re-selecting the same phase must navigate to the same primary entry. A
+    # virtualized Mixed document may not have that DOM mark mounted before the
+    # CodeMirror scroll completes, so no DOM fallback may override it.
+    page.locator(f'.timeline-output[data-call-key="call:{call_id}"]').click()
+    page.wait_for_timeout(400)
+    repeated = page.evaluate(
+        """(primaryEntryKey) => {
+          const primaryMark = mixedCodeMirrorModel.marks.find(
+            mark => mark.attributes["data-update-entry"] === primaryEntryKey
+          );
+          const viewport = mixedCodeMirrorView.viewport;
+          return {
+            primaryInView: Boolean(
+              primaryMark
+              && primaryMark.start <= viewport.to
+              && primaryMark.end >= viewport.from
+            ),
+            focused: Boolean(primaryMark?.focused),
+          };
+        }""",
+        arg=state["primaryEntryKey"],
+    )
+    assert repeated == {"primaryInView": True, "focused": True}
 
 
 @pytest.fixture
@@ -2170,45 +4183,155 @@ def add_then_remove_viewer_url(tmp_path):
     store.close()
 
 
-def test_removed_text_in_mixed_references_the_call_that_removed_it(
+def test_removed_text_strike_links_removal_and_underline_links_addition(
     page: Page, add_then_remove_viewer_url
 ):
+    # A removed part with a known origin carries both references on one struck
+    # element: the red strike-through focuses where it was removed, and the green
+    # underline at the baseline focuses where it was added. A click in the lower
+    # band (on the underline) follows the addition; the rest focuses the removal.
     url, adder, remover, marker = add_then_remove_viewer_url
     page.goto(f"{url}/")
     page.locator(f'.timeline-input[data-key="call:{remover}"]').click()
     page.wait_for_timeout(500)
 
-    # The removed marker is shown as removed history, in full, and every removed
-    # copy references the remover — never the call that added it.
+    # The removed marker is shown in full, owns its removal entry, and links back
+    # to its addition origin (rendered as the green underline).
     refs = page.evaluate(
-        """(marker) => [...document.querySelectorAll('#mixed del.removed-part')]
-             .filter(node => node.textContent.includes(marker))
-             .map(node => ({entry: node.dataset.updateEntry, len: node.textContent.length}))""",
+        """(marker) => mixedCodeMirrorModel.marks
+             .filter(mark => mark.classes.includes("removed-part")
+               && mixedCodeMirrorModel.text.slice(mark.start, mark.end).includes(marker))
+             .map(mark => ({
+               entry: mark.attributes["data-update-entry"],
+               addedEntry: mark.attributes["data-added-entry"] || null,
+               underline: mark.classes.includes("cm-mixed-added-origin"),
+               len: mark.end - mark.start,
+             }))""",
         marker,
     )
     assert refs, "removed marker should appear in Mixed"
     assert all(ref["entry"].startswith(f"{remover}:") for ref in refs), refs
-    assert all(f"{adder}:" not in ref["entry"] for ref in refs), refs
+    assert all(ref["addedEntry"].startswith(f"{adder}:") for ref in refs), refs
+    assert all(ref["underline"] for ref in refs), refs
     assert all(ref["len"] >= len(marker) for ref in refs), refs  # full text, not truncated
 
-    # Clicking it lands on the removing call's entry, on its REMOVED side — so
-    # the reference matches: removed text points to removed text.
-    page.locator("#mixed del.removed-part", has_text=marker).first.click()
+    def del_box():
+        return page.locator("#mixed del.removed-part", has_text=marker).first.evaluate(
+            """node => {
+              const r = [...node.getClientRects()].sort((a, b) => b.width - a.width)[0];
+              return {x: r.left + r.width / 2, top: r.top, height: r.height};
+            }"""
+        )
+
+    # Clicking the upper part of the struck text navigates to where it was removed.
+    box = del_box()
+    page.mouse.click(box["x"], box["top"] + box["height"] * 0.3)
     page.wait_for_timeout(500)
-    landed = page.evaluate(
+    assert page.evaluate("() => state.timelineFocus?.key") == f"call:{remover}"
+
+    # Re-select the remover, then clicking the lower band (the underline)
+    # navigates to where it was added.
+    page.locator(f'.timeline-input[data-key="call:{remover}"]').click()
+    page.wait_for_timeout(500)
+    box = del_box()
+    page.mouse.click(box["x"], box["top"] + box["height"] * 0.85)
+    page.wait_for_timeout(500)
+    assert page.evaluate("() => state.timelineFocus?.key") == f"call:{adder}"
+
+
+@pytest.fixture
+def present_then_removed_viewer_url(tmp_path):
+    """A checkpoint call already contains a distinctive message; a later call
+    removes it. The text has no explicit add event in the loaded history, so its
+    origin is the earliest loaded call that still shows it."""
+    store = TraceStore(tmp_path / "present-removed.llmtrace")
+    marker = "DISTINCTIVE PRESENT SINCE START PARAGRAPH ABOUT BUILDINGS"
+    body = "\n".join(f"ctx line {i:03d}" for i in range(8))
+    origin = store.start_call(
+        {
+            "model": "local",
+            "messages": [
+                {"role": "system", "content": body},
+                {"role": "user", "content": "keep this"},
+                {"role": "assistant", "content": marker},
+            ],
+        },
+        session_id="pr",
+        branch_id="main",
+    )
+    store.finish_call(origin, "out one")
+    state = store.get_call(origin)["request_state_id"]
+    remover = store.start_call(
+        {
+            "model": "local",
+            "messages": [
+                {"role": "system", "content": body},
+                {"role": "user", "content": "keep this"},
+            ],
+        },
+        session_id="pr",
+        branch_id="main",
+        explicit_parent_state=state,
+    )
+    store.finish_call(remover, "out two")
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", origin, remover, marker
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_present_then_removed_underline_links_to_earliest_call(
+    page: Page, present_then_removed_viewer_url
+):
+    # Text that was already present when the loaded history begins has no explicit
+    # "added" change, so its underline origin is the earliest loaded call that
+    # still shows it; clicking that underline selects that call.
+    url, origin, remover, marker = present_then_removed_viewer_url
+    page.goto(f"{url}/")
+    page.locator(f'.timeline-input[data-key="call:{remover}"]').click()
+    page.wait_for_timeout(500)
+
+    ref = page.evaluate(
         """(marker) => {
-          const active = document.querySelector('.update-jump.active, .update-back-focus');
-          if (!active) return {none: true};
-          const del = active.querySelector('del.removed-part, .removed-part');
+          const mark = mixedCodeMirrorModel.marks.find(candidate => (
+            candidate.classes.includes("removed-part")
+            && mixedCodeMirrorModel.text.slice(candidate.start, candidate.end).includes(marker)
+          ));
+          if (!mark) return null;
           return {
-            card: active.closest('.update-card')?.dataset.key,
-            removedHasMarker: !!del && del.textContent.includes(marker),
+            entry: mark.attributes["data-update-entry"],
+            addedEntry: mark.attributes["data-added-entry"] || null,
+            addedCall: mark.attributes["data-added-call"] || null,
+            underline: mark.classes.includes("cm-mixed-added-origin"),
           };
         }""",
         marker,
     )
-    assert landed.get("card") == f"call:{remover}", landed
-    assert landed.get("removedHasMarker") is True, landed
+    assert ref, "removed marker should appear in Mixed"
+    assert ref["entry"].startswith(f"{remover}:"), ref
+    assert ref["addedEntry"] is None, ref  # no explicit add event exists
+    assert ref["addedCall"] == str(origin), ref
+    assert ref["underline"], ref
+
+    # Clicking the lower band (the underline) points the timeline to the earliest
+    # call that shows it, while leaving the selected call (and the Mixed pane the
+    # user clicked in) unchanged — only the other panes move to where it was added.
+    box = page.locator("#mixed del.removed-part", has_text=marker).first.evaluate(
+        """node => {
+          const r = [...node.getClientRects()].sort((a, b) => b.width - a.width)[0];
+          return {x: r.left + r.width / 2, y: r.top + r.height * 0.85};
+        }"""
+    )
+    page.mouse.click(box["x"], box["y"])
+    page.wait_for_timeout(500)
+    assert page.evaluate("() => state.timelineFocus && state.timelineFocus.key") == f"call:{origin}"
+    # Selection stays on the remover: the Mixed pane is not rebuilt/navigated away.
+    assert page.evaluate("() => state.selected && state.selected.id") == remover
 
 
 @pytest.fixture
@@ -2346,10 +4469,13 @@ def test_debug_label_rides_existing_lines_in_timeline_and_updates(
     page.goto(f"{url}/")
     expect(page.locator(".timeline-item")).not_to_have_count(0)
 
-    # The label appears on the timeline item, and a call without one shows none.
+    # Without an explicit title, the debug label is the primary title fallback;
+    # a call without either falls back to its purpose.
     labelled_item = page.locator(f'.timeline-input[data-key="call:{labelled}"]')
     plain_item = page.locator(f'.timeline-input[data-key="call:{plain}"]')
-    expect(labelled_item.locator(".item-debug")).to_have_text("08-review")
+    expect(labelled_item.locator(".item-title")).to_have_text("08-review")
+    expect(labelled_item.locator(".item-debug")).to_have_count(0)
+    expect(plain_item.locator(".item-title")).to_have_text("chat")
     expect(plain_item.locator(".item-debug")).to_have_count(0)
 
     # It rides the action line — the item is no taller than the one without a
@@ -2379,6 +4505,76 @@ def test_debug_label_rides_existing_lines_in_timeline_and_updates(
     assert abs(
         labelled_head.bounding_box()["height"] - plain_head.bounding_box()["height"]
     ) < 1
+
+
+@pytest.fixture
+def titled_call_viewer_url(tmp_path):
+    store = TraceStore(tmp_path / "title.llmtrace")
+    call_id = store.start_call(
+        {"model": "local", "prompt": "find documents"},
+        session_id="titles",
+        req_id="01JTITLE",
+        metadata={
+            "title": "EXECUTE/find_documents",
+            "debug_label": "harness step 7",
+        },
+    )
+    store.finish_call(
+        call_id,
+        "done",
+        metadata={
+            "duration_ms": 5,
+            "usage": {
+                "input_tokens": 1200,
+                "output_tokens": 34,
+                "total_tokens": 1234,
+            },
+        },
+    )
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", call_id
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_title_is_primary_timeline_label_and_updates_without_height_change(
+    page: Page, titled_call_viewer_url
+):
+    url, call_id = titled_call_viewer_url
+    page.goto(f"{url}/")
+    item = page.locator(f'.timeline-input[data-key="call:{call_id}"]')
+    expect(item.locator(".item-title")).to_have_text("EXECUTE/find_documents")
+    expect(item.locator(".item-meta")).to_contain_text(f"#{call_id}")
+    expect(item.locator(".item-meta")).not_to_contain_text("01JTITLE")
+    expect(item.locator(".item-label")).to_have_text("→ new state input")
+    expect(item.locator(".item-checkpoint-marker")).to_have_count(0)
+    expect(item.locator(".item-debug")).to_have_count(0)
+    expect(item.locator(".item-meta")).to_contain_text("1,200 in")
+    output_item = page.locator(f'.timeline-output[data-call-key="call:{call_id}"]')
+    expect(output_item.locator(".item-meta")).to_contain_text("34 out · 1,234 total")
+    before = item.bounding_box()["height"]
+
+    response = requests.post(
+        f"{url}/_llmtrace/update-title",
+        json={
+            "req_id": "01JTITLE",
+            "title": "EXECUTE/find_documents:TOOL_CALLS/get_toc_headings",
+        },
+        timeout=5,
+    )
+    assert response.status_code == 204
+    expect(item.locator(".item-title")).to_have_text(
+        "EXECUTE/find_documents:TOOL_CALLS/get_toc_headings",
+        timeout=4000,
+    )
+    expect(item.locator(".item-label")).to_have_text("→ new state input")
+    expect(item.locator(".item-debug")).to_have_count(0)
+    after = item.bounding_box()["height"]
+    assert abs(after - before) < 1, (before, after)
 
 
 @pytest.fixture
@@ -2418,6 +4614,16 @@ def test_req_id_lineage_is_shown_in_header_and_metadata(page: Page, req_id_viewe
     page.locator(f'.timeline-input[data-key="call:{b}"]').click()
     page.wait_for_timeout(400)
 
+    # Timeline uses the caller's public request identity, not the storage id.
+    expect(page.locator(f'.timeline-input[data-key="call:{b}"]')).to_contain_text(
+        "#B"
+    )
+    page.locator("#view-branches").click()
+    expect(page.locator(f'#branch-graph .branch-node[data-key="call:{b}"]')).to_contain_text(
+        "#B"
+    )
+    page.locator("#view-list").click()
+
     # The lineage header names the request and its declared predecessor rather
     # than an inferred parent source.
     expect(page.locator("#lineage")).to_contain_text("B ·")
@@ -2428,36 +4634,82 @@ def test_req_id_lineage_is_shown_in_header_and_metadata(page: Page, req_id_viewe
     expect(page.locator("#exact")).to_contain_text('prev_req_id: "A"')
 
 
-def test_branch_view_is_disabled_even_with_saved_preference(
-    page: Page, req_id_viewer_url
+@pytest.fixture
+def window_group_viewer_url(tmp_path):
+    """Overview root, two windows (grouping nodes), lines under each, and votes."""
+    store = TraceStore(tmp_path / "window.llmtrace")
+    root = "overview"
+
+    def call(step, req, prev, content, group=None):
+        metadata = {"debug_label": step}
+        if group:
+            metadata["group"] = group
+        made = store.start_call(
+            {"model": "local", "messages": [{"role": "user", "content": content}]},
+            session_id="nb",
+            branch_id="main",
+            req_id=req,
+            prev_req_id=prev,
+            metadata=metadata,
+        )
+        store.finish_call(made, "ok", metadata={"duration_ms": 5})
+        return made
+
+    overview = call("document overview", root, None, "overview")
+    line = call("w1 · L0", "w1-0-1", root, "w1 l0", group="window 1")
+    call("w1 · L5", "w1-5-1", root, "w1 l5", group="window 1")
+    call("w2 · L0", "w2-0-1", root, "w2 l0", group="window 2")
+    vote = call("table vote", "table-1-0", root, "tv")
+
+    server = TraceServer(("127.0.0.1", 0), store, "http://127.0.0.1:1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", overview, line, vote
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+    store.close()
+
+
+def test_branch_view_groups_lines_under_a_synthetic_window_node(
+    page: Page, window_group_viewer_url
 ):
-    url, _a, _b, _c = req_id_viewer_url
-    page.add_init_script(
-        "() => localStorage.setItem('insequent.timelineView', 'branches')"
-    )
+    url, overview, line, vote = window_group_viewer_url
     page.goto(f"{url}/")
     page.wait_for_selector(".timeline-item", timeout=20000)
+    page.locator("#view-branches").click()
+    page.wait_for_timeout(400)
 
-    assert page.evaluate("() => FRONTEND_CONFIG.branchGraph.enabled") is False
-    assert page.evaluate("() => state.timelineView") == "list"
-    expect(page.locator("#view-branches")).to_have_count(0)
-    expect(page.locator("#orientation-switch")).to_have_count(0)
-    expect(page.locator("#timeline")).not_to_have_class(re.compile(r"\bhidden\b"))
-    expect(page.locator("#branch-graph")).to_have_class(re.compile(r"\bhidden\b"))
-    expect(page.locator(".branch-node")).to_have_count(0)
-
-    # Even a direct stale call cannot activate or render the graph.
-    result = page.evaluate(
+    tree = page.evaluate(
         """() => {
-          setTimelineView("branches");
-          renderBranchGraph(state.timelineItems);
+          const g = buildBranchGraph(state.timelineItems);
+          const p = {};
+          for (const n of g.nodes) p[String(n.id)] = n;
           return {
-            view: state.timelineView,
-            nodes: document.querySelectorAll(".branch-node").length,
+            synthetic: g.nodes.filter(n => n.synthetic).map(n => n.group),
+            lineParent: p[%d] ? p[%d].parentId : null,
+            voteParent: p[%d] ? p[%d].parentId : null,
+            overviewIsRoot: p[%d] && p[%d].parentId == null,
           };
-        }"""
+        }""" % (line, line, vote, vote, overview, overview)
     )
-    assert result == {"view": "list", "nodes": 0}
+    # Each window is a synthetic grouping node.
+    assert tree["synthetic"] == ["window 1", "window 2"], tree
+    # A line hangs off its window node, not directly off the overview.
+    assert tree["lineParent"] == "group:window 1", tree
+    # A vote (no group) hangs off the overview root directly.
+    assert tree["voteParent"] == overview, tree
+    assert tree["overviewIsRoot"] is True, tree
+
+    # The window node is rendered, but it is not a request: no call id, inert.
+    windows = page.locator(".branch-node.synthetic")
+    expect(windows).to_have_count(2)
+    assert page.evaluate(
+        "() => [...document.querySelectorAll('.branch-node.synthetic')]"
+        ".every(n => n.dataset.callId == null)"
+    )
+    # Its lines and votes are real, selectable calls.
+    expect(page.locator(f'.branch-node[data-call-id="{line}"]')).to_have_count(1)
 
 
 def test_timeline_pane_is_resizable_and_persists_width(page: Page, req_id_viewer_url):
@@ -2526,6 +4778,146 @@ def test_other_pane_focus_targets_owning_timeline_item(
     )
 
 
+def test_unchanged_state_content_links_to_its_checkpoint_origin(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    page.wait_for_selector("#mixed .cm-editor")
+    page.locator('.timeline-input[data-key="call:3"]').click()
+    origin = page.locator(
+        '#exact [data-checkpoint-call="2"][data-checkpoint-scope="input-params"]'
+    )
+    expect(origin).to_have_attribute("title", "Inherited from checkpoint call #2")
+    page.wait_for_timeout(300)
+
+    result = page.evaluate(
+        """async () => {
+          const pane = document.querySelector("#exact");
+          const origin = pane.querySelector(
+            '[data-checkpoint-call="2"][data-checkpoint-scope="input-params"]'
+          );
+          const before = pane.scrollTop;
+          origin.click();
+          await new Promise(resolve => setTimeout(resolve, 400));
+          const mixedOrigin = mixedCodeMirrorModel.marks.find(mark => (
+            mark.focused
+            && mark.attributes["data-checkpoint-call"] === "2"
+            && mark.attributes["data-checkpoint-scope"] === "input-params"
+          ));
+          const viewport = mixedCodeMirrorView.viewport;
+          const card = document.querySelector(
+            '.update-card[data-key="call:2"][data-phase="input"]'
+          );
+          return {
+            selected: state.selected.id,
+            timelineFocus: state.timelineFocus,
+            exactScrollPreserved: pane.scrollTop === before,
+            mixedOriginFocused: Boolean(mixedOrigin),
+            mixedOriginInView: Boolean(
+              mixedOrigin
+              && mixedOrigin.start <= viewport.to
+              && mixedOrigin.end >= viewport.from
+            ),
+            checkpointCard: card?.classList.contains("checkpoint"),
+            parametersActive: card?.querySelector(
+              '[data-checkpoint-scope="input-params"]'
+            )?.classList.contains("active"),
+          };
+        }"""
+    )
+    assert result == {
+        "selected": 3,
+        "timelineFocus": {"key": "call:2", "phase": "input"},
+        "exactScrollPreserved": True,
+        "mixedOriginFocused": True,
+        "mixedOriginInView": True,
+        "checkpointCard": True,
+        "parametersActive": True,
+    }
+
+
+def test_reset_history_permanently_deletes_calls_older_than_selection(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    page.wait_for_selector("#mixed .cm-editor")
+    # The reconstructed current state can remain on a newer call while a
+    # historical input/output is the visibly focused timeline item. Cleanup
+    # must use that focus, not the stale state selection behind the panes.
+    page.locator('.timeline-input[data-key="call:4"]').click()
+    page.wait_for_function("state.detail?.id === 4")
+    page.evaluate('setTimelineFocus("call:3", "output", false)')
+    assert page.evaluate("state.selected.id") == 4
+    expect(page.locator('.timeline-output[data-call-key="call:3"]')).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+    reset = page.get_by_role("button", name="Clean from here")
+    expect(reset).to_be_enabled()
+    expect(reset).to_have_attribute(
+        "title",
+        "Permanently delete focused call #3 and every older call",
+    )
+
+    confirmations = []
+
+    def accept_reset(dialog):
+        confirmations.append(dialog.message)
+        dialog.accept()
+
+    page.once("dialog", accept_reset)
+    reset.click()
+    # Cleaning is inclusive: the selected call #3 and every older call (#2) are
+    # deleted, so #3 itself disappears and #4 becomes the new oldest.
+    page.wait_for_function(
+        """() => !document.querySelector('.timeline-input[data-key="call:3"]')
+          && !document.querySelector('.timeline-input[data-key="call:2"]')
+          && document.querySelector('.timeline-input[data-key="call:4"]')"""
+    )
+    assert len(confirmations) == 1
+    assert "delete selected call #3 and the 1 call older than it" in confirmations[0]
+    assert "2 total" in confirmations[0]
+    assert "cannot be undone" in confirmations[0].casefold()
+
+    expect(page.locator('.timeline-item[data-key="call:2"]')).to_have_count(0)
+    expect(page.locator('.timeline-item[data-key="call:3"]')).to_have_count(0)
+    expect(page.locator('.timeline-input[data-key="call:4"]')).not_to_have_count(0)
+    expect(page.locator('.update-card[data-key="call:3"]')).to_have_count(0)
+    expect(page.get_by_label("Session").locator("option:checked")).to_contain_text(
+        "viewer · 1 call"
+    )
+
+    assert requests.get(f"{viewer_url}/api/calls/2", timeout=5).status_code == 404
+    assert requests.get(f"{viewer_url}/api/calls/3", timeout=5).status_code == 404
+    boundary = requests.get(f"{viewer_url}/api/calls/4", timeout=5).json()
+    assert boundary["parent_state_id"] is None
+    assert boundary["chronological_parent_id"] is None
+    assert boundary["diff"]["mode"] == "snapshot"
+    # The unrelated session is outside the selected boundary.
+    assert requests.get(f"{viewer_url}/api/calls/1", timeout=5).status_code == 200
+
+
+def test_cleaning_the_last_call_clears_every_state_pane(
+    page: Page, exact_scroll_url: str
+):
+    page.goto(f"{exact_scroll_url}/")
+    page.locator('.timeline-input[data-key="call:2"]').click()
+    page.wait_for_function("state.detail?.id === 2")
+    expect(page.locator("#exact")).to_contain_text("BBB changed bottom message")
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    page.get_by_role("button", name="Clean from here").click()
+
+    expect(page.locator(".timeline-item")).to_have_count(0)
+    expect(page.locator("#mixed")).to_have_text("No LLM calls in this session.")
+    expect(page.locator("#exact")).to_have_text("No current state.")
+    expect(page.locator("#updates")).to_have_text("No updates in this session.")
+    expect(page.locator("#mixed-status")).to_have_text("Select a call")
+    expect(page.locator("#lineage")).to_have_text("Select an event")
+    expect(page.locator("#mixed")).to_have_class(re.compile(r"\bempty\b"))
+    expect(page.locator("#exact")).to_have_class(re.compile(r"\bempty\b"))
+    expect(page.get_by_role("button", name="Clean from here")).to_be_disabled()
+
+
 def test_three_thousand_calls_render_without_quadratic_ui_work(
     page: Page, viewer_url: str
 ):
@@ -2554,8 +4946,6 @@ def test_three_thousand_calls_render_without_quadratic_ui_work(
             elapsed,
             timelineEvents: document.querySelectorAll(".timeline-item").length,
             updateCards: document.querySelectorAll(".update-card").length,
-            mixedMaxCalls: FRONTEND_CONFIG.mixedTrace.maxCalls,
-            retainedPreview: limitedMixedTraceText("x".repeat(10000)).length,
             contentVisibility: getComputedStyle(
               document.querySelector(".timeline-item")
             ).contentVisibility,
@@ -2564,7 +4954,62 @@ def test_three_thousand_calls_render_without_quadratic_ui_work(
     )
     assert result["timelineEvents"] == 6000
     assert result["updateCards"] == 6000
-    assert result["mixedMaxCalls"] == 12
-    assert result["retainedPreview"] < 1100
     assert result["contentVisibility"] == "auto"
     assert result["elapsed"] < 5000, result
+
+
+def test_large_mixed_values_are_lazy_but_never_truncated(
+    page: Page, viewer_url: str
+):
+    page.goto(f"{viewer_url}/")
+    page.wait_for_function(
+        "state.detail && state.mixedSegmentDetails.length > 0 && !state.pendingSelection"
+    )
+    expected = page.evaluate(
+        """() => {
+          const fullValue = "full-retained-value\\n".repeat(30000);
+          state.liveBusy = true;
+          loadSessions = async () => false;
+          loadTimeline = async () => false;
+          loadStats = async () => false;
+          const detail = {
+            ...state.detail,
+            id: 900001,
+            request: {model: "local", prompt: "large mixed value"},
+            response: fullValue,
+            thoughts: "",
+            diff: {
+              mode: "diff",
+              prompt: {hunks: [{"=": "10 unchanged lines"}]},
+              parameters: {},
+            },
+            output_diff: {mode: "snapshot"},
+            thoughts_diff: {mode: "unchanged"},
+          };
+          state.detail = detail;
+          state.selected = {type: "call", id: detail.id};
+          state.mixedSegmentDetails = [detail];
+          state.mixedHistoryComplete = true;
+          renderMixed();
+          return fullValue.length;
+        }"""
+    )
+    expect(page.locator("#mixed-load-older")).to_have_count(0)
+    expect(page.locator("#mixed-load-all")).to_have_count(0)
+    page.wait_for_selector("#mixed .cm-editor")
+    rendered = page.locator("#mixed").evaluate(
+        """element => ({
+          text: element._codeMirrorView.state.doc.toString(),
+          documentLines: element._codeMirrorView.state.doc.lines,
+          renderedLines: element.querySelectorAll(".cm-line").length,
+          addedChars: mixedCodeMirrorModel.marks
+            .filter(mark => mark.classes.includes("added-part"))
+            .reduce((total, mark) => total + mark.end - mark.start, 0),
+        })"""
+    )
+    assert len(rendered["text"]) >= expected
+    assert rendered["text"].endswith("full-retained-value\n")
+    assert "truncated" not in rendered["text"]
+    assert rendered["documentLines"] >= 30000
+    assert rendered["addedChars"] >= expected
+    assert rendered["renderedLines"] < 200

@@ -15,6 +15,10 @@ def main() -> None:
     parser.add_argument("--upstream", help="Override upstream base URL")
     args = parser.parse_args()
     config = load_config(args.config)
+    reranker = config.get("reranker", {})
+    reranker_enabled = bool(reranker.get("enabled", False))
+    reranker_llama_cpp = reranker.get("llama_cpp", {})
+    reranker_listen = reranker.get("listen", {})
     serve(
         args.db or config["storage"]["path"],
         host=args.host or config["server"]["host"],
@@ -27,6 +31,16 @@ def main() -> None:
             if config["storage"].get("max_mb")
             else None
         ),
+        reranker_listen_host=str(reranker_listen.get("host", "127.0.0.1"))
+        if reranker_enabled else None,
+        reranker_listen_port=int(reranker_listen.get("port", 8083))
+        if reranker_enabled else None,
+        reranker_llama_cpp_host=str(
+            reranker_llama_cpp.get("host", "127.0.0.1")
+        )
+        if reranker_enabled else None,
+        reranker_llama_cpp_port=int(reranker_llama_cpp.get("port", 8082))
+        if reranker_enabled else None,
     )
 
 

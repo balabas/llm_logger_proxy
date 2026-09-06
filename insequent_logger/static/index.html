@@ -18,6 +18,11 @@
     </label>
     <form id="search-form">
       <input id="search" type="search" placeholder="Search inputs, outputs, state…" autocomplete="off">
+      <fieldset class="search-fields" aria-label="Search fields">
+        <label><input type="checkbox" name="search-field" value="input" checked><span>Input</span></label>
+        <label><input type="checkbox" name="search-field" value="thoughts" checked><span>Thoughts</span></label>
+        <label><input type="checkbox" name="search-field" value="output" checked><span>Output</span></label>
+      </fieldset>
       <button>Search</button>
     </form>
     <div id="stats" class="stats">Loading…</div>
@@ -28,6 +33,14 @@
       <div class="pane-title">
         <div><span>01</span><h2>Timeline</h2></div>
         <div class="timeline-tools">
+          <div class="view-switch" role="group" aria-label="Timeline view">
+            <button id="view-list" class="view-switch-btn active" data-view="list" title="Linear list of events">List</button>
+            <button id="view-branches" class="view-switch-btn" data-view="branches" title="Branching graph of the call tree">Branches</button>
+          </div>
+          <div id="orientation-switch" class="view-switch hidden" role="group" aria-label="Branch orientation">
+            <button id="orient-vertical" class="view-switch-btn active" data-orient="vertical" title="Grow downward">↓</button>
+            <button id="orient-horizontal" class="view-switch-btn" data-orient="horizontal" title="Grow rightward">→</button>
+          </div>
           <label
             class="follow-toggle"
             title="When off, stay on the currently focused item"
@@ -36,6 +49,12 @@
             <span>Follow</span>
           </label>
           <span id="live-indicator" class="live-indicator">● LIVE</span>
+          <button
+            id="reset-history"
+            class="quiet danger"
+            title="Permanently delete the selected call and every older call"
+            disabled
+          >Clean from here</button>
           <button id="refresh" class="quiet">Refresh</button>
         </div>
       </div>

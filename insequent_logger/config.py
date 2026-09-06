@@ -8,6 +8,11 @@ from typing import Any
 DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
     "server": {"host": "127.0.0.1", "port": 8081},
     "upstream": {"url": "http://127.0.0.1:8080"},
+    "reranker": {
+        "enabled": False,
+        "llama_cpp": {"host": "127.0.0.1", "port": 8082},
+        "listen": {"host": "127.0.0.1", "port": 8083},
+    },
     "storage": {"path": "trace.llmtrace", "max_mb": 3},
     "defaults": {"session_id": "unassigned", "branch_id": "main"},
 }

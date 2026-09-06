@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import logging
+import os
 import re
 import sqlite3
 import threading
+import time
 import zlib
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -14,6 +17,27 @@ from typing import Any
 
 from .diffing import compact_text_diff, compact_token_diff, diff_manifests, diff_values
 from .protocol import extract_model_response
+
+
+log = logging.getLogger(__name__)
+
+# Largest *differing region*, in characters, that may be delta-encoded.
+#
+# SequenceMatcher is quadratic, and the tracer sits in the request path: every
+# second spent diffing is a second the caller waits for its model response.
+# Measured on Cyrillic text (chars -> seconds for one get_opcodes):
+#     5k -> 0.26   10k -> 1.1   20k -> 5.0   40k -> 18   80k -> 70
+# The limit is applied to the region left after the shared prefix and suffix
+# are trimmed, not to the whole blob, because the two are wildly different in
+# practice: consecutive requests in a conversation share nearly everything and
+# diverge in a few hundred characters, while an unrelated pair of 200k-char
+# tool results shares nothing and costs minutes. Sizing by total length would
+# refuse the first case to protect against the second.
+_MAX_DELTA_CHARS = int(os.environ.get("INSEQUENT_MAX_DELTA_CHARS", "40000"))
+
+# A delta slower than this means the size cap is set wrong for this content;
+# say so rather than silently paying it on every call.
+_SLOW_DELTA_SECONDS = float(os.environ.get("INSEQUENT_SLOW_DELTA_SECONDS", "1.0"))
 
 
 def _now() -> str:
@@ -37,6 +61,9 @@ class TraceStore:
         self._lock = threading.RLock()
         self._init_schema()
         self._recover_interrupted_calls()
+        # Reclaim any full-text index bloat left by earlier pruning before the
+        # size check, so the file reflects its real content size.
+        self._reclaim_search_index_if_bloated()
         if self.max_file_bytes:
             self.enforce_size_limit()
 
@@ -305,10 +332,18 @@ class TraceStore:
                 row = self._db.execute(
                     "SELECT chain_depth, raw_size FROM blobs WHERE hash=?", (base_hash,)
                 ).fetchone()
-                if row and row["chain_depth"] < max_chain and row["raw_size"] <= 2_000_000:
+                if row and row["chain_depth"] < max_chain:
                     base = self.get_text(base_hash)
-                    if len(text) <= 2_000_000:
-                        ops = self._text_delta(base, text)
+                    started = time.monotonic()
+                    ops = self._text_delta(base, text)
+                    elapsed = time.monotonic() - started
+                    if elapsed > _SLOW_DELTA_SECONDS:
+                        log.warning(
+                            "delta of %d chars against %d took %.1fs; lower "
+                            "INSEQUENT_MAX_DELTA_CHARS (currently %d)",
+                            len(text), len(base), elapsed, _MAX_DELTA_CHARS,
+                        )
+                    if ops is not None:
                         packed_delta = zlib.compress(_json(ops).encode("utf-8"), level=6)
                         if len(packed_delta) < len(full) * delta_ratio:
                             storage = "delta"
@@ -327,10 +362,31 @@ class TraceStore:
             return digest
 
     @staticmethod
-    def _text_delta(base: str, current: str) -> list[list[Any]]:
-        matcher = SequenceMatcher(None, base, current, autojunk=False)
+    def _text_delta(base: str, current: str) -> list[list[Any]] | None:
+        """Edits turning `base` into `current`, or None when diffing is too costly.
+
+        Opcode positions are indices into `base`, which is what get_text()
+        replays, so the shared head and tail are trimmed before matching and
+        the offset added back afterwards. That keeps the quadratic work
+        proportional to what actually changed rather than to the blob size.
+        """
+        head = 0
+        limit = min(len(base), len(current))
+        while head < limit and base[head] == current[head]:
+            head += 1
+        tail = 0
+        limit -= head
+        while tail < limit and base[-1 - tail] == current[-1 - tail]:
+            tail += 1
+
+        base_mid = base[head:len(base) - tail]
+        current_mid = current[head:len(current) - tail]
+        if len(base_mid) > _MAX_DELTA_CHARS or len(current_mid) > _MAX_DELTA_CHARS:
+            return None
+
+        matcher = SequenceMatcher(None, base_mid, current_mid, autojunk=False)
         return [
-            [i1, i2, current[j1:j2]]
+            [i1 + head, i2 + head, current_mid[j1:j2]]
             for tag, i1, i2, j1, j2 in matcher.get_opcodes()
             if tag != "equal"
         ]
@@ -772,6 +828,32 @@ class TraceStore:
                     )
             self.enforce_size_limit()
 
+    def update_call_title(self, req_id: str, title: str) -> dict[str, Any]:
+        """Replace the explicit title of the newest call with a caller ID."""
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT id, session_id, metadata_json FROM calls
+                WHERE req_id=? ORDER BY id DESC LIMIT 1
+                """,
+                (req_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(req_id)
+            metadata = json.loads(row["metadata_json"])
+            metadata["title"] = title
+            with self._db:
+                self._db.execute(
+                    "UPDATE calls SET metadata_json=? WHERE id=?",
+                    (_json(metadata), row["id"]),
+                )
+            return {
+                "call_id": int(row["id"]),
+                "session": row["session_id"],
+                "req_id": req_id,
+                "title": title,
+            }
+
     def add_stream_event(
         self, call_id: int, sequence: int, relative_ms: float, event_type: str, data: str
     ) -> None:
@@ -904,11 +986,60 @@ class TraceStore:
                 self._delete_session(session_id)
                 pruned.append(session_id)
                 self._garbage_collect_blobs()
+                # Merge the deleted session's full-text segments before VACUUM;
+                # otherwise the dead index data keeps the file above the limit and
+                # the loop deletes every remaining session for nothing.
+                self._optimize_search_index()
+                self._db.commit()  # close the optimize transaction before VACUUM
                 self._db.execute("VACUUM")
                 if not self._checkpoint_wal():
                     break
             self._last_pruned_sessions = pruned
         return pruned
+
+    def _optimize_search_index(self) -> None:
+        """Merge FTS5 segments so deleted documents' index data is reclaimed.
+
+        Deleting rows only tombstones them in the full-text index; the segment
+        data lingers until merged. After mass deletion (session pruning, cleaning
+        history) an unmerged index can dwarf the actual content — tens of MB of
+        dead segments for a handful of live documents — which VACUUM alone cannot
+        reclaim because those are live pages, not free ones."""
+        try:
+            self._db.execute(
+                "INSERT INTO search_documents(search_documents) VALUES('optimize')"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    def _search_index_is_bloated(self) -> bool:
+        """A healthy FTS index has a few segments per document. Hundreds of
+        segments for a few live documents means deleted content never merged."""
+        try:
+            segments = self._db.execute(
+                "SELECT COUNT(*) FROM search_documents_data"
+            ).fetchone()[0]
+            documents = self._db.execute(
+                "SELECT COUNT(*) FROM search_documents_docsize"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            return False
+        return segments > 256 and segments > max(documents, 1) * 32
+
+    def _reclaim_search_index_if_bloated(self) -> bool:
+        """One-shot repair for an already-bloated index (e.g. from earlier
+        pruning). Runs at startup so the file shrinks to its real size."""
+        with self._lock:
+            if not self._search_index_is_bloated():
+                return False
+            self._optimize_search_index()
+            self._db.commit()
+            try:
+                self._db.execute("VACUUM")
+            except sqlite3.OperationalError:
+                return False
+            self._checkpoint_wal()
+        return True
 
     def _checkpoint_wal(self) -> bool:
         """Try to compact the WAL without failing an in-flight request."""
@@ -976,6 +1107,188 @@ class TraceStore:
             self._db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
             self._db.execute("DELETE FROM states WHERE session_id=?", (session_id,))
 
+    def history_reset_preview(self, call_id: int) -> dict[str, Any]:
+        """Describe permanently deleting ``call_id`` and older calls in its session."""
+        with self._lock:
+            selected = self._db.execute(
+                """
+                SELECT c.id, c.session_id, timeline.sequence
+                FROM calls c
+                JOIN timeline
+                  ON timeline.item_type='call' AND timeline.item_id=c.id
+                WHERE c.id=?
+                """,
+                (call_id,),
+            ).fetchone()
+            if not selected:
+                raise KeyError(call_id)
+            # The selected call is removed together with everything older, so the
+            # boundary is inclusive.
+            older = self._db.execute(
+                """
+                SELECT c.id, c.status
+                FROM calls c
+                JOIN timeline
+                  ON timeline.item_type='call' AND timeline.item_id=c.id
+                WHERE c.session_id=? AND timeline.sequence<=?
+                ORDER BY timeline.sequence
+                """,
+                (selected["session_id"], selected["sequence"]),
+            ).fetchall()
+            running = [row["id"] for row in older if row["status"] == "running"]
+            return {
+                "selected_call_id": selected["id"],
+                "session_id": selected["session_id"],
+                "delete_calls": len(older),
+                "running_call_ids": running,
+                "can_reset": not running,
+            }
+
+    def reset_history_before_call(self, call_id: int) -> dict[str, Any]:
+        """Permanently delete older calls in the selected call's session.
+
+        The selected call becomes the session's storage boundary. Surviving
+        calls keep their complete request/response blobs, while references to
+        deleted calls and orphan request states are detached.
+        """
+        with self._lock:
+            preview = self.history_reset_preview(call_id)
+            if preview["running_call_ids"]:
+                identifiers = ", ".join(
+                    f"#{identifier}" for identifier in preview["running_call_ids"]
+                )
+                raise ValueError(
+                    f"cannot delete older history while calls {identifiers} are running"
+                )
+            selected = self._db.execute(
+                """
+                SELECT c.session_id, timeline.sequence
+                FROM calls c
+                JOIN timeline
+                  ON timeline.item_type='call' AND timeline.item_id=c.id
+                WHERE c.id=?
+                """,
+                (call_id,),
+            ).fetchone()
+            older_rows = self._db.execute(
+                """
+                SELECT c.id, c.req_id
+                FROM calls c
+                JOIN timeline
+                  ON timeline.item_type='call' AND timeline.item_id=c.id
+                WHERE c.session_id=? AND timeline.sequence<=?
+                ORDER BY timeline.sequence
+                """,
+                (selected["session_id"], selected["sequence"]),
+            ).fetchall()
+            call_ids = [row["id"] for row in older_rows]
+            if not call_ids:
+                return {
+                    **preview,
+                    "deleted_calls": 0,
+                    "remaining_calls": self._db.execute(
+                        "SELECT COUNT(*) FROM calls WHERE session_id=?",
+                        (selected["session_id"],),
+                    ).fetchone()[0],
+                }
+
+            placeholders = ",".join("?" for _ in call_ids)
+            session_state_ids = {
+                row["id"]
+                for row in self._db.execute(
+                    "SELECT id FROM states WHERE session_id=?",
+                    (selected["session_id"],),
+                )
+            }
+            surviving_state_ids = {
+                row["request_state_id"]
+                for row in self._db.execute(
+                    f"""
+                    SELECT DISTINCT request_state_id FROM calls
+                    WHERE id NOT IN ({placeholders})
+                    """,
+                    call_ids,
+                )
+            }
+            orphan_state_ids = sorted(session_state_ids - surviving_state_ids)
+            removed_req_ids = sorted({
+                row["req_id"] for row in older_rows if row["req_id"] is not None
+            })
+
+            # The VACUUM below rebuilds the file from live pages only, so deleted
+            # payloads never reach the new file — no need to also overwrite them
+            # in place first. In-place secure_delete on a large bulk delete cost
+            # ~20s and only duplicated what VACUUM already achieves.
+            self._db.execute("PRAGMA secure_delete=OFF")
+            with self._db:
+                self._db.execute(
+                    f"""
+                    UPDATE calls SET chronological_parent_id=NULL
+                    WHERE chronological_parent_id IN ({placeholders})
+                    """,
+                    call_ids,
+                )
+                if removed_req_ids:
+                    req_placeholders = ",".join("?" for _ in removed_req_ids)
+                    self._db.execute(
+                        f"""
+                        UPDATE calls SET prev_req_id=NULL
+                        WHERE session_id=? AND id NOT IN ({placeholders})
+                          AND prev_req_id IN ({req_placeholders})
+                        """,
+                        (selected["session_id"], *call_ids, *removed_req_ids),
+                    )
+                self._db.execute(
+                    f"""
+                    DELETE FROM search_documents
+                    WHERE owner_type='call' AND owner_id IN ({placeholders})
+                    """,
+                    call_ids,
+                )
+                self._db.execute(
+                    f"""
+                    DELETE FROM timeline
+                    WHERE item_type='call' AND item_id IN ({placeholders})
+                    """,
+                    call_ids,
+                )
+                self._db.execute(
+                    f"DELETE FROM stream_events WHERE call_id IN ({placeholders})",
+                    call_ids,
+                )
+                self._db.execute(
+                    f"DELETE FROM calls WHERE id IN ({placeholders})",
+                    call_ids,
+                )
+                if orphan_state_ids:
+                    state_placeholders = ",".join("?" for _ in orphan_state_ids)
+                    self._db.execute(
+                        f"""
+                        UPDATE states
+                        SET parent_state_id=NULL, parent_source='history-reset',
+                            similarity=NULL
+                        WHERE parent_state_id IN ({state_placeholders})
+                        """,
+                        orphan_state_ids,
+                    )
+                    self._db.execute(
+                        f"DELETE FROM states WHERE id IN ({state_placeholders})",
+                        orphan_state_ids,
+                    )
+
+            self._garbage_collect_blobs()
+            self._checkpoint_wal()
+            self._db.execute("VACUUM")
+            self._checkpoint_wal()
+            return {
+                **preview,
+                "deleted_calls": len(call_ids),
+                "remaining_calls": self._db.execute(
+                    "SELECT COUNT(*) FROM calls WHERE session_id=?",
+                    (selected["session_id"],),
+                ).fetchone()[0],
+            }
+
     @staticmethod
     def _blob_refs(value: Any) -> set[str]:
         refs: set[str] = set()
@@ -1012,34 +1325,51 @@ class TraceStore:
             manifest = json.loads(self.get_text(row["payload_blob_hash"]))
             reachable.update(self._blob_refs(manifest))
 
+        # A delta blob keeps its base alive. Resolve the whole chain from a
+        # single in-memory map rather than one query per blob — on a large trace
+        # the per-blob walk was thousands of round trips and dominated a reset.
+        base_of = {
+            row["hash"]: row["base_hash"]
+            for row in self._db.execute("SELECT hash, base_hash FROM blobs")
+        }
         pending = list(reachable)
         while pending:
-            digest = pending.pop()
-            row = self._db.execute(
-                "SELECT base_hash FROM blobs WHERE hash=?", (digest,)
-            ).fetchone()
-            if row and row["base_hash"] and row["base_hash"] not in reachable:
-                reachable.add(row["base_hash"])
-                pending.append(row["base_hash"])
+            base = base_of.get(pending.pop())
+            if base and base not in reachable:
+                reachable.add(base)
+                pending.append(base)
 
-        with self._db:
-            self._db.execute(
-                "CREATE TEMP TABLE IF NOT EXISTS reachable_blobs(hash TEXT PRIMARY KEY)"
-            )
-            self._db.execute("DELETE FROM reachable_blobs")
-            self._db.executemany(
-                "INSERT INTO reachable_blobs(hash) VALUES (?)",
-                ((digest,) for digest in reachable),
-            )
-            self._db.execute(
-                "DELETE FROM blobs WHERE NOT EXISTS "
-                "(SELECT 1 FROM reachable_blobs WHERE reachable_blobs.hash=blobs.hash)"
-            )
+        # Every blob deleted here is already outside the reachable set, so no
+        # surviving row references it — the foreign-key check SQLite would run
+        # per deleted blob (a full scan of each referencing table, including the
+        # large stream_events) is redundant and cost ~20s on a big trace.
+        # Disable it for this delete only; the pragma is a no-op inside a
+        # transaction, so it is set before the block begins one.
+        self._db.execute("PRAGMA foreign_keys=OFF")
+        try:
+            with self._db:
+                self._db.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS reachable_blobs(hash TEXT PRIMARY KEY)"
+                )
+                self._db.execute("DELETE FROM reachable_blobs")
+                self._db.executemany(
+                    "INSERT INTO reachable_blobs(hash) VALUES (?)",
+                    ((digest,) for digest in reachable),
+                )
+                self._db.execute(
+                    "DELETE FROM blobs WHERE NOT EXISTS "
+                    "(SELECT 1 FROM reachable_blobs WHERE reachable_blobs.hash=blobs.hash)"
+                )
+        finally:
+            self._db.execute("PRAGMA foreign_keys=ON")
 
     # ---------- reads ----------
 
     def _resolve(self, value: Any) -> Any:
-        if isinstance(value, dict) and "$blob" in value:
+        # A blob reference is {"$blob": <hash string>}. Only a string hash is a
+        # reference; a "$blob" whose value is anything else is ordinary data (or
+        # a diff over the field named "$blob") and must be recursed, not fetched.
+        if isinstance(value, dict) and isinstance(value.get("$blob"), str):
             text = self.get_text(value["$blob"])
             return json.loads(text) if value.get("format") == "json" else text
         if isinstance(value, dict):
@@ -1151,6 +1481,26 @@ class TraceStore:
                 if row["raw_response_blob_hash"]
                 else response
             )
+            metadata = json.loads(row["metadata_json"])
+            # Calls stored before token accounting was introduced still retain
+            # their exact provider envelope. Backfill usage lazily when the call
+            # is opened instead of scanning every potentially huge raw response
+            # in an existing trace during startup.
+            if "usage" not in metadata and row["raw_response_blob_hash"]:
+                streaming = any(
+                    line.lstrip().startswith("data:")
+                    for line in raw_response.splitlines()[:5]
+                )
+                parsed_usage = extract_model_response(
+                    raw_response, streaming=streaming
+                ).usage
+                if parsed_usage:
+                    metadata["usage"] = parsed_usage
+                    with self._db:
+                        self._db.execute(
+                            "UPDATE calls SET metadata_json=? WHERE id=?",
+                            (_json(metadata), call_id),
+                        )
             output_parent = self._db.execute(
                 """
                 SELECT id, request_state_id, response_blob_hash, thoughts_blob_hash
@@ -1199,16 +1549,23 @@ class TraceStore:
                     output_parent["request_state_id"] == row["request_state_id"]
                 )
             else:
+                # No earlier call shares this state (e.g. every FIT_TO_SCHEMA call
+                # is the first at its freshly built message list). Carry the value
+                # so the snapshot is self-describing — like the event path does at
+                # {"mode": "snapshot", "value": payload} — rather than an empty diff
+                # that says nothing on its own.
                 output_diff = {
                     "mode": "snapshot",
                     "base_call_id": None,
                     "similarity": None,
+                    "value": response,
                     "changes": [],
                 }
                 thoughts_diff = {
                     "mode": "snapshot",
                     "base_call_id": None,
                     "similarity": None,
+                    "value": thoughts,
                     "changes": [],
                 }
                 output_parent_same_request = False
@@ -1241,7 +1598,7 @@ class TraceStore:
                 "thoughts": thoughts,
                 "thoughts_diff": thoughts_diff,
                 "raw_response": raw_response,
-                "metadata": json.loads(row["metadata_json"]),
+                "metadata": metadata,
             }
 
     def get_event(self, event_id: int) -> dict[str, Any]:
@@ -1379,6 +1736,14 @@ class TraceStore:
                         item_data["duration_ms"] = metadata["duration_ms"]
                     if metadata.get("debug_label"):
                         item_data["debug_label"] = metadata["debug_label"]
+                    if metadata.get("title"):
+                        item_data["title"] = metadata["title"]
+                    if isinstance(metadata.get("usage"), dict):
+                        item_data["usage"] = metadata["usage"]
+                    if metadata.get("request_id"):
+                        item_data["request_id"] = metadata["request_id"]
+                    if metadata.get("group"):
+                        item_data["group"] = metadata["group"]
                     items.append(
                         {
                             "sequence": row["sequence"],
@@ -1407,55 +1772,81 @@ class TraceStore:
             return [dict(row) for row in rows]
 
     def search(
-        self, query: str, limit: int = 100, session_id: str | None = None
+        self,
+        query: str,
+        limit: int = 100,
+        session_id: str | None = None,
+        fields: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         with self._lock:
-            return self._search_unlocked(query, limit, session_id)
+            return self._search_unlocked(query, limit, session_id, fields)
 
     def _search_unlocked(
-        self, query: str, limit: int, session_id: str | None
+        self,
+        query: str,
+        limit: int,
+        session_id: str | None,
+        fields: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         query = query.strip()
         if not query:
             return []
         candidate_limit = limit * 5 if session_id else limit
         terms = re.findall(r"\w+", query, flags=re.UNICODE)
-        prefix_query = " AND ".join(
-            f'"{term.replace(chr(34), chr(34) * 2)}"*' for term in terms
-        )
-        rows: list[sqlite3.Row] = []
-        if prefix_query:
-            rows.extend(
-                self._db.execute(
-                    """
-                    SELECT owner_type, owner_id, field, text
-                    FROM search_documents
-                    WHERE search_documents MATCH ?
-                    LIMIT ?
-                    """,
-                    (prefix_query, candidate_limit),
-                ).fetchall()
-            )
-
-        # FTS5's unicode tokenizer supports token prefixes, but not arbitrary
-        # word fragments. The trace is size-bounded, so supplementing it with
-        # a case-folded scan gives predictable infix search, including Cyrillic.
         needle = query.casefold()
-        seen = {
-            (row["owner_type"], row["owner_id"], row["field"])
-            for row in rows
-        }
+        rows: list[sqlite3.Row] = []
+        seen: set[tuple[str, int, str]] = set()
+
+        # Exact substring (infix) matches come first. A literal query — a table
+        # row, text with punctuation — is what the user means to find verbatim,
+        # but FTS's tokenizer discards the punctuation and can reduce such a query
+        # to a single common token that floods the results. The trace is
+        # size-bounded, so this case-folded scan is affordable, and it also gives
+        # predictable infix matching (including Cyrillic) that the token index
+        # cannot. Special characters therefore never break search.
         for row in self._db.execute(
             "SELECT owner_type, owner_id, field, text FROM search_documents"
         ):
-            key = (row["owner_type"], row["owner_id"], row["field"])
-            if key in seen or needle not in row["text"].casefold():
+            if fields is not None and row["field"] not in fields:
                 continue
-            rows.append(row)
-            seen.add(key)
+            if needle and needle in row["text"].casefold():
+                key = (row["owner_type"], row["owner_id"], row["field"])
+                if key not in seen:
+                    rows.append(row)
+                    seen.add(key)
+
+        # Token-prefix matches supplement: FTS finds word-boundary matches across
+        # formatting that a raw substring cannot. Each term is quoted (with its
+        # own quotes doubled), so no query character reaches FTS as syntax.
+        prefix_query = " AND ".join(
+            f'"{term.replace(chr(34), chr(34) * 2)}"*' for term in terms
+        )
+        if prefix_query:
+            field_clause = ""
+            field_params: list[Any] = []
+            if fields:
+                placeholders = ",".join("?" for _ in fields)
+                field_clause = f" AND field IN ({placeholders})"
+                field_params = sorted(fields)
+            for row in self._db.execute(
+                f"""
+                SELECT owner_type, owner_id, field, text
+                FROM search_documents
+                WHERE search_documents MATCH ?
+                {field_clause}
+                LIMIT ?
+                """,
+                (prefix_query, *field_params, candidate_limit),
+            ).fetchall():
+                key = (row["owner_type"], row["owner_id"], row["field"])
+                if key not in seen:
+                    rows.append(row)
+                    seen.add(key)
 
         results: list[dict[str, Any]] = []
         for row in rows:
+            if fields is not None and row["field"] not in fields:
+                continue
             result = {
                 "owner_type": row["owner_type"],
                 "owner_id": row["owner_id"],
@@ -1477,16 +1868,24 @@ class TraceStore:
     @staticmethod
     def _search_snippet(text: str, query: str, terms: list[str]) -> str:
         folded = text.casefold()
-        matches = [query, *terms]
+        # Centre the snippet on the most specific match: the full query phrase
+        # wherever it occurs, else the longest (most distinctive) term present.
+        # Picking the earliest match instead — as before — centred on a common
+        # short word like "в" and showed unrelated surrounding text, which made
+        # correct results look irrelevant.
         match_start = -1
         match_length = 0
-        for candidate in matches:
-            if not candidate:
-                continue
-            index = folded.find(candidate.casefold())
-            if index >= 0 and (match_start < 0 or index < match_start):
-                match_start = index
-                match_length = len(candidate)
+        phrase_index = folded.find(query.casefold()) if query else -1
+        if phrase_index >= 0:
+            match_start = phrase_index
+            match_length = len(query)
+        else:
+            for candidate in sorted(terms, key=len, reverse=True):
+                index = folded.find(candidate.casefold())
+                if index >= 0:
+                    match_start = index
+                    match_length = len(candidate)
+                    break
         if match_start < 0:
             match_start = 0
             match_length = 0

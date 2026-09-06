@@ -69,14 +69,31 @@ def _mapping_diff(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     return changes
 
 
+def _is_blob_ref(value: Any) -> bool:
+    # An externalized value: {"$blob": <hash>, "format": ...}. It is opaque —
+    # diffing must not descend into it, or it produces a nested "$blob" key that
+    # the reader mistakes for a real blob reference (whose value is now a diff).
+    return isinstance(value, dict) and "$blob" in value
+
+
 def _value_diff(old: Any, new: Any) -> dict[str, Any]:
-    if isinstance(old, dict) and isinstance(new, dict):
+    if (
+        isinstance(old, dict)
+        and isinstance(new, dict)
+        and not _is_blob_ref(old)
+        and not _is_blob_ref(new)
+    ):
         return {"op": "~", "fields": _mapping_diff(old, new)}
     return {"op": "~", "old": old, "new": new}
 
 
 def diff_values(old: Any, new: Any) -> Any:
-    if isinstance(old, dict) and isinstance(new, dict):
+    if (
+        isinstance(old, dict)
+        and isinstance(new, dict)
+        and not _is_blob_ref(old)
+        and not _is_blob_ref(new)
+    ):
         changes = _mapping_diff(old, new)
         return {"mode": "diff", "fields": changes} if changes else {"mode": "unchanged"}
     if old == new:

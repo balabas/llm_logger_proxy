@@ -2,8 +2,157 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+
+import pytest
 
 from insequent_logger import TraceStore
+
+
+def test_search_with_special_characters_finds_the_literal_row(tmp_path):
+    # A literal query full of punctuation (a copied table row) must find its exact
+    # row, not degrade to matching a lone common token and flood the results —
+    # FTS tokenizing "|  6 |  …" down to "6" is what made search seem to fail.
+    store = TraceStore(tmp_path / "special.llmtrace")
+    target = store.start_call(
+        {"model": "local", "messages": [
+            {"role": "user", "content": "header\n|  6 |  Насосная станция  |  готово |\nfooter"},
+        ]},
+        session_id="s",
+    )
+    store.finish_call(target, "ok")
+    for i in range(25):  # noise that all contain "6"
+        call = store.start_call(
+            {"model": "local", "messages": [
+                {"role": "user", "content": f"random text with 6 and number {i}6 more"},
+            ]},
+            session_id="s",
+        )
+        store.finish_call(call, f"result 6 item {i}")
+
+    results = store.search("|  6 |  Насосная станция  |  готово |", limit=10)
+    assert results, "a literal query must find its row"
+    assert results[0]["owner_id"] == target, results[0]
+    assert all(r["owner_id"] == target for r in results), results
+
+    # A query that is only punctuation and one common token must never raise.
+    assert isinstance(store.search("|  6 |        |           ", limit=5), list)
+    assert isinstance(store.search('| "unbalanced |', limit=5), list)
+    store.close()
+
+
+def test_search_snippet_centres_on_the_phrase_not_a_stray_letter(tmp_path):
+    # A long doc that contains the phrase also contains its common short words
+    # (e.g. "в") much earlier. The snippet must centre on the phrase, not on the
+    # first stray letter — otherwise a correct result looks irrelevant.
+    store = TraceStore(tmp_path / "snippet.llmtrace")
+    phrase = "В состав проектируемых гидротехнических сооружений"
+    text = (
+        "в начале документа много общего текста и Нагорные канавы №1-№3 и прочее, "
+        "далее по тексту: " + phrase + " входят насосные станции и трубопроводы."
+    )
+    call = store.start_call(
+        {"model": "local", "messages": [{"role": "user", "content": text}]},
+        session_id="s",
+    )
+    store.finish_call(call, "ok")
+
+    results = store.search(phrase, limit=5, fields={"input"})
+    assert results, "phrase must be found"
+    snippet = results[0]["snippet"]
+    marks = re.findall(r"<mark[^>]*>(.*?)</mark>", snippet)
+    assert marks == [phrase], marks  # the whole phrase is highlighted, not "в"
+    assert phrase in re.sub(r"<[^>]+>", "", snippet)  # and it is in the shown window
+    store.close()
+
+
+def test_pruning_reclaims_full_text_index_segments(tmp_path):
+    # Deleting rows only tombstones them in the FTS index; the segment data
+    # lingers and VACUUM cannot reclaim it. Without merging, a churned index grows
+    # to dwarf the actual content — the bug where a 2-call trace occupied ~57 MB.
+    path = tmp_path / "bloat.llmtrace"
+    store = TraceStore(path)
+    for index in range(60):
+        call = store.start_call(
+            {"model": "local", "messages": [
+                {"role": "user", "content": f"уникальный документ номер {index} с содержимым"},
+            ]},
+            session_id=f"s{index}",
+        )
+        store.finish_call(call, f"результат выполнения шага номер {index}")
+        store._delete_session(f"s{index}")
+    store._db.commit()
+    before = store._db.execute("SELECT COUNT(*) FROM search_documents_data").fetchone()[0]
+    store._optimize_search_index()
+    store._db.commit()
+    after = store._db.execute("SELECT COUNT(*) FROM search_documents_data").fetchone()[0]
+    # A live call remains searchable after the merge.
+    live = store.start_call(
+        {"model": "local", "messages": [{"role": "user", "content": "финальный запрос"}]},
+        session_id="live",
+    )
+    store.finish_call(live, "финальный ответ")
+    hits = store._db.execute(
+        "SELECT COUNT(*) FROM search_documents WHERE search_documents MATCH 'финальный'"
+    ).fetchone()[0]
+    store.close()
+    assert after < before, (before, after)
+    assert hits >= 1
+
+
+def test_startup_reclaims_a_bloated_search_index(tmp_path):
+    # A store that opens onto an already-bloated index (from earlier pruning)
+    # repairs it once at startup, so the file shrinks to its real size.
+    path = tmp_path / "startup.llmtrace"
+    store = TraceStore(path)
+    for index in range(120):
+        call = store.start_call(
+            {"model": "local", "messages": [
+                {"role": "user", "content": f"документ {index} " * 8},
+            ]},
+            session_id=f"s{index}",
+        )
+        store.finish_call(call, f"вывод {index} " * 8)
+        store._delete_session(f"s{index}")
+    store._db.commit()
+    segments_before = store._db.execute(
+        "SELECT COUNT(*) FROM search_documents_data"
+    ).fetchone()[0]
+    was_bloated = store._search_index_is_bloated()
+    store.close()
+
+    reopened = TraceStore(path)  # __init__ runs the reclaim
+    segments_after = reopened._db.execute(
+        "SELECT COUNT(*) FROM search_documents_data"
+    ).fetchone()[0]
+    reopened.close()
+
+    if was_bloated:  # only assert reclamation when the churn actually bloated it
+        assert segments_after < segments_before, (segments_before, segments_after)
+    assert not TraceStore(path)._search_index_is_bloated()
+
+
+def test_base_less_output_snapshot_carries_its_value(tmp_path):
+    # A call with no earlier call at its state (e.g. every FIT_TO_SCHEMA call, the
+    # first at a freshly built message list) gets a base-less snapshot. It must
+    # carry the value so the snapshot is self-describing, not an empty diff that
+    # says nothing on its own — mirroring the event path's {"mode": "snapshot",
+    # "value": payload}.
+    store = TraceStore(tmp_path / "snap.llmtrace")
+    call_id = store.start_call(
+        {"model": "local", "messages": [{"role": "user", "content": "go"}]},
+        session_id="s",
+        purpose="FIT_TO_SCHEMA",
+    )
+    store.finish_call(call_id, '{"step_result":"the produced answer"}', thoughts="reasoning")
+    call = store.get_call(call_id)
+
+    assert call["output_parent_call_id"] is None
+    assert call["output_diff"]["mode"] == "snapshot"
+    assert call["output_diff"]["changes"] == []
+    assert call["output_diff"]["value"] == '{"step_result":"the produced answer"}'
+    assert call["thoughts_diff"]["mode"] == "snapshot"
+    assert call["thoughts_diff"]["value"] == "reasoning"
 
 
 def test_blob_delta_round_trip_and_dedup(tmp_path):
@@ -191,6 +340,34 @@ def test_thoughts_are_stored_separately_from_final_output(tmp_path):
     assert detail["response"] == "the final answer"
     assert detail["thoughts_diff"]["mode"] == "snapshot"
     assert detail["output_diff"]["mode"] == "snapshot"
+    store.close()
+
+
+def test_existing_raw_response_usage_is_backfilled_when_call_is_opened(tmp_path):
+    store = TraceStore(tmp_path / "usage-backfill.llmtrace")
+    call = store.start_call(
+        {"model": "local", "prompt": "count", "stream": True},
+        session_id="usage",
+    )
+    raw = "\n\n".join([
+        'data: {"choices":[{"delta":{"content":"done"}}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":253,'
+        '"completion_tokens":1188,"total_tokens":1441}}',
+        "data: [DONE]",
+    ])
+    store.finish_call(call, "done", raw_response=raw)
+    assert "usage" not in next(
+        item for item in store.timeline() if item.get("id") == call
+    )
+
+    assert store.get_call(call)["metadata"]["usage"] == {
+        "input_tokens": 253,
+        "output_tokens": 1188,
+        "total_tokens": 1441,
+    }
+    assert next(
+        item for item in store.timeline() if item.get("id") == call
+    )["usage"]["total_tokens"] == 1441
     store.close()
 
 
@@ -480,7 +657,7 @@ def test_sessions_and_session_filtered_search(tmp_path):
         },
         session_id="session-a",
     )
-    store.finish_call(first, "alpha output")
+    store.finish_call(first, "alpha output", thoughts="alpha private reasoning")
     second = store.start_call(
         {"messages": [{"role": "user", "content": "beta private term"}]},
         session_id="session-b",
@@ -501,6 +678,15 @@ def test_sessions_and_session_filtered_search(tmp_path):
     } == {"session-a"}
     assert store.search("priv", session_id="session-a")
     assert store.search("ivat", session_id="session-a")
+    assert {
+        item["field"]
+        for item in store.search(
+            "alpha", session_id="session-a", fields={"thoughts"}
+        )
+    } == {"thoughts"}
+    assert store.search(
+        "private reasoning", session_id="session-a", fields={"input"}
+    ) == []
     cyrillic = store.search("ЦЕНТРАЦ", session_id="session-a")
     assert cyrillic
     assert "<mark>центрац</mark>" in cyrillic[0]["snippet"].casefold()
@@ -535,6 +721,102 @@ def test_disk_limit_prunes_complete_oldest_sessions(tmp_path):
     assert "session-0" not in sessions
     assert store.stats()["file_bytes"] <= limit
     assert store.stats()["max_file_bytes"] == limit
+    store.close()
+
+
+def test_reset_history_permanently_deletes_calls_before_selected_boundary(tmp_path):
+    store = TraceStore(tmp_path / "reset-history.llmtrace")
+
+    def completed(prompt, response, *, session="main", parent=None, req_id=None, prev=None):
+        call_id = store.start_call(
+            {"model": "local", "prompt": prompt},
+            session_id=session,
+            explicit_parent_state=parent,
+            req_id=req_id,
+            prev_req_id=prev,
+        )
+        store.finish_call(call_id, response)
+        return call_id, store.get_call(call_id)["request_state_id"]
+
+    first, first_state = completed("old first", "old response", req_id="A")
+    second, second_state = completed(
+        "old second", "second response", parent=first_state, req_id="B", prev="A"
+    )
+    boundary, boundary_state = completed(
+        "keep boundary", "boundary response", parent=second_state, req_id="C", prev="B"
+    )
+    newest, _ = completed(
+        "keep newest", "newest response", parent=boundary_state, req_id="D", prev="C"
+    )
+    other, _ = completed("other session", "other response", session="other")
+
+    # Reset is inclusive of the selected call: selecting `second` removes it and
+    # everything older (first), leaving the boundary and newer calls.
+    preview = store.history_reset_preview(second)
+    assert preview == {
+        "selected_call_id": second,
+        "session_id": "main",
+        "delete_calls": 2,
+        "running_call_ids": [],
+        "can_reset": True,
+    }
+
+    result = store.reset_history_before_call(second)
+    assert result["deleted_calls"] == 2
+    assert result["remaining_calls"] == 2
+    for deleted in (first, second):
+        with pytest.raises(KeyError):
+            store.get_call(deleted)
+    assert store.search("old first", session_id="main") == []
+    assert [item["id"] for item in store.timeline(session_id="main")] == [
+        boundary,
+        newest,
+    ]
+    assert store.get_call(other)["response"] == "other response"
+
+    boundary_detail = store.get_call(boundary)
+    assert boundary_detail["request"]["prompt"] == "keep boundary"
+    assert boundary_detail["response"] == "boundary response"
+    assert boundary_detail["chronological_parent_id"] is None
+    assert boundary_detail["parent_state_id"] is None
+    assert boundary_detail["parent_source"] == "history-reset"
+    assert boundary_detail["prev_req_id"] is None
+    assert boundary_detail["diff"]["mode"] == "snapshot"
+    newest_detail = store.get_call(newest)
+    assert newest_detail["request"]["prompt"] == "keep newest"
+    assert newest_detail["response"] == "newest response"
+    assert newest_detail["chronological_parent_id"] == boundary
+    assert newest_detail["output_parent_call_id"] == boundary
+
+    # Blob garbage collection deletes with foreign-key enforcement disabled (it
+    # only removes blobs the reachability walk proved orphaned); the store must
+    # still be referentially intact and leave enforcement back on.
+    assert store._db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert store._db.execute("PRAGMA foreign_key_check").fetchall() == []
+    dangling = store._db.execute(
+        """
+        SELECT COUNT(*) FROM calls
+        WHERE response_blob_hash IS NOT NULL
+          AND response_blob_hash NOT IN (SELECT hash FROM blobs)
+        """
+    ).fetchone()[0]
+    assert dangling == 0
+    store.close()
+
+
+def test_reset_history_rejects_deleting_a_running_call(tmp_path):
+    store = TraceStore(tmp_path / "reset-running.llmtrace")
+    running = store.start_call({"prompt": "still running"}, session_id="main")
+    boundary = store.start_call({"prompt": "boundary"}, session_id="main")
+    store.finish_call(boundary, "keep")
+
+    preview = store.history_reset_preview(boundary)
+    assert preview["running_call_ids"] == [running]
+    assert preview["can_reset"] is False
+    with pytest.raises(ValueError, match="running"):
+        store.reset_history_before_call(boundary)
+    assert store.get_call(running)["status"] == "running"
+    assert store.get_call(boundary)["response"] == "keep"
     store.close()
 
 
@@ -670,4 +952,52 @@ def test_timeline_loads_rows_in_batches_instead_of_one_query_per_item(tmp_path):
     ]
     assert len(timeline) == 44
     assert len(selects) == 3, selects
+    store.close()
+
+
+def test_changed_externalized_parameter_resolves_without_crash(tmp_path):
+    # Large or nested parameters (e.g. a tool list) are externalized to a blob
+    # reference {"$blob": hash}. When such a parameter changes, the diff must not
+    # descend into the reference — doing so produced a nested "$blob" key that the
+    # reader tried to fetch as a blob, crashing get_call.
+    store = TraceStore(tmp_path / "params.llmtrace")
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": f"tool_{i}",
+                "description": "d" * 40,
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            },
+        }
+        for i in range(6)
+    ]
+    request = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 80000,
+        "stream_options": {"include_usage": True},
+        "tools": tools,
+    }
+    first = store.start_call(request, session_id="p")
+    store.finish_call(first, "ok")
+    parent_state = store.get_call(first)["request_state_id"]
+
+    changed = [dict(tool) for tool in tools]
+    changed[0] = {"type": "function", "function": {"name": "tool_RENAMED"}}
+    second = store.start_call(
+        {**request, "tools": changed, "messages": [{"role": "user", "content": "next"}]},
+        session_id="p",
+        explicit_parent_state=parent_state,
+    )
+    store.finish_call(second, "ok")
+
+    detail = store.get_call(second)  # must not raise
+    tools_diff = detail["diff"]["parameters"]["tools"]
+    assert tools_diff["op"] == "~"
+    # The change resolves to the real tool lists, not blob hashes.
+    assert isinstance(tools_diff["old"], list)
+    assert isinstance(tools_diff["new"], list)
+    assert tools_diff["new"][0]["function"]["name"] == "tool_RENAMED"
+    assert detail["request"]["tools"][0]["function"]["name"] == "tool_RENAMED"
     store.close()

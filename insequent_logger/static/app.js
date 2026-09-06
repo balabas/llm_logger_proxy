@@ -1,6 +1,6 @@
 const FRONTEND_CONFIG = Object.freeze({
   branchGraph: Object.freeze({
-    enabled: false,
+    enabled: true,
     lanePitch: 31,
     overlapShift: 8,
     bandPitch: 32,
@@ -11,11 +11,6 @@ const FRONTEND_CONFIG = Object.freeze({
     minWidth: 205,
     otherPanesMinWidth: 780,
     storageKey: "insequent.timelinePaneWidth",
-  }),
-  mixedTrace: Object.freeze({
-    maxCalls: 12,
-    maxHistoricalChars: 250000,
-    maxEntryChars: 1000,
   }),
 });
 
@@ -29,11 +24,16 @@ const state = {
   latestSession: null,
   sessionsSignature: "",
   timelineSignature: "",
+  timelineEpoch: 0,
+  searchFocus: null,
   lastTimelineKey: null,
   timelineItems: [],
   mixedSegmentDetails: [],
-  mixedHistoryTruncated: false,
+  mixedHistoryComplete: true,
+  mixedHistoryLoading: false,
   liveBusy: false,
+  live: new Map(),
+  liveSource: null,
   followedUpdateKey: null,
   pendingSelection: null,
   followedUpdateTimer: null,
@@ -117,6 +117,18 @@ function itemKey(item) {
   return `${item.type}:${item.id}`;
 }
 
+// A stored call id is numeric; an in-flight (synthetic) streaming call uses a
+// string id "live-<n>". Keep live ids as strings so they survive Number()-based
+// dataset round-trips.
+function parseItemId(value) {
+  const text = String(value);
+  return text.startsWith("live-") ? text : Number(text);
+}
+
+function isLiveId(id) {
+  return String(id).startsWith("live-");
+}
+
 function focusedTimelineKey() {
   return state.timelineFocus?.key
     || (state.selected ? itemKey(state.selected) : null);
@@ -142,8 +154,61 @@ function requestParameters(request) {
   );
 }
 
+function parsedStructuredJson(value) {
+  if (typeof value !== "string") return value;
+  let parsed = value;
+  for (let depth = 0; depth < 2 && typeof parsed === "string"; depth += 1) {
+    const candidate = parsed.trim();
+    if (!candidate || !"[{\"".includes(candidate[0])) break;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      return value;
+    }
+  }
+  return parsed && typeof parsed === "object" ? parsed : value;
+}
+
+function messageForDisplay(message) {
+  if (!message || typeof message !== "object") return message;
+  // Message objects may arrive content-first from reconstructed storage or
+  // role-first from a live request. Normalize the visual field order while
+  // retaining every provider-specific field after the two primary fields.
+  const displayed = {};
+  if (Object.hasOwn(message, "role")) displayed.role = message.role;
+  if (Object.hasOwn(message, "content")) displayed.content = message.content;
+  for (const [key, value] of Object.entries(message)) {
+    if (key !== "role" && key !== "content") displayed[key] = value;
+  }
+  if (displayed.role === "tool" && typeof displayed.content === "string") {
+    displayed.content = parsedStructuredJson(displayed.content);
+  }
+  if (Array.isArray(displayed.tool_calls)) {
+    displayed.tool_calls = displayed.tool_calls.map(call => {
+      if (!call || typeof call !== "object") return call;
+      const shownCall = {...call};
+      if (call.function && typeof call.function === "object") {
+        shownCall.function = {
+          ...call.function,
+          arguments: parsedStructuredJson(call.function.arguments),
+        };
+      }
+      return shownCall;
+    });
+  }
+  if (displayed.function_call && typeof displayed.function_call === "object") {
+    displayed.function_call = {
+      ...displayed.function_call,
+      arguments: parsedStructuredJson(displayed.function_call.arguments),
+    };
+  }
+  return displayed;
+}
+
 function requestContent(request) {
-  if (Array.isArray(request?.messages)) return { messages: request.messages };
+  if (Array.isArray(request?.messages)) {
+    return {messages: request.messages.map(messageForDisplay)};
+  }
   if (Object.hasOwn(request || {}, "prompt")) return { prompt: request.prompt };
   return request || {};
 }
@@ -196,7 +261,22 @@ function stateDisplayParts(detail) {
   const outputLabel = "output:\n";
   const output = responseValue(detail);
   const outputRendered = displayValue(output);
+  // A context-exceeded or cancelled call may stream no usable parsed data, so
+  // carry the raw body into Output as a diagnostic fallback. A reasoning-only
+  // response is different even when cancelled: its SSE was parsed into Thoughts
+  // and an empty public Output is legitimate; showing the raw transport there
+  // would duplicate Thoughts and falsely label parsed data as unparsed.
+  const rawText = typeof detail.raw_response === "string" ? detail.raw_response : "";
+  const outputEmpty = output == null
+    || (typeof output === "string" && output.trim() === "");
+  const hasParsedThoughts = typeof detail.thoughts === "string"
+    && detail.thoughts.trim() !== "";
+  const outputIsRaw = outputEmpty
+    && rawText.trim() !== ""
+    && !hasParsedThoughts;
   return {
+    outputIsRaw,
+    rawOutputText: `${outputLabel}${rawText}`,
     parameters,
     topParameterText,
     parameterText,
@@ -219,7 +299,7 @@ function stateDisplayParts(detail) {
   };
 }
 
-function stateScopeHtml(kind, html, nested = false) {
+function stateScopeHtml(kind, html, nested = false, originAttributes = "", badge = "") {
   const labels = {
     input: "Input",
     "input-params": "Input parameters",
@@ -235,7 +315,38 @@ function stateScopeHtml(kind, html, nested = false) {
   const sourceLabel = sourceLabels[kind];
   const labelPattern = new RegExp(`^\\s*${sourceLabel}:(?: |\\n)?`);
   const content = String(html).replace(labelPattern, "");
-  return `<span class="state-scope ${nested ? "state-subscope " : ""}trace-kind-${kind}" data-state-scope="${kind}"><span class="state-scope-label" role="button" tabindex="0" aria-label="${labels[kind]} scope">${labels[kind]}</span><span class="state-scope-content">${content}</span></span>`;
+  const badgeHtml = badge
+    ? `<span class="scope-badge" title="Parsed output was empty — showing the raw captured response.">${escapeHtml(badge)}</span>`
+    : "";
+  return `<span class="state-scope ${nested ? "state-subscope " : ""}trace-kind-${kind}${originAttributes ? " checkpoint-origin" : ""}" data-state-scope="${kind}"><span class="state-scope-label" role="button" tabindex="0" aria-label="${labels[kind]} scope">${labels[kind]}${badgeHtml}</span><span class="state-scope-content"${originAttributes}>${content}</span></span>`;
+}
+
+function inheritedCheckpointDetail() {
+  if (!state.detail || isCheckpoint(state.detail)) return null;
+  return state.mixedSegmentDetails.find(detail => isCheckpoint(detail)) || null;
+}
+
+function scopeIsInherited(detail, scope, currentEntries) {
+  if (!detail || isCheckpoint(detail)) return false;
+  if (scope === "output") {
+    // An empty value has no text provenance to navigate to. Its scope represents
+    // the selected call's lack of output, even if another call was also empty.
+    return String(detail.response || "").trim() !== ""
+      && detail.output_diff?.mode === "unchanged";
+  }
+  if (scope === "thoughts") {
+    return String(detail.thoughts || "").trim() !== ""
+      && detail.thoughts_diff?.mode === "unchanged";
+  }
+  // Input scopes contain a mixture of inherited and current ranges. Their
+  // individual update marks intercept current text; plain text belongs to the
+  // checkpoint and retains the scope-level fallback origin.
+  return true;
+}
+
+function checkpointOriginAttributes(detail, scope) {
+  if (!detail) return "";
+  return ` data-checkpoint-call="${detail.id}" data-checkpoint-scope="${scope}" title="Inherited from checkpoint call #${detail.id}"`;
 }
 
 function messageStructureHtml(html, includeListLabel = true) {
@@ -247,23 +358,37 @@ function messageStructureHtml(html, includeListLabel = true) {
     );
   }
   // A structural key can now be preceded by an update mark that opens on the
-  // line, so keep any leading tags and relabel what follows them.
+  // line, so keep any leading tags and relabel what follows them. Either field
+  // may lead the list item (the store serializes content-first; a live call
+  // carries the request as sent — usually role-first), so the leading "- " dash
+  // is optional on both.
+  let roleIndex = 0;
   content = content
     .replace(
-      /^((?:<[^>]+>)*)[ \t]*-[ \t]+content:(?: )?/gm,
+      /^((?:<[^>]+>)*)[ \t]*(?:-[ \t]+)?content:(?: )?/gm,
       '$1<span class="message-field-label">Content</span> ',
     )
     .replace(
-      /^((?:<[^>]+>)*)[ \t]*role:(?: )?/gm,
-      '$1<span class="message-field-label message-role-label">Role</span> ',
+      /^((?:<[^>]+>)*)[ \t]*(?:-[ \t]+)?role:(?: )?/gm,
+      (_match, leadingTags) => {
+        const separator = roleIndex > 0
+          ? '<span class="message-separator" aria-hidden="true"></span>'
+          : "";
+        roleIndex += 1;
+        return `${separator}${leadingTags}<span class="message-field-label message-role-label">Role</span> `;
+      },
     )
     .replace(
       /(<span class="message-field-label[^"]*">[^<]+<\/span>) &quot;/g,
       "$1 ",
     )
     // A closing update-mark tag can now sit between the trailing quote and the
-    // line end; the quote is still serializer syntax, not payload.
-    .replace(/&quot;(?=(?:<\/[^>]+>)*(?:\n|$))/gm, "");
+    // line end. Remove that serializer quote only on the Content/Role lines we
+    // relabelled above; fields such as tool-call name/id/type retain both quotes.
+    .replace(
+      /^(.*message-field-label.*)&quot;(?=(?:<\/[^>]+>)*(?:\n|$))/gm,
+      "$1",
+    );
   return content;
 }
 
@@ -436,9 +561,9 @@ function updateEntries(detail) {
         entries.push({
           label: `Removed input · ${message.role || "message"}`,
           text: markedValue("−", message),
-          oldText: yaml(message),
+          oldText: yaml(messageForDisplay(message)),
           newText: "",
-          mixedOldText: yaml(message),
+          mixedOldText: yaml(messageForDisplay(message)),
           messageIndex: newStartIndex,
           anchorNeedle: firstSearchableValue(
             detail.request?.messages?.[change.new?.[0]]?.content,
@@ -459,25 +584,35 @@ function updateEntries(detail) {
         if (!oldMessage || !newMessage) {
           const message = newMessage || oldMessage;
           const operation = newMessage ? "+" : "-";
+          // When a replacement removes more messages than it adds, anchor the
+          // unpaired removals at the last replacement message. Mixed then sorts
+          // the zero-width red removals before that message's green span instead
+          // of parking them at the end of the scope after the new text.
+          const replacementAnchorIndex = newStartIndex == null
+            ? null
+            : newStartIndex + Math.max(newMessages.length - 1, 0);
           entries.push({
             label: `${operationName(operation)} input · ${message.role || "message"}`,
             text: markedValue(operation === "+" ? "+" : "−", message),
-            oldText: oldMessage ? yaml(oldMessage) : "",
-            newText: newMessage ? yaml(newMessage) : "",
-            mixedOldText: oldMessage ? yaml(oldMessage) : "",
-            messageIndex: newStartIndex == null ? null : newStartIndex + index,
+            oldText: oldMessage ? yaml(messageForDisplay(oldMessage)) : "",
+            newText: newMessage ? yaml(messageForDisplay(newMessage)) : "",
+            mixedOldText: oldMessage ? yaml(messageForDisplay(oldMessage)) : "",
+            messageIndex: newMessage
+              ? (newStartIndex == null ? null : newStartIndex + index)
+              : replacementAnchorIndex,
             needle: newMessage ? firstSearchableValue(newMessage.content) : "",
             needles: newMessage ? searchableLines(newMessage.content) : [],
             scope: "input",
             category: "input",
             operation,
+            replacementOrder: index,
           });
         } else {
           entries.push({
             label: `Changed input · ${newMessage.role || oldMessage.role || "message"}`,
             text: transitionText({ op: "~", old: oldMessage, new: newMessage }),
-            oldText: yaml(oldMessage),
-            newText: yaml(newMessage),
+            oldText: yaml(messageForDisplay(oldMessage)),
+            newText: yaml(messageForDisplay(newMessage)),
             mixedOldText: firstSearchableValue(oldMessage.content),
             messageIndex: newStartIndex == null ? null : newStartIndex + index,
             needle: firstSearchableValue(newMessage.content),
@@ -485,6 +620,7 @@ function updateEntries(detail) {
             scope: "input",
             category: "input",
             operation: "~",
+            replacementOrder: index,
           });
         }
       }
@@ -495,7 +631,7 @@ function updateEntries(detail) {
         label: `Added input · ${message.role || "message"}`,
         text: markedValue("+", message),
         oldText: "",
-        newText: yaml(message),
+        newText: yaml(messageForDisplay(message)),
         messageIndex: newStartIndex == null ? null : newStartIndex + index,
         needle: firstSearchableValue(message.content),
         needles: searchableLines(message.content),
@@ -928,12 +1064,91 @@ function unchangedInputNoticeHtml(detail, entries) {
     </div>`;
 }
 
-function limitedMixedTraceText(value) {
-  const text = String(value || "");
-  const limit = FRONTEND_CONFIG.mixedTrace.maxEntryChars;
-  return text.length <= limit
-    ? text
-    : `${text.slice(0, limit)}\n… retained trace text truncated …`;
+function removedTextAdditionOrigins(entries) {
+  const originsByRemoval = new Map();
+  const activeOrigins = new Map();
+  const chronological = [...entries].sort((left, right) => (
+    Number(left.callId) - Number(right.callId)
+    || Number(left.entryIndex) - Number(right.entryIndex)
+    || Number(left.fragmentIndex ?? -1) - Number(right.fragmentIndex ?? -1)
+  ));
+  for (const entry of chronological) {
+    const oldText = entry.oldText || entry.mixedOldText || "";
+    const newText = entry.newText || "";
+    if ((entry.operation === "-" || entry.operation === "~") && oldText) {
+      const origins = activeOrigins.get(oldText) || [];
+      const origin = origins.pop();
+      if (origin) originsByRemoval.set(entry, origin);
+      if (origins.length) activeOrigins.set(oldText, origins);
+      else activeOrigins.delete(oldText);
+    }
+    if ((entry.operation === "+" || entry.operation === "~") && newText) {
+      const origins = activeOrigins.get(newText) || [];
+      origins.push(entry);
+      activeOrigins.set(newText, origins);
+    }
+  }
+  return originsByRemoval;
+}
+
+// A removed part whose text was already present before the loaded history begins
+// has no explicit "+" that introduced it. Attribute it to the earliest loaded
+// call whose reconstructed state still contains it, so the "where added"
+// reference can point somewhere rather than being absent. A distinctive line
+// survives reformatting between the diff text and a call's rendered state better
+// than the whole block, so match on the removed part's longest line.
+// Search every scope of a call, not just the removal's own scope: in agentic
+// loops a call's output (a step_result) becomes a later call's input, so removed
+// input text often originated as an earlier call's output.
+// Per-render budget: the maximum number of (removed-text, detail) substring scans
+// the origin search may run. Sized to cover ordinary segments fully (early hits
+// return before spending much) while capping pathological deep/large ones so the
+// page cannot freeze. MIXED_ORIGIN_HAYSTACK_CAP bounds each scan's cost so the
+// budget maps to bounded time even when a call's state is multiple megabytes.
+const MIXED_ORIGIN_SCAN_BUDGET = 6000;
+const MIXED_ORIGIN_HAYSTACK_CAP = 400000;
+let mixedOriginScanBudget = 0;
+
+const mixedOriginPartsCache = new WeakMap();
+function mixedOriginSearchText(detail) {
+  let combined = mixedOriginPartsCache.get(detail);
+  if (combined == null) {
+    const parts = stateDisplayParts(detail);
+    combined = [
+      parts.parameterText,
+      parts.contentText,
+      parts.outputText,
+      parts.thoughtsText,
+    ].filter(Boolean).join("\n").slice(0, MIXED_ORIGIN_HAYSTACK_CAP);
+    mixedOriginPartsCache.set(detail, combined);
+  }
+  return combined;
+}
+
+function removedTextOriginCall(removedText) {
+  // JSON string values keep their newlines escaped ("\\n"), so a whole block can
+  // arrive as one giant escaped line. Split on both real and escaped newlines and
+  // common structural punctuation so the needle is a short, distinctive segment
+  // that survives reformatting, rather than a huge exact-match-only string.
+  const segments = (removedText || "")
+    .split(/\\+n|\r?\n|","|":\s*"|[[\]{}]/)
+    .map(part => part.replace(/^[\s"',:*]+|[\s"',:*]+$/g, ""))
+    .filter(part => part.length >= 6);
+  if (!segments.length) return null;
+  // Prefer the longest distinctive segment, but keep a few candidates: the single
+  // longest can still be a coincidence, so a call must merely contain one of them.
+  const needles = [...new Set(segments)]
+    .sort((left, right) => right.length - left.length)
+    .slice(0, 6);
+  // mixedSegmentDetails runs earliest → selected, so the first match is the
+  // earliest loaded call that still shows this text.
+  for (const detail of state.mixedSegmentDetails) {
+    if (mixedOriginScanBudget <= 0) return null;  // spent: leave this part un-underlined
+    mixedOriginScanBudget -= 1;
+    const haystack = mixedOriginSearchText(detail);
+    if (needles.some(needle => haystack.includes(needle))) return detail.id;
+  }
+  return null;
 }
 
 function mixedStateHtml(text, entries, anchors = null) {
@@ -951,6 +1166,47 @@ function mixedStateHtml(text, entries, anchors = null) {
       if (removed) removedByEntry.add(removed);
     }
   }
+  const additionOrigins = removedTextAdditionOrigins(entries);
+  // Resolve the "where added" call once per removal (grouped by its owning
+  // change), using the whole removed text, then share it across every fragment
+  // of that removal. Resolving per token-fragment would leave short fragments
+  // (keys, punctuation, a single word) without a distinctive line to match, so
+  // only part of one removed block would carry the reference.
+  // Search on all available removed text for a change, not just mixedOldText —
+  // for a message replacement that field is only the first value, while the full
+  // block (oldText) is what is rendered and what an earlier call still contains.
+  // A distinctive needle needs only a short prefix, so cap the text kept per
+  // change. Without this, a large block (e.g. a task prompt) repeated across
+  // hundreds of removed marks would grow one string by O(n^2) concatenation and
+  // then be hashed whole as a cache key — enough to freeze the page.
+  const ORIGIN_TEXT_CAP = 2000;
+  const removedTextOf = entry => [entry.oldText, entry.mixedOldText, entry.text]
+    .filter(Boolean).join("\n").slice(0, ORIGIN_TEXT_CAP);
+  const removedTextByEntryKey = new Map();
+  for (const entry of entries) {
+    if (entry.operation !== "-" && entry.operation !== "~") continue;
+    const previous = removedTextByEntryKey.get(entry.entryKey) || "";
+    if (previous.length >= ORIGIN_TEXT_CAP) continue;  // already enough for a needle
+    const removed = removedTextOf(entry);
+    if (!removed) continue;
+    const combined = previous ? `${previous}\n${removed}` : removed;
+    removedTextByEntryKey.set(entry.entryKey, combined.slice(0, ORIGIN_TEXT_CAP));
+  }
+  const textOriginCache = new Map();
+  const originCallForText = removed => {
+    if (!removed) return null;
+    if (textOriginCache.has(removed)) return textOriginCache.get(removed);
+    const call = removedTextOriginCall(removed);
+    textOriginCache.set(removed, call);
+    return call;
+  };
+  const entryOriginCall = entry => originCallForText(
+    removedTextByEntryKey.get(entry.entryKey) || removedTextOf(entry),
+  );
+  const addedCallAttribute = removed => {
+    const originCall = originCallForText(removed);
+    return originCall != null ? ` data-added-call="${originCall}"` : "";
+  };
   const changes = [];
   for (const entry of entries) {
     if (entry.operation === "-") {
@@ -962,16 +1218,36 @@ function mixedStateHtml(text, entries, anchors = null) {
       if (position < 0) {
         position = entry.scope === "input" && boundary >= 0 ? boundary : text.length;
       }
-      changes.push({ start: position, end: position, entry });
+      changes.push({
+        start: position,
+        end: position,
+        entry,
+        replacementOrder: entry.replacementOrder,
+      });
       continue;
     }
     const ranges = entryRanges(text, entry, anchors);
     ranges.forEach((range, rangeIndex) => {
+      if (
+        entry.operation === "~"
+        && rangeIndex === 0
+        && entry.mixedOldText
+      ) {
+        changes.push({
+          start: range[0],
+          end: range[0],
+          entry,
+          removedOnly: true,
+          replacementOrder: entry.replacementOrder,
+        });
+      }
       changes.push({
         start: range[0],
         end: range[1],
         entry,
         firstRange: rangeIndex === 0,
+        skipInlineRemoval: entry.operation === "~" && rangeIndex === 0,
+        replacementOrder: entry.replacementOrder,
       });
     });
     if (!ranges.length) {
@@ -1002,17 +1278,32 @@ function mixedStateHtml(text, entries, anchors = null) {
       placed.push(change);
       continue;
     }
-    const collides = claimed.some(
+    const collision = claimed.find(
       span => change.start < span[1] && span[0] < change.end,
     );
-    if (collides) {
-      placed.push({ ...change, historical: true, start: text.length, end: text.length });
+    if (collision) {
+      // Retained history that was replaced by the selected call belongs before
+      // the selected call's present (green) span. Anchoring it at the end of the
+      // document reverses the transition visually: green first, then red.
+      // Make it a zero-width insertion at the replacing span's start so the
+      // renderer emits the removed history first without competing for text.
+      placed.push({
+        ...change,
+        historical: true,
+        start: collision[0],
+        end: collision[0],
+      });
       continue;
     }
     claimed.push([change.start, change.end]);
     placed.push(change);
   }
-  placed.sort((left, right) => left.start - right.start || left.end - right.end);
+  placed.sort((left, right) => (
+    left.start - right.start
+    || left.end - right.end
+    || (left.replacementOrder ?? Number.MAX_SAFE_INTEGER)
+      - (right.replacementOrder ?? Number.MAX_SAFE_INTEGER)
+  ));
   let html = "";
   let cursor = 0;
   for (const change of placed) {
@@ -1031,13 +1322,23 @@ function mixedStateHtml(text, entries, anchors = null) {
       : ` data-output-fragment="${entry.fragmentIndex}"`;
     const entryAttribute =
       `data-update-entry="${entry.entryKey}"${fragmentAttribute} role="button" tabindex="0"`;
+    // A removed part carries both references on the one struck element: the
+    // strike-through focuses its removal, and a green underline (the addition
+    // origin) focuses where it was added. The origin is either a specific earlier
+    // change (data-added-entry) or, for text already present before the loaded
+    // history, the earliest call that still shows it (data-added-call).
+    const additionOrigin = additionOrigins.get(entry);
+    let addedAttribute = "";
+    if (additionOrigin) {
+      addedAttribute = ` data-added-entry="${additionOrigin.entryKey}"`;
+    } else {
+      const originCall = entryOriginCall(entry);
+      if (originCall != null) addedAttribute = ` data-added-call="${originCall}"`;
+    }
+    const removedEntryAttribute = `${entryAttribute}${addedAttribute}`;
     if (change.historical) {
-      const oldText = limitedMixedTraceText(
-        entry.oldText || entry.mixedOldText || "",
-      );
-      const newText = limitedMixedTraceText(
-        entry.newText || entry.text || "",
-      );
+      const oldText = entry.oldText || entry.mixedOldText || "";
+      const newText = entry.newText || entry.text || "";
       // The selected call's own absent addition is still "added" (it is what the
       // call produced). An earlier call's absent addition is retained as removed
       // history — unless a real removal entry already shows that exact text, in
@@ -1049,33 +1350,49 @@ function mixedStateHtml(text, entries, anchors = null) {
       const newKind = entry.fromEarlierCall ? "removed" : "added";
       html += "\n";
       if (entry.operation === "~" && oldText) {
-        html += changePartHtml("removed", oldText, category, false, entryAttribute);
+        html += changePartHtml("removed", oldText, category, false, removedEntryAttribute);
         if (showNew) html += '<span class="change-arrow inline-arrow"> → </span>';
       }
       if (showNew) {
-        html += changePartHtml(newKind, newText, category, false, entryAttribute);
+        // An earlier call's addition that is now gone is shown as removed
+        // history; it still links back to the call that first added it.
+        const newAttribute = newKind === "removed"
+          ? `${entryAttribute}${addedCallAttribute(newText)}`
+          : entryAttribute;
+        html += changePartHtml(newKind, newText, category, false, newAttribute);
       }
       html += "\n";
-    } else if (entry.operation === "-") {
-      const removed = limitedMixedTraceText(
+    } else if (change.removedOnly) {
+      html += changePartHtml(
+        "removed",
         entry.mixedOldText || entry.oldText || entry.text,
+        category,
+        true,
+        removedEntryAttribute,
       );
+    } else if (entry.operation === "-") {
+      const removed = entry.mixedOldText || entry.oldText || entry.text;
       html += `\n${changePartHtml(
         "removed",
         removed,
         category,
         false,
-        entryAttribute,
+        removedEntryAttribute,
       )}\n`;
     } else {
       const current = text.slice(change.start, change.end);
-      if (entry.operation === "~" && entry.mixedOldText && change.firstRange) {
+      if (
+        entry.operation === "~"
+        && entry.mixedOldText
+        && change.firstRange
+        && !change.skipInlineRemoval
+      ) {
         html += changePartHtml(
           "removed",
-          limitedMixedTraceText(entry.mixedOldText),
+          entry.mixedOldText,
           category,
           true,
-          entryAttribute,
+          removedEntryAttribute,
         );
         html += '<span class="change-arrow inline-arrow"> → </span>';
       }
@@ -1146,6 +1463,13 @@ function mixedOutputHtml(detail, outputEntry = null) {
 }
 
 async function detailFor(type, id) {
+  // In-flight streaming calls are not stored yet; serve a synthetic detail built
+  // from the live record (a stable, mutated-in-place object) instead of fetching.
+  if (isLiveId(id)) {
+    const record = state.live.get(Number(String(id).slice(5)));
+    if (record) return liveDetailFor(record);
+    throw Object.assign(new Error("live call ended"), { status: 404 });
+  }
   const key = `${type}:${id}`;
   if (!state.details.has(key)) {
     const request = fetchJson(`/api/calls/${id}`).catch(error => {
@@ -1211,6 +1535,10 @@ function updateCardId(card) {
 // between later inputs without disturbing the rest.
 function renderUpdateCards(items) {
   const updates = $("updates");
+  // The empty-session message is real pane state, not decoration. A live call
+  // can arrive before the first durable timeline poll, so remove the placeholder
+  // as part of the same reconciliation that creates its input card.
+  updates.querySelectorAll(".empty-session").forEach(node => node.remove());
   const existing = new Map();
   updates.querySelectorAll(".update-card").forEach(card => {
     existing.set(updateCardId(card), card);
@@ -1227,6 +1555,13 @@ function renderUpdateCards(items) {
     state.observer?.unobserve(card);
     card.remove();
   });
+  if (!desired.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-session";
+    empty.textContent = "No updates in this session.";
+    updates.replaceChildren(empty);
+    return;
+  }
   // Reconcile order in place: a card that is already where it belongs is left
   // untouched. Re-inserting a node — even to the same spot — restarts every CSS
   // animation on it and its descendants, so a blanket rebuild would replay the
@@ -1294,15 +1629,51 @@ function timelinePhaseEvents(items) {
     const dated = Number.isFinite(parsedStart);
     const startedAt = dated ? parsedStart : UNDATED_EVENT_AT;
     events.push({ item, phase: "input", at: startedAt, sortOrder: 3 });
+    // A stored call gets an output event once finished; a still-running call has
+    // none. A streaming (synthetic, in-flight) call gets one immediately, flagged
+    // not-finished, so its live output is selectable while it streams.
+    const streaming = item.status === "streaming";
     if (item.status !== "running") {
       const duration = Number(item.duration_ms);
       const completedAt = dated && Number.isFinite(duration)
         ? startedAt + Math.max(duration, 0)
         : startedAt + 1;
-      events.push({ item, phase: "output", at: completedAt, sortOrder: 0 });
+      events.push({
+        item, phase: "output", at: completedAt, sortOrder: 0, streaming,
+      });
     }
   }
   return events;
+}
+
+function timelineDisplayId(item) {
+  // The visible #number is the proxy's durable call id. req_id/request_id may be
+  // caller-owned opaque strings (often long hashes); keep those for lineage and
+  // live→stored reconciliation, never as the human-facing timeline number.
+  return item.live ? item.call_id : item.id;
+}
+
+function formatSpeed(value) {
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} tok/s`;
+}
+
+function timelineUsageText(item, phase) {
+  const usage = item.usage;
+  if (!usage || typeof usage !== "object") return "";
+  const input = Number.isInteger(usage.input_tokens) ? usage.input_tokens : null;
+  const output = Number.isInteger(usage.output_tokens) ? usage.output_tokens : null;
+  const total = Number.isInteger(usage.total_tokens) ? usage.total_tokens : null;
+  const speed = typeof usage.output_per_second === "number" && usage.output_per_second > 0
+    ? usage.output_per_second
+    : null;
+  if (phase === "input") {
+    return input == null ? "" : `${input.toLocaleString()} in`;
+  }
+  const parts = [];
+  if (output != null) parts.push(`${output.toLocaleString()} out`);
+  if (total != null) parts.push(`${total.toLocaleString()} total`);
+  if (speed != null) parts.push(formatSpeed(speed));
+  return parts.join(" · ");
 }
 
 function compareTimelineEvents(left, right) {
@@ -1338,7 +1709,32 @@ function renderTimelineEvents(items) {
   }
   events.sort(compareTimelineEvents);
 
-  $("timeline").innerHTML = "";
+  const timeline = $("timeline");
+  const existingByKey = new Map();
+  const existingByIdentity = new Map();
+  for (const node of timeline.querySelectorAll(".timeline-item")) {
+    const phase = node.dataset.phase;
+    const key = node.dataset.key || node.dataset.callKey;
+    if (phase && key) existingByKey.set(`${phase}:${key}`, node);
+    if (node.dataset.timelineIdentity) {
+      const matches = existingByIdentity.get(node.dataset.timelineIdentity) || [];
+      matches.push(node);
+      existingByIdentity.set(node.dataset.timelineIdentity, matches);
+    }
+  }
+  const reusedNodes = new Set();
+  const reusableNode = (phase, key, identity) => {
+    const exact = existingByKey.get(`${phase}:${key}`);
+    if (exact && !reusedNodes.has(exact)) {
+      reusedNodes.add(exact);
+      return exact;
+    }
+    const identityMatch = (existingByIdentity.get(identity) || [])
+      .find(node => !reusedNodes.has(node));
+    if (identityMatch) reusedNodes.add(identityMatch);
+    return identityMatch || document.createElement("button");
+  };
+  const nextChildren = document.createDocumentFragment();
   for (const event of events) {
     if (event.phase === "parallel-start" || event.phase === "parallel-end") {
       const divider = document.createElement("div");
@@ -1348,42 +1744,60 @@ function renderTimelineEvents(items) {
       divider.innerHTML = `
         <span>parallel ${edge}</span>
         <small>${event.branchCount} branches</small>`;
-      $("timeline").appendChild(divider);
+      nextChildren.appendChild(divider);
       continue;
     }
     const { item, phase } = event;
     const key = itemKey(item);
-    const button = document.createElement("button");
-    button.className = `timeline-item timeline-${phase} trace-kind-${phase} call`;
+    const stableId = item.req_id || item.request_id || item.call_id || item.id;
+    const identity = `${phase}:${item.session_id || ""}:${stableId}`;
+    // Reuse the phase node across live updates and the live→stored handoff. The
+    // public request id is stable even when the internal id changes from live-N
+    // to the durable numeric call id.
+    const button = reusableNode(phase, key, identity);
+    button.className = `timeline-item timeline-${phase} trace-kind-${phase} call${
+      event.streaming ? " timeline-streaming" : ""
+    }`;
     button.dataset.phase = phase;
+    button.dataset.timelineIdentity = identity;
     if (phase === "input") {
       button.dataset.key = key;
+      delete button.dataset.callKey;
       button.classList.toggle("checkpoint-call", state.checkpointKeys.has(key));
     } else {
       button.dataset.callKey = key;
+      delete button.dataset.key;
     }
     const checkpoint = phase === "input" && state.checkpointKeys.has(key);
+    const phaseHtml = phase === "input"
+      ? checkpoint ? "→ new state input" : "→ input"
+      : event.streaming ? '<span class="live-dot"></span>← output' : "← output";
+    const explicitTitle = item.title || null;
+    const displayedTitle = explicitTitle || item.debug_label || item.label || "LLM call";
+    const usageText = timelineUsageText(item, phase);
+    const statusText = phase === "input" ? "sent" : item.status;
     button.innerHTML = `
       <span class="item-head">
-        <span class="item-label">${
-          phase === "input"
-            ? checkpoint ? "→ new state input" : "→ input"
-            : "← output"
-        }</span>
-        ${debugLabelHtml(item.debug_label, "item-debug")}
+        <span class="item-title" title="${escapeHtml(displayedTitle)}">${escapeHtml(displayedTitle)}</span>
       </span>
       <span class="item-meta">
-        <span>#${item.id} · <b class="branch">${escapeHtml(item.branch_id || "main")}</b></span>
-        <span>${escapeHtml(phase === "input" ? "sent" : item.status)}</span>
+        <span>#${escapeHtml(String(timelineDisplayId(item)))} · <b class="branch">${escapeHtml(item.branch_id || "main")}</b></span>
+        <span class="item-tail" title="${escapeHtml(usageText || statusText)}">
+          <span class="item-label">${phaseHtml}</span>${
+            escapeHtml([usageText, statusText].filter(Boolean).join(" · "))
+        }</span>
       </span>`;
     button.classList.toggle(
       "active",
       focusedTimelineKey() === key
         && (state.timelineFocus?.phase || state.selectedPhase) === phase,
     );
-    button.onclick = () => selectItem(item.type, item.id, button);
-    $("timeline").appendChild(button);
+    button.onclick = () => selectItem(
+      item.type, item.id, button, false, true, "timeline",
+    );
+    nextChildren.appendChild(button);
   }
+  timeline.replaceChildren(nextChildren);
   applyBranchIndentation(callBlocks);
   renderBranchGraph(items);
 }
@@ -1416,16 +1830,45 @@ function buildBranchGraph(items) {
     stateHead.set(item.request_state_id, item.id);
   }
 
+  // A window (or any declared group) is a grouping node, not a request. Insert
+  // a synthetic node per group between its members and their shared parent, so
+  // the lines hang off the window and the window hangs off the root. The
+  // synthetic node's id is a string, distinct from the numeric call ids.
+  const groupNodeId = new Map();
+  const groupParent = new Map();
+  const orderedEntries = [];
+  for (const item of calls) {
+    const group = item.group;
+    if (group && !groupNodeId.has(group)) {
+      const syntheticId = `group:${group}`;
+      groupNodeId.set(group, syntheticId);
+      groupParent.set(group, parentOf.get(item.id) ?? null);
+      orderedEntries.push({ synthetic: true, id: syntheticId, group });
+    }
+    orderedEntries.push({ synthetic: false, item, id: item.id });
+  }
+  const resolvedParent = entry => {
+    if (entry.synthetic) return groupParent.get(entry.group);
+    if (entry.item.group) return groupNodeId.get(entry.item.group);
+    return parentOf.get(entry.id) ?? null;
+  };
+  // Child counts over the reparented tree drive lane reuse.
+  const laneChildCount = new Map();
+  for (const entry of orderedEntries) {
+    const parent = resolvedParent(entry);
+    if (parent != null) laneChildCount.set(parent, (laneChildCount.get(parent) || 0) + 1);
+  }
+
   // Lane assignment with reuse: a continuation keeps its parent's lane, a branch
   // takes the lowest free lane, and a lane frees when its tip has no children
   // left to place. This keeps a mostly-linear trace narrow.
   const laneTip = [];
   const laneOf = new Map();
   const extended = new Set();
-  const remaining = new Map(childCount);
+  const remaining = new Map(laneChildCount);
   const nodes = [];
-  calls.forEach((item, depth) => {
-    const parent = parentOf.get(item.id);
+  orderedEntries.forEach((entry, depth) => {
+    const parent = resolvedParent(entry);
     let lane;
     if (parent != null && laneOf.has(parent) && !extended.has(parent)) {
       lane = laneOf.get(parent);
@@ -1437,9 +1880,17 @@ function buildBranchGraph(items) {
         laneTip.push(null);
       }
     }
-    laneOf.set(item.id, lane);
-    laneTip[lane] = item.id;
-    nodes.push({ item, id: item.id, depth, lane, parentId: parent });
+    laneOf.set(entry.id, lane);
+    laneTip[lane] = entry.id;
+    nodes.push({
+      item: entry.item ?? null,
+      id: entry.id,
+      synthetic: !!entry.synthetic,
+      group: entry.group ?? null,
+      depth,
+      lane,
+      parentId: parent,
+    });
     if (parent != null) {
       remaining.set(parent, (remaining.get(parent) || 0) - 1);
       const parentLane = laneOf.get(parent);
@@ -1469,8 +1920,39 @@ function branchNodeLabel(item) {
     ? escapeHtml(item.debug_label)
     : (item.label ? escapeHtml(item.label) : "");
   const branch = escapeHtml(item.branch_id || "main");
-  return `<span class="branch-node-step">${step || `#${item.id}`}</span>`
-    + `<span class="branch-node-meta">${step ? `#${item.id} · ` : ""}${branch}</span>`;
+  const displayId = escapeHtml(String(timelineDisplayId(item)));
+  return `<span class="branch-node-step">${step || `#${displayId}`}</span>`
+    + `<span class="branch-node-meta">${step ? `#${displayId} · ` : ""}${branch}</span>`;
+}
+
+// A node is either a real call or a synthetic grouping node (a window). The
+// grouping node is not a request: it has no call id, is not selectable, and
+// reads as its group name.
+function branchNodeInfo(node) {
+  if (node.synthetic) {
+    const label = escapeHtml(node.group || "group");
+    return {
+      selectable: false,
+      dotClass: "synthetic",
+      title: `window ${node.group || ""}`.trim(),
+      labelClass: "synthetic",
+      labelHtml: `<span class="branch-node-step">${label}</span>`
+        + `<span class="branch-node-meta">window</span>`,
+    };
+  }
+  const item = node.item;
+  const running = item.status === "running";
+  const checkpoint = state.checkpointKeys.has(`call:${node.id}`);
+  const displayId = escapeHtml(String(timelineDisplayId(item)));
+  return {
+    selectable: true,
+    dotClass: `${running ? " running" : ""}${checkpoint ? " checkpoint" : ""}`,
+    title: `LLM call #${displayId}`
+      + `${item.debug_label ? ` · ${escapeHtml(item.debug_label)}` : ""}`
+      + ` · ${escapeHtml(item.branch_id || "main")}`,
+    labelClass: "",
+    labelHtml: branchNodeLabel(item),
+  };
 }
 
 function branchLaneColor(lane) {
@@ -1513,22 +1995,26 @@ function horizontalBranchMarkup(nodes, nodeById, laneCount) {
     ${nodes.map(node => {
       const cx = xOf(node);
       const cy = yOf(node);
-      const running = node.item.status === "running";
-      const checkpoint = state.checkpointKeys.has(`call:${node.id}`);
-      const active = focusedTimelineKey() === `call:${node.id}`;
-      return `<circle class="branch-dot${running ? " running" : ""}${checkpoint ? " checkpoint" : ""}${active ? " active" : ""}"
-        cx="${cx}" cy="${cy}" r="${BRANCH_NODE_R}" fill="${branchLaneColor(node.lane)}" data-call-id="${node.id}"/>`;
+      const info = branchNodeInfo(node);
+      const active = info.selectable && focusedTimelineKey() === `call:${node.id}`;
+      const callAttr = info.selectable ? ` data-call-id="${node.id}"` : "";
+      return `<circle class="branch-dot${info.dotClass}${active ? " active" : ""}"
+        cx="${cx}" cy="${cy}" r="${BRANCH_NODE_R}" fill="${branchLaneColor(node.lane)}"${callAttr}/>`;
     }).join("")}
   </svg>`;
   const labels = nodes.map(node => {
     const cx = xOf(node);
     const cy = yOf(node);
+    const info = branchNodeInfo(node);
     const key = `call:${node.id}`;
-    const active = focusedTimelineKey() === key;
-    return `<button class="branch-node${active ? " active" : ""} horizontal"
-      data-key="${key}" data-call-id="${node.id}" style="left:${cx}px;top:${cy + BRANCH_NODE_R + 3}px;"
-      title="LLM call #${node.id}${node.item.debug_label ? ` · ${escapeHtml(node.item.debug_label)}` : ""} · ${escapeHtml(node.item.branch_id || "main")}">
-      ${branchNodeLabel(node.item)}
+    const active = info.selectable && focusedTimelineKey() === key;
+    const attrs = info.selectable
+      ? ` data-key="${key}" data-call-id="${node.id}"`
+      : "";
+    return `<button class="branch-node horizontal${active ? " active" : ""} ${info.labelClass}"
+     ${attrs} style="left:${cx}px;top:${cy + BRANCH_NODE_R + 3}px;"
+      title="${info.title}">
+      ${info.labelHtml}
     </button>`;
   }).join("");
   return { width, height, html: `<div class="branch-canvas" style="width:${width + 220}px;height:${height}px;">${svg}${labels}</div>` };
@@ -1706,23 +2192,27 @@ function verticalBranchMarkup(nodes, nodeById, width) {
 
   const dots = nodes.map(node => {
     const point = positions.get(node.id);
-    const running = node.item.status === "running";
-    const checkpoint = state.checkpointKeys.has(`call:${node.id}`);
-    const active = focusedTimelineKey() === `call:${node.id}`;
-    return `<circle class="branch-dot${running ? " running" : ""}${checkpoint ? " checkpoint" : ""}${active ? " active" : ""}"
-      cx="${point.x}" cy="${point.y}" r="${BRANCH_NODE_R}" fill="${branchLaneColor(node.lane)}" data-call-id="${node.id}"/>`;
+    const info = branchNodeInfo(node);
+    const active = info.selectable && focusedTimelineKey() === `call:${node.id}`;
+    const callAttr = info.selectable ? ` data-call-id="${node.id}"` : "";
+    return `<circle class="branch-dot${info.dotClass}${active ? " active" : ""}"
+      cx="${point.x}" cy="${point.y}" r="${BRANCH_NODE_R}" fill="${branchLaneColor(node.lane)}"${callAttr}/>`;
   }).join("");
   const labels = nodes.map(node => {
     const point = positions.get(node.id);
     const roomRight = width - point.x;
     const placeLeft = roomRight < 150;
     const available = Math.max(76, Math.min(190, placeLeft ? point.x - 18 : roomRight - 18));
-    const active = focusedTimelineKey() === `call:${node.id}`;
-    return `<button class="branch-node${active ? " active" : ""}${placeLeft ? " place-left" : ""}"
-      data-key="call:${node.id}" data-call-id="${node.id}"
+    const info = branchNodeInfo(node);
+    const active = info.selectable && focusedTimelineKey() === `call:${node.id}`;
+    const attrs = info.selectable
+      ? ` data-key="call:${node.id}" data-call-id="${node.id}"`
+      : "";
+    return `<button class="branch-node${active ? " active" : ""}${placeLeft ? " place-left" : ""} ${info.labelClass}"
+     ${attrs}
       style="left:${point.x + (placeLeft ? -8 : 8)}px;top:${point.y}px;width:${available}px;"
-      title="LLM call #${node.id}${node.item.debug_label ? ` · ${escapeHtml(node.item.debug_label)}` : ""} · ${escapeHtml(node.item.branch_id || "main")}">
-      ${branchNodeLabel(node.item)}
+      title="${info.title}">
+      ${info.labelHtml}
     </button>`;
   }).join("");
   const svg = `<svg class="branch-graph-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${edgeMarkup}${dots}</svg>`;
@@ -1766,7 +2256,12 @@ function highlightBranchNode(container, id) {
 
 function bindBranchGraphInteractions(container) {
   container.querySelectorAll(".branch-node").forEach(button => {
-    button.onclick = () => selectItem("call", Number(button.dataset.callId), button);
+    // A synthetic grouping node (a window) is not a call; it has no id, so it is
+    // inert rather than selecting an undefined call.
+    if (button.dataset.callId == null) return;
+    button.onclick = () => selectItem(
+      "call", Number(button.dataset.callId), button, false, true, "timeline",
+    );
     button.onmouseenter = () => highlightBranchNode(container, button.dataset.callId);
     button.onmouseleave = () => clearBranchHover(container);
   });
@@ -1837,7 +2332,14 @@ function syncBranchGraphSelection() {
 // Selection owns the state rendered in Mixed/Exact. Timeline focus is separate:
 // a historical fragment in those panes can point back to the call that created
 // it without replacing the currently reconstructed state.
-function setTimelineFocus(key, phase = "input", scroll = false, element = null) {
+function setTimelineFocus(
+  key,
+  phase = "input",
+  scroll = false,
+  element = null,
+  block = "start",
+  flash = scroll,
+) {
   state.timelineFocus = { key, phase };
   state.selectedPhase = phase;
   document.querySelectorAll(".timeline-item").forEach(node => {
@@ -1848,7 +2350,6 @@ function setTimelineFocus(key, phase = "input", scroll = false, element = null) 
     );
   });
   syncBranchGraphSelection();
-  if (!scroll) return;
   const graphTarget = state.timelineView === "branches"
     ? $("branch-graph")?.querySelector(`.branch-node[data-key="${key}"]`)
     : null;
@@ -1856,8 +2357,48 @@ function setTimelineFocus(key, phase = "input", scroll = false, element = null) 
     ? document.querySelector(`.timeline-output[data-call-key="${key}"]`)
     : document.querySelector(`.timeline-input[data-key="${key}"]`);
   const target = graphTarget || element || listTarget;
+  if (flash && target) {
+    // Active is a persistent state and is easy to mistake for a failed repeat
+    // focus. Restart a short pulse even when this same item was already active.
+    target.classList.remove("timeline-focus-flash");
+    void target.offsetWidth;
+    target.classList.add("timeline-focus-flash");
+  }
+  updateCleanHistoryControl();
+  if (!scroll) return;
   target?.focus({ preventScroll: true });
-  focusScrollIntoView(target, "nearest");
+  focusScrollIntoView(target, block);
+}
+
+function cleanHistoryTarget() {
+  const focusedKey = state.timelineFocus?.key;
+  const focused = focusedKey?.startsWith("call:")
+    ? state.timelineItems.find(item => itemKey(item) === focusedKey)
+    : null;
+  const item = focused || (
+    state.selected?.type === "call"
+      ? state.timelineItems.find(item => itemKey(item) === itemKey(state.selected))
+        || state.selected
+      : null
+  );
+  if (!item || item.type !== "call") return null;
+  const durableId = item.live ? item.call_id : item.id;
+  if (durableId == null || !Number.isFinite(Number(durableId))) return null;
+  return {
+    id: Number(durableId),
+    key: itemKey(item),
+    displayId: timelineDisplayId(item),
+  };
+}
+
+function updateCleanHistoryControl() {
+  const button = $("reset-history");
+  if (!button) return;
+  const target = cleanHistoryTarget();
+  button.disabled = !target || button.dataset.busy === "true";
+  button.title = target
+    ? `Permanently delete focused call #${target.displayId} and every older call`
+    : "Select a call before cleaning history";
 }
 
 function applyTimelineView() {
@@ -1950,12 +2491,17 @@ function restoreUpdatesViewport(anchor, fallbackScrollTop) {
   container.scrollTop += currentOffset - anchor.offset;
 }
 
-function renderWaitingCalls(items) {
+function renderWaitingCalls() {
   const box = $("waiting-calls");
-  const waiting = items.filter(item => item.type === "call" && item.status === "running");
+  // Storage is deferred, so there is never a stored "running" call. The live
+  // streams ARE the running calls, and each already appears as its own synthetic
+  // Timeline item (input + streaming output); this is just the running count.
+  const running = [...state.live.values()].filter(
+    record => (record.status || "streaming") === "streaming",
+  ).length;
   box.innerHTML = `
     <div class="waiting-calls-head">
-      <span>${waiting.length} waiting / running</span>
+      <span>${running} waiting / running</span>
     </div>`;
 }
 
@@ -2019,10 +2565,95 @@ function keepFollowedUpdateVisible() {
 }
 
 const FOCUS_SCROLL_DURATION_MS = 200;
+const SOURCE_PANE_SCROLL_GUARD_MS = 5000;
 const focusScrollAnimations = new WeakMap();
+const panePointerScrolls = new WeakMap();
+const paneScrollPins = new WeakMap();
+let paneScrollPreservationGeneration = 0;
+
+// Removing search marks briefly preserves every pane's viewport to defeat DOM
+// scroll anchoring. Any later explicit focus owns the viewport, so invalidate
+// those queued restores before starting its scroll. Otherwise a fast click can
+// be reset on the next frame and only the second click appears to work.
+function supersedePaneScrollPreservation() {
+  paneScrollPreservationGeneration += 1;
+}
+
+// Clicking a mark inside a pane focuses it across every pane, but the pane the
+// user clicked in must not move — they are already looking at it. Focus and
+// CodeMirror's async re-measure both try to reveal the target, so hold the
+// clicked pane's scroll for a short window rather than trusting a single
+// restore. The other panes still scroll to their corresponding item.
+function paneScrollPosition(pane) {
+  const scroller = pane.querySelector(".cm-scroller") || pane;
+  return { scroller, top: scroller.scrollTop, left: scroller.scrollLeft };
+}
+
+function pinPaneScroll(pane, position = null) {
+  // Replace an older guard instead of stacking scroll listeners and timers when
+  // several marks are clicked quickly in the same large virtual document.
+  paneScrollPins.get(pane)?.();
+  const current = paneScrollPosition(pane);
+  const { scroller } = current;
+  // A CodeMirror mousedown may already have scrolled by the time the click
+  // handler runs. Prefer the capture-phase position recorded before CodeMirror
+  // saw that mousedown; keyboard and synthetic clicks use the current position.
+  const top = position?.scroller === scroller ? position.top : current.top;
+  const left = position?.scroller === scroller ? position.left : current.left;
+  let restoring = false;
+  let pinned = true;
+  const directScrollEvents = ["wheel", "touchstart", "pointerdown", "keydown"];
+  const release = () => {
+    if (!pinned) return;
+    pinned = false;
+    scroller.removeEventListener("scroll", restore);
+    for (const eventName of directScrollEvents) {
+      scroller.removeEventListener(eventName, release);
+    }
+    for (const eventName of ["pointerdown", "click", "keydown"]) {
+      document.removeEventListener(eventName, release, true);
+    }
+    if (paneScrollPins.get(pane) === release) paneScrollPins.delete(pane);
+  };
+  paneScrollPins.set(pane, release);
+  const restore = () => {
+    if (!pinned || restoring) return;
+    restoring = true;
+    if (scroller.scrollTop !== top) scroller.scrollTop = top;
+    if (scroller.scrollLeft !== left) scroller.scrollLeft = left;
+    restoring = false;
+  };
+  // CodeMirror may defer revealing its new selection until a later animation
+  // frame. Timed restores eventually put the pane back, but the intermediate
+  // position can still be painted as a visible jump. A scroll listener reverses
+  // that deferred movement in the same scroll-delivery cycle, before paint.
+  scroller.addEventListener("scroll", restore);
+  // Large virtual documents can finish measuring well after the click. Keep
+  // guarding against those delayed programmatic reveals, but release before a
+  // new intentional user gesture so this never makes Mixed feel scroll-locked.
+  for (const eventName of directScrollEvents) {
+    scroller.addEventListener(eventName, release, { once: true, passive: true });
+  }
+  // The current gesture reached this function from the pane's bubbling click,
+  // after document capture has already run. These capture listeners therefore
+  // release only for the *next* action, including a click in another pane.
+  for (const eventName of ["pointerdown", "click", "keydown"]) {
+    document.addEventListener(eventName, release, { capture: true, once: true });
+  }
+  restore();
+  requestAnimationFrame(() => {
+    restore();
+    requestAnimationFrame(restore);
+  });
+  for (const delay of [0, 30, 80, 160, 260, 500, 900, 1400, 2200, 3200, 4400]) {
+    setTimeout(restore, delay);
+  }
+  setTimeout(release, SOURCE_PANE_SCROLL_GUARD_MS);
+}
 
 function focusScrollIntoView(element, block = "center") {
   if (!element) return;
+  supersedePaneScrollPreservation();
   let container = element.parentElement;
   while (container && container !== document.body) {
     const overflowY = getComputedStyle(container).overflowY;
@@ -2044,6 +2675,8 @@ function focusScrollIntoView(element, block = "center") {
   let target;
   if (block === "start") {
     target = elementTop;
+  } else if (block === "end") {
+    target = elementBottom - container.clientHeight;
   } else if (block === "nearest") {
     if (elementTop < start) {
       target = elementTop;
@@ -2060,8 +2693,16 @@ function focusScrollIntoView(element, block = "center") {
 
   const previousAnimation = focusScrollAnimations.get(container);
   if (previousAnimation) cancelAnimationFrame(previousAnimation);
-  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  // A long animated jump can briefly park a section header at the bottom edge
+  // while all of its content remains below the viewport. That looks exactly
+  // like an empty Output pane. Land long cross-document jumps immediately;
+  // animation is useful only when the destination is already nearby.
+  if (
+    Math.abs(target - start) > container.clientHeight
+    || window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  ) {
     container.scrollTop = target;
+    focusScrollAnimations.delete(container);
     return;
   }
 
@@ -2115,7 +2756,15 @@ function focusedFragmentEntry(entry, indices) {
 // selects which of them is focused; clicking elsewhere in the entry focuses the
 // change as a whole.
 function clickedPartKind(event) {
-  const part = event?.target?.closest?.("del, ins");
+  const storedPart = event?.currentTarget?.dataset?.mixedPartKind;
+  if (storedPart) {
+    delete event.currentTarget.dataset.mixedPartKind;
+    return storedPart;
+  }
+  if (event?.mixedPartKind) return event.mixedPartKind;
+  const part = event?.composedPath?.().find(node => (
+    node?.tagName === "DEL" || node?.tagName === "INS"
+  )) || event?.target?.closest?.("del, ins");
   if (!part) return null;
   return part.tagName === "DEL" ? "removed" : "added";
 }
@@ -2134,15 +2783,163 @@ function applyMixedFocus(targets) {
     void target.offsetWidth;
     target.classList.add("fragment-focus", "flash");
   }
-  focusScrollIntoView(targets[0]);
+  focusScrollIntoView(targets[0], "start");
+}
+
+function applyMixedCodeMirrorRanges(
+  ranges,
+  preferredRange = null,
+  scrollIntoRange = true,
+) {
+  if (!mixedCodeMirrorModel || !ranges.length) return false;
+  const range = preferredRange || ranges[0];
+  const focusedRanges = new Set(ranges);
+  const focusChanged = mixedCodeMirrorModel.marks.some(
+    mark => Boolean(mark.focused) !== focusedRanges.has(mark),
+  );
+  mixedCodeMirrorModel.marks.forEach(mark => {
+    mark.focused = focusedRanges.has(mark);
+  });
+  if (!mixedCodeMirrorView) return true;
+  const scrollTop = mixedCodeMirrorView.scrollDOM.scrollTop;
+  if (focusChanged) {
+    // Swap decorations in place (see reconfigureMixedDecorations); a full
+    // setState here would reset height measurements and jerk the scroll.
+    if (!reconfigureMixedDecorations()) {
+      const selection = mixedCodeMirrorView.state.selection;
+      mixedCodeMirrorView.setState(
+        mixedCodeMirrorState(mixedCodeMirrorApi, mixedCodeMirrorModel, selection),
+      );
+    }
+    mixedCodeMirrorView.scrollDOM.scrollTop = scrollTop;
+  } else {
+    // Restart the visible pulse without rebuilding the enormous virtual
+    // document when the user clicks the same timeline phase again.
+    mixedCodeMirrorView.dom.querySelectorAll(".fragment-focus.flash").forEach(node => {
+      node.classList.remove("flash");
+      void node.offsetWidth;
+      node.classList.add("flash");
+    });
+  }
+  if (scrollIntoRange) {
+    supersedePaneScrollPreservation();
+    mixedCodeMirrorView.dispatch({
+      // The decoration already highlights the complete change. Selecting a
+      // potentially huge range makes CodeMirror reveal its far end, which may
+      // be nowhere near the mark the timeline item is meant to lead to.
+      selection: { anchor: range.start },
+      effects: mixedCodeMirrorApi.EditorView.scrollIntoView(
+        range.start,
+        { y: "start" },
+      ),
+    });
+    mixedCodeMirrorView.focus();
+  } else {
+    // CodeMirror measures its virtual viewport after setState. Reapply the
+    // captured position after that measurement so a click on a visible mark
+    // cannot be nudged by the refreshed decorations.
+    const focusedView = mixedCodeMirrorView;
+    const restoreScroll = () => {
+      if (mixedCodeMirrorView === focusedView) {
+        focusedView.scrollDOM.scrollTop = scrollTop;
+      }
+    };
+    window.requestAnimationFrame(() => {
+      restoreScroll();
+      // A click inside CodeMirror may queue its own selection measurement
+      // during the same frame. Restore once more after that measurement.
+      window.requestAnimationFrame(restoreScroll);
+    });
+    window.setTimeout(restoreScroll, 50);
+  }
+  return true;
+}
+
+function focusMixedCodeMirror(
+  entryKey,
+  fragmentIndices = null,
+  part = null,
+  scrollIntoRange = true,
+) {
+  if (!mixedCodeMirrorView || !mixedCodeMirrorModel) return false;
+  const ranges = mixedCodeMirrorModel.marks.filter(mark => (
+    (
+      mark.attributes["data-update-entry"] === entryKey
+      || mark.attributes["data-added-entry"] === entryKey
+    )
+    && (
+      !fragmentIndices
+      || fragmentIndices.includes(Number(mark.attributes["data-output-fragment"]))
+    )
+    && (
+      !part
+      || mark.classes.includes(
+        part === "removed" ? "cm-mixed-removed" : "cm-mixed-added",
+      )
+    )
+  ));
+  return applyMixedCodeMirrorRanges(ranges, null, scrollIntoRange);
+}
+
+function focusMixedCodeMirrorEntries(entryKeys, preferredEntryKey = null) {
+  if (!mixedCodeMirrorModel) return false;
+  const keys = new Set(entryKeys);
+  const ranges = mixedCodeMirrorModel.marks.filter(
+    mark => keys.has(mark.attributes["data-update-entry"]),
+  );
+  const preferred = preferredEntryKey
+    ? ranges.find(mark => mark.attributes["data-update-entry"] === preferredEntryKey)
+    : null;
+  return applyMixedCodeMirrorRanges(ranges, preferred);
+}
+
+function focusMixedCodeMirrorScope(scope) {
+  if (!mixedCodeMirrorModel) return false;
+  return applyMixedCodeMirrorRanges(mixedCodeMirrorModel.marks.filter(
+    mark => mark.attributes["data-state-scope"] === scope,
+  ));
+}
+
+function focusMixedCodeMirrorCheckpointOrigin(
+  callId,
+  scope,
+  scrollIntoRange = true,
+) {
+  if (!mixedCodeMirrorModel) return false;
+  return applyMixedCodeMirrorRanges(mixedCodeMirrorModel.marks.filter(mark => (
+    mark.attributes["data-checkpoint-call"] === String(callId)
+    && mark.attributes["data-checkpoint-scope"] === scope
+  )), null, scrollIntoRange);
+}
+
+function clearMixedCodeMirrorFocus(render = true) {
+  if (!mixedCodeMirrorModel) return;
+  if (!mixedCodeMirrorModel.marks.some(mark => mark.focused)) return;
+  mixedCodeMirrorModel.marks.forEach(mark => {
+    mark.focused = false;
+  });
+  if (!render || !mixedCodeMirrorView) return;
+  const scrollTop = mixedCodeMirrorView.scrollDOM.scrollTop;
+  // Clear the focus decorations in place; a full setState would reset height
+  // measurements and jerk the scroll (see reconfigureMixedDecorations).
+  if (!reconfigureMixedDecorations()) {
+    const selection = mixedCodeMirrorView.state.selection;
+    mixedCodeMirrorView.setState(
+      mixedCodeMirrorState(mixedCodeMirrorApi, mixedCodeMirrorModel, selection),
+    );
+  }
+  mixedCodeMirrorView.scrollDOM.scrollTop = scrollTop;
 }
 
 function focusMixedFragments(indices, entry, part = null) {
+  focusMixedCodeMirror(entry.entryKey, indices, part);
   const targets = indices.flatMap(index => (
     [...$("mixed").querySelectorAll(
       `[data-update-entry="${entry.entryKey}"][data-output-fragment="${index}"]`,
     )]
-  )).filter(node => partMatches(node, part));
+  )).filter(node => (
+    node.classList.contains("mixed-history-value") || partMatches(node, part)
+  ));
   applyMixedFocus(targets);
 }
 
@@ -2151,9 +2948,12 @@ function focusMixedEntry(entry, part = null) {
     focusMixedFragments(entry.fragments.map((_, index) => index), entry, part);
     return;
   }
+  focusMixedCodeMirror(entry.entryKey, null, part);
   const targets = [
     ...$("mixed").querySelectorAll(`[data-update-entry="${entry.entryKey}"]`),
-  ].filter(node => partMatches(node, part));
+  ].filter(node => (
+    node.classList.contains("mixed-history-value") || partMatches(node, part)
+  ));
   applyMixedFocus(targets);
 }
 
@@ -2165,6 +2965,7 @@ function focusCheckpointScope(scope) {
     activateTab("state");
   }
   renderExact();
+  focusMixedCodeMirrorScope(scope);
   for (const pane of [$("mixed"), $("exact")]) {
     pane.querySelectorAll(".checkpoint-pane-focus").forEach(node => {
       node.classList.remove("checkpoint-pane-focus");
@@ -2188,9 +2989,34 @@ function timelineEventFor(callId, phase) {
     : document.querySelector(`.timeline-input[data-key="${key}"]`);
 }
 
+// Follow tracks the final *visible timeline event*, not merely the final call.
+// A call can contribute both an input and a later output, and overlapping calls
+// can make an older call's output the newest event. Passing the actual event
+// element also preserves its phase; without it selectItem defaults to input.
+function latestTimelineEvent(items = state.timelineItems) {
+  const events = timelinePhaseEvents(items).sort(compareTimelineEvents);
+  return events.at(-1) || null;
+}
+
+function followLatestTimelineEvent(focusSelection = true) {
+  const latest = latestTimelineEvent();
+  if (!latest) return null;
+  const element = timelineEventFor(latest.item.id, latest.phase);
+  return selectItem(
+    latest.item.type,
+    latest.item.id,
+    element,
+    true,
+    focusSelection,
+    "follow",
+  );
+}
+
 async function selectPhaseFromCard(card) {
-  const id = Number(card.dataset.id);
-  await selectItem("call", id, timelineEventFor(id, card.dataset.phase), true);
+  const id = parseItemId(card.dataset.id);
+  await selectItem(
+    "call", id, timelineEventFor(id, card.dataset.phase), true, true, "updates",
+  );
 }
 
 // Entries, fragments, and checkpoint sections carry a more specific target, so
@@ -2220,7 +3046,7 @@ async function loadUpdateCard(card) {
   card.dataset.loading = "true";
   let detail;
   try {
-    detail = await detailFor(card.dataset.type, Number(card.dataset.id));
+    detail = await detailFor(card.dataset.type, parseItemId(card.dataset.id));
     await resolveOutputParentRequestIdentity(detail);
   } catch (error) {
     delete card.dataset.loading;
@@ -2264,19 +3090,24 @@ async function loadUpdateCard(card) {
   ));
   card.classList.remove("loading");
   card.classList.toggle("checkpoint", checkpoint);
+  // Timeline and Updates must agree immediately. A live call has no parent diff
+  // yet and Updates renders it as a new current state, so its input phase carries
+  // the same checkpoint label before output/storage finishes.
+  const timelineCheckpoint = checkpoint;
   const timelineItem = document.querySelector(
     `.timeline-item[data-key="call:${detail.id}"]`,
   );
   const timelineKey = `call:${detail.id}`;
-  if (checkpoint) {
+  if (timelineCheckpoint) {
     state.checkpointKeys.add(timelineKey);
   } else {
     state.checkpointKeys.delete(timelineKey);
   }
-  timelineItem?.classList.toggle("checkpoint-call", checkpoint);
-  const timelineLabel = timelineItem?.querySelector(".item-label");
-  if (timelineLabel) {
-    timelineLabel.textContent = checkpoint ? "→ new state input" : "→ input";
+  timelineItem?.classList.toggle("checkpoint-call", timelineCheckpoint);
+  const timelinePhase = timelineItem?.querySelector(".item-phase")
+    || timelineItem?.querySelector(".item-label");
+  if (timelinePhase) {
+    timelinePhase.textContent = timelineCheckpoint ? "→ new state input" : "→ input";
   }
   if (checkpoint) {
     const input = requestContent(detail.request);
@@ -2380,6 +3211,14 @@ async function loadUpdateCard(card) {
       ${phase === "output" ? notice : ""}
       ${entriesHtml || notice ? "" : '<div class="no-update">No textual update</div>'}
     </div>`;
+  card.querySelectorAll("del, ins").forEach(part => {
+    part.addEventListener("click", event => {
+      const kind = part.tagName === "DEL" ? "removed" : "added";
+      event.mixedPartKind = kind;
+      const owner = part.closest(".fragment-change, .update-jump");
+      if (owner) owner.dataset.mixedPartKind = kind;
+    }, { capture: true });
+  });
   card.querySelectorAll(".update-jump").forEach(button => {
     const openUpdate = async event => {
       if (hasTextSelectionWithin(button)) return;
@@ -2389,10 +3228,20 @@ async function loadUpdateCard(card) {
         "call", detail.id, timelineEventFor(detail.id, phase), true, false,
       );
       activateTab("state");
+      // The clicked jump is the focused entry now: light it (and only it) in the
+      // Updates pane. No scroll — this pane is the one the user clicked in.
+      clearUpdateEntryFocus();
+      card.classList.add("active");
+      button.classList.add("timeline-update-focus", "timeline-update-flash");
       // Removed text is absent from Exact State by definition, so a click on
       // the removed half must not flash the present half there instead.
       renderExact(part === "removed" ? null : entry);
       focusMixedEntry(entry, part);
+      window.setTimeout(() => {
+        if (Number(state.detail?.id) === Number(detail.id)) {
+          focusMixedEntry(entry, part);
+        }
+      }, 0);
     };
     button.onclick = openUpdate;
     button.onkeydown = event => {
@@ -2419,6 +3268,11 @@ async function loadUpdateCard(card) {
       activateTab("state");
       renderExact(part === "removed" ? null : focusedEntry);
       focusMixedFragments(indices, entry, part);
+      window.setTimeout(() => {
+        if (Number(state.detail?.id) === Number(detail.id)) {
+          focusMixedFragments(indices, entry, part);
+        }
+      }, 0);
       card.querySelectorAll(".fragment-change.active").forEach(node => {
         node.classList.remove("active");
       });
@@ -2435,15 +3289,49 @@ async function loadUpdateCard(card) {
   keepFollowedUpdateVisible();
 }
 
+// Mixed is one complete reconstructed document. Load every call back to the
+// checkpoint automatically; batches cap request concurrency without exposing a
+// pagination control or omitting any history.
+async function mixedDetailsThroughCheckpoint(startIndex, selectedDetail) {
+  const candidates = [];
+  let cursor = startIndex;
+  while (cursor >= 0) {
+    const item = state.timelineItems[cursor];
+    if (item.type === "call") {
+      candidates.push(item);
+      if (state.checkpointKeys.has(itemKey(item))) break;
+    }
+    cursor -= 1;
+  }
+  const details = [];
+  const batchSize = 48;
+  for (let offset = 0; offset < candidates.length; offset += batchSize) {
+    const batch = candidates.slice(offset, offset + batchSize);
+    const loaded = await Promise.all(batch.map(item => (
+      Number(item.id) === Number(selectedDetail?.id)
+        ? selectedDetail
+        : detailFor(item.type, item.id)
+    )));
+    for (const detail of loaded) {
+      details.unshift(detail);
+      if (isCheckpoint(detail)) return details;
+    }
+  }
+  return details;
+}
+
 async function loadMixedSegment(type, id, selectionVersion = null) {
   const selectionIsCurrent = () => (
     selectionVersion == null || selectionVersion === state.selectionVersion
   );
   const selectedDetail = state.detail;
-  if (type !== "call") {
+  state.mixedHistoryLoading = false;
+  // A live (in-flight) call has no stored history to diff against; render it as a
+  // single-item segment so Mixed shows its input as the current state.
+  if (type !== "call" || isLiveId(id)) {
     if (selectionIsCurrent()) {
       state.mixedSegmentDetails = selectedDetail ? [selectedDetail] : [];
-      state.mixedHistoryTruncated = false;
+      state.mixedHistoryComplete = true;
     }
     return selectionIsCurrent();
   }
@@ -2453,89 +3341,282 @@ async function loadMixedSegment(type, id, selectionVersion = null) {
   if (selectedIndex < 0) {
     if (selectionIsCurrent()) {
       state.mixedSegmentDetails = selectedDetail ? [selectedDetail] : [];
-      state.mixedHistoryTruncated = false;
+      state.mixedHistoryComplete = true;
     }
     return selectionIsCurrent();
   }
-  const details = [];
-  // The walk back to the checkpoint is sequential, but its fetches need not be:
-  // one round trip per call made selecting a long segment take most of a second,
-  // which is the window in which a second click cancels the first.
-  const WINDOW = 12;
-  let index = selectedIndex;
-  let reachedCheckpoint = false;
-  while (
-    index >= 0
-    && !reachedCheckpoint
-    && details.length < FRONTEND_CONFIG.mixedTrace.maxCalls
-  ) {
-    const windowStart = Math.max(index - WINDOW + 1, 0);
-    const warming = [];
-    for (let at = index; at >= windowStart; at -= 1) {
-      const item = state.timelineItems[at];
-      if (item.type === "call" && Number(item.id) !== Number(id)) {
-        warming.push(detailFor(item.type, item.id).catch(() => null));
-      }
-    }
-    await Promise.all(warming);
+  state.mixedHistoryLoading = true;
+  try {
+    const details = await mixedDetailsThroughCheckpoint(selectedIndex, selectedDetail);
     if (!selectionIsCurrent()) return false;
-    for (
-      ;
-      index >= windowStart
-        && details.length < FRONTEND_CONFIG.mixedTrace.maxCalls;
-      index -= 1
-    ) {
-      const item = state.timelineItems[index];
-      if (item.type !== "call") continue;
-      const detail = Number(item.id) === Number(id)
-        ? selectedDetail
-        : await detailFor(item.type, item.id);
-      if (!selectionIsCurrent()) return false;
-      details.unshift(detail);
-      if (isCheckpoint(detail)) {
-        reachedCheckpoint = true;
-        break;
-      }
-    }
+    state.mixedSegmentDetails = details;
+    state.mixedHistoryComplete = true;
+    return true;
+  } finally {
+    if (selectionIsCurrent()) state.mixedHistoryLoading = false;
   }
-  if (!selectionIsCurrent()) return false;
-  state.mixedSegmentDetails = details;
-  state.mixedHistoryTruncated = !reachedCheckpoint && index >= 0;
+}
+
+let mixedCodeMirrorRuntime = null;
+let mixedCodeMirrorApi = null;
+const mixedCodeMirrorViews = new Set();
+let mixedCodeMirrorView = null;
+let mixedCodeMirrorGeneration = 0;
+let mixedCodeMirrorModel = null;
+
+function loadMixedCodeMirror() {
+  if (!mixedCodeMirrorRuntime) {
+    mixedCodeMirrorRuntime = Promise.all([
+      import("https://esm.sh/@codemirror/state@6"),
+      import("https://esm.sh/@codemirror/view@6"),
+    ]).then(([stateModule, viewModule]) => {
+      mixedCodeMirrorApi = { ...stateModule, ...viewModule };
+      return mixedCodeMirrorApi;
+    });
+  }
+  return mixedCodeMirrorRuntime;
+}
+
+function mixedCodeMirrorDocument(html) {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  let text = "";
+  const marks = [];
+  const visit = (node, inheritedScope = null) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      text += node.nodeValue;
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      node.childNodes.forEach(child => visit(child, inheritedScope));
+      return;
+    }
+    const scope = node.dataset.stateScope || inheritedScope;
+    const start = text.length;
+    node.childNodes.forEach(child => visit(child, scope));
+    const end = text.length;
+    if (start === end) return;
+    const classes = [];
+    if (node.tagName === "INS") {
+      classes.push("cm-mixed-added", ...node.classList);
+    }
+    if (node.tagName === "DEL") {
+      classes.push("cm-mixed-removed", ...node.classList);
+    }
+    if (node.classList.contains("change-arrow")) classes.push("cm-mixed-arrow");
+    if (node.dataset.stateScope) {
+      classes.push("cm-mixed-scope", `cm-mixed-scope-${node.dataset.stateScope}`);
+    }
+    if (node.dataset.checkpointCall) {
+      classes.push("cm-mixed-checkpoint-origin");
+    }
+    const attributes = {};
+    if (node.dataset.updateEntry) {
+      attributes["data-update-entry"] = node.dataset.updateEntry;
+      classes.push("cm-mixed-update");
+    }
+    if (node.dataset.addedEntry) {
+      attributes["data-added-entry"] = node.dataset.addedEntry;
+      classes.push("cm-mixed-added-origin");
+    }
+    if (node.dataset.addedCall) {
+      attributes["data-added-call"] = node.dataset.addedCall;
+      classes.push("cm-mixed-added-origin");
+    }
+    if (node.dataset.outputFragment != null) {
+      attributes["data-output-fragment"] = node.dataset.outputFragment;
+    }
+    if (node.dataset.stateScope) {
+      attributes["data-state-scope"] = node.dataset.stateScope;
+    }
+    if (node.dataset.checkpointCall) {
+      attributes["data-checkpoint-call"] = node.dataset.checkpointCall;
+    }
+    if (node.dataset.checkpointScope) {
+      attributes["data-checkpoint-scope"] = node.dataset.checkpointScope;
+    }
+    if (classes.length) {
+      marks.push({ start, end, classes, attributes, scope });
+    }
+  };
+  template.content.childNodes.forEach(visit);
+  return { text, marks };
+}
+
+async function mountMixedCodeMirror(
+  parent,
+  model,
+  generation,
+  initialScroll = 0,
+) {
+  const runtime = await loadMixedCodeMirror();
+  if (!parent.isConnected || generation !== mixedCodeMirrorGeneration) return null;
+  const editorState = mixedCodeMirrorState(runtime, model);
+  parent.textContent = "";
+  const view = new runtime.EditorView({ state: editorState, parent });
+  parent._codeMirrorView = view;
+  mixedCodeMirrorViews.add(view);
+  mixedCodeMirrorView = view;
+  view.scrollDOM.scrollTop = initialScroll;
+  return view;
+}
+
+// A single stable compartment lets a focus change swap only the decoration
+// facet through `dispatch`, instead of recreating the whole EditorState with
+// `setState`. Recreating the state discards CodeMirror's measured line heights
+// for this (often enormous, virtualized) document, so its next measure pass
+// re-anchors the viewport and visibly jerks the scroll before any restore can
+// catch it. A compartment reconfigure keeps the measurements and the scroll.
+let mixedDecorationsCompartment = null;
+function mixedGetDecorationsCompartment(runtime) {
+  if (!mixedDecorationsCompartment) {
+    mixedDecorationsCompartment = new runtime.Compartment();
+  }
+  return mixedDecorationsCompartment;
+}
+
+function buildMixedDecorations(runtime, model) {
+  const { Decoration } = runtime;
+  return Decoration.set(model.marks.map(mark => (
+    Decoration.mark({
+      class: `${mark.classes.join(" ")}${
+        mark.focused
+          ? mark.attributes["data-state-scope"]
+            ? ` checkpoint-pane-focus flash trace-kind-${mark.attributes["data-state-scope"]}`
+            : " fragment-focus flash"
+          : ""
+      }`,
+      attributes: mark.attributes,
+      tagName: mark.classes.includes("cm-mixed-removed")
+        ? "del"
+        : mark.classes.includes("cm-mixed-added") ? "ins" : "span",
+    }).range(mark.start, mark.end)
+  )), true);
+}
+
+// Swap only the focus decorations on the live view without recreating its
+// state, preserving measured heights and scroll. Returns false if there is no
+// view to update (callers then fall back to a full state build).
+function reconfigureMixedDecorations() {
+  if (!mixedCodeMirrorView || !mixedCodeMirrorApi || !mixedCodeMirrorModel) {
+    return false;
+  }
+  const compartment = mixedGetDecorationsCompartment(mixedCodeMirrorApi);
+  mixedCodeMirrorView.dispatch({
+    effects: compartment.reconfigure(
+      mixedCodeMirrorApi.EditorView.decorations.of(
+        buildMixedDecorations(mixedCodeMirrorApi, mixedCodeMirrorModel),
+      ),
+    ),
+  });
   return true;
 }
 
-function boundedHistoricalEntries(segment) {
-  const entries = [];
-  let chars = 0;
-  let omitted = false;
-  // Keep the most recent history first. Older changes are useful only while
-  // their retained text stays inside the render budget.
-  for (let index = segment.length - 2; index >= 0; index -= 1) {
-    const detail = segment[index];
-    if (isCheckpoint(detail)) continue;
-    for (const entry of updateEntries(detail)) {
-      const cost = [
-        entry.text,
-        entry.oldText,
-        entry.newText,
-        entry.mixedOldText,
-      ].reduce((total, value) => total + String(value || "").length, 0);
-      if (
-        chars + cost > FRONTEND_CONFIG.mixedTrace.maxHistoricalChars
-      ) {
-        omitted = true;
-        continue;
-      }
-      chars += cost;
-      entries.push({ ...entry, fromEarlierCall: true });
-    }
-  }
-  return { entries, omitted };
+function mixedCodeMirrorState(runtime, model, selection = undefined) {
+  const {
+    EditorState,
+    EditorView,
+  } = runtime;
+  const compartment = mixedGetDecorationsCompartment(runtime);
+  return EditorState.create({
+    doc: model.text,
+    selection,
+    extensions: [
+      EditorState.readOnly.of(true),
+      EditorView.editable.of(false),
+      EditorView.lineWrapping,
+      compartment.of(EditorView.decorations.of(buildMixedDecorations(runtime, model))),
+      EditorView.theme({
+        "&": {
+          height: "100%",
+          color: "#dbe5df",
+          backgroundColor: "#17201d",
+          fontSize: "10px",
+        },
+        ".cm-scroller": {
+          overflow: "auto",
+          fontFamily: 'ui-monospace, "SFMono-Regular", "DejaVu Sans Mono", "Liberation Mono", Consolas, monospace',
+          lineHeight: "1.5",
+        },
+        ".cm-content": { padding: "10px" },
+        ".cm-gutters": { display: "none" },
+        ".cm-mixed-added": {
+          color: "#bff3d3",
+          backgroundColor: "rgba(38, 119, 76, .48)",
+          textDecoration: "none",
+          borderBottom: "1px solid #59c98a",
+        },
+        ".cm-mixed-removed": {
+          color: "#ffd0cc",
+          backgroundColor: "rgba(139, 55, 51, .5)",
+          textDecoration: "line-through",
+          borderBottom: "1px solid #e66f6a",
+        },
+        ".cm-mixed-arrow": {
+          color: "#d0a550",
+          fontWeight: "700",
+          textDecoration: "none",
+        },
+        // A removed part that is also linked to where it was added: keep the red
+        // strike-through (removal) and add a green underline (addition origin), so
+        // the two references are visually distinct on the one struck element.
+        ".cm-mixed-added-origin": {
+          borderBottom: "2px solid #59c98a",
+          cursor: "pointer",
+        },
+        ".cm-mixed-scope": {
+          borderLeft: "2px solid rgba(137, 183, 166, .42)",
+        },
+        ".cm-mixed-update": {
+          cursor: "pointer",
+        },
+        ".cm-mixed-checkpoint-origin": {
+          cursor: "pointer",
+        },
+        ".cm-mixed-update:hover": {
+          outline: "1px solid #fff0a6",
+          outlineOffset: "-1px",
+        },
+        ".cm-search-match": {
+          color: "#18201d",
+          backgroundColor: "#f4d96b",
+          borderRadius: "2px",
+          boxShadow: "inset 0 -1px #b98d18",
+        },
+        ".cm-search-match-selected": {
+          backgroundColor: "#ffb84d",
+          outline: "2px solid #fff3ba",
+          outlineOffset: "1px",
+        },
+        "&.cm-focused": { outline: "2px solid #5d9c86" },
+      }),
+    ],
+  });
+}
+
+function destroyMixedCodeMirrorViews() {
+  mixedCodeMirrorGeneration += 1;
+  mixedCodeMirrorViews.forEach(view => view.destroy());
+  mixedCodeMirrorViews.clear();
+  mixedCodeMirrorView = null;
+  mixedCodeMirrorModel = null;
 }
 
 function renderMixed(previousDetail = null) {
   if (!state.detail) return;
-  const previousScroll = $("mixed").scrollTop;
+  // Bound "where added" origin resolution for this render. Its cost is
+  // distinct-removed-texts x segment-details x substring-scans, which on a deep
+  // segment of large states would otherwise run for many seconds and freeze the
+  // page. When the budget is spent, remaining removed parts simply get no
+  // underline — the trace still renders.
+  mixedOriginScanBudget = MIXED_ORIGIN_SCAN_BUDGET;
+  const previousScroll = mixedCodeMirrorView?.scrollDOM.scrollTop || 0;
+  const reusableView = mixedCodeMirrorView && mixedCodeMirrorApi
+    ? mixedCodeMirrorView
+    : null;
+  if (!reusableView) destroyMixedCodeMirrorViews();
+  const generation = mixedCodeMirrorGeneration;
+  $("mixed").classList.remove("codemirror-fallback");
   const preserveScroll = requestsAreSimilar(previousDetail, state.detail);
   const checkpoint = isCheckpoint(state.detail);
   const identicalTo = identicalBaseCall(state.detail);
@@ -2544,12 +3625,25 @@ function renderMixed(previousDetail = null) {
     ? state.mixedSegmentDetails
     : [state.detail];
   const selectedEntries = checkpoint ? [] : updateEntries(state.detail);
-  const historical = checkpoint
-    ? { entries: [], omitted: false }
-    : boundedHistoricalEntries(segment);
+  const historicalEntries = checkpoint
+    ? []
+    : segment.slice(0, -1).flatMap(
+        detail => isCheckpoint(detail)
+          ? []
+          : updateEntries(detail).map(entry => ({
+              ...entry,
+              fromEarlierCall: true,
+            })),
+      );
   const entries = checkpoint
     ? []
-    : [...selectedEntries, ...historical.entries];
+    : [...selectedEntries, ...historicalEntries];
+  const inheritedCheckpoint = checkpoint
+    ? null
+    : segment.find(detail => isCheckpoint(detail)) || null;
+  const checkpointAttributes = scope => scopeIsInherited(
+    state.detail, scope, selectedEntries,
+  ) ? checkpointOriginAttributes(inheritedCheckpoint, scope) : "";
   const parts = stateDisplayParts(state.detail);
   const parameterEntries = entries.filter(entry => entry.category === "parameter");
   const inputEntries = entries.filter(
@@ -2562,41 +3656,64 @@ function renderMixed(previousDetail = null) {
     entries.filter(entry => entry.scope === "thoughts"),
   );
   const parameterHtml = mixedStateHtml(parts.parameterText, parameterEntries);
-  const contentHtml = inputContentHtml(
-    state.detail,
-    mixedStateHtml(parts.contentText, inputEntries, parts.contentAnchors),
+  const contentHtml = mixedStateHtml(
+    parts.contentText,
+    inputEntries,
+    parts.contentAnchors,
   );
-  const inputHtml = stateScopeHtml(
-    "input",
-    `input:\n${stateScopeHtml("input-params", parameterHtml, true)}\n${contentHtml}`,
-  );
-  const outputHtml = stateScopeHtml(
-    "output",
-    checkpoint
-      ? escapeHtml(parts.outputText)
-      : mixedStateHtml(parts.outputText, outputEntries, parts.outputAnchors),
-  );
+  const inputHtml =
+    `<span class="checkpoint-origin" data-state-scope="input"${
+      checkpointAttributes("input")
+    }>input:\n` +
+    `<span class="checkpoint-origin" data-state-scope="input-params"${
+      checkpointAttributes("input-params")
+    }>${parameterHtml}</span>\n` +
+    `${contentHtml}</span>`;
+  const outputHtml =
+    `<span class="checkpoint-origin" data-state-scope="output"${
+      checkpointAttributes("output")
+    }>${
+      checkpoint
+        ? escapeHtml(parts.outputText)
+        : mixedStateHtml(parts.outputText, outputEntries, parts.outputAnchors)
+    }</span>`;
   const thoughtsHtml = state.detail.thoughts
-    ? stateScopeHtml(
-        "thoughts",
+    ? `<span class="checkpoint-origin" data-state-scope="thoughts"${
+        checkpointAttributes("thoughts")
+      }>${
         checkpoint
           ? escapeHtml(parts.thoughtsText)
-          : mixedStateHtml(parts.thoughtsText, thoughtsEntries, parts.thoughtsAnchors),
-      )
+          : mixedStateHtml(parts.thoughtsText, thoughtsEntries, parts.thoughtsAnchors)
+      }</span>`
     : "";
   $("mixed-status").textContent = checkpoint
     ? "◆ new current state"
     : identicalTo
       ? `↻ identical to call #${identicalTo}`
-      : `Δ ${entries.length} accumulated update${entries.length === 1 ? "" : "s"}${
-          state.mixedHistoryTruncated || historical.omitted
-            ? " · recent history only"
-            : ""
-        }`;
+      : `Δ ${entries.length} accumulated update${entries.length === 1 ? "" : "s"} · ${
+          segment.length
+        } calls`;
   $("mixed-status").className = checkpoint ? "mixed-legend checkpoint" : "mixed-legend delta";
   $("mixed").classList.remove("empty");
-  $("mixed").innerHTML = `${inputHtml}\n${thoughtsHtml}\n${outputHtml}`;
-  $("mixed").scrollTop = preserveScroll ? previousScroll : 0;
+  if (!reusableView) $("mixed").textContent = "Rendering complete Mixed trace…";
+  const model = mixedCodeMirrorDocument(`${inputHtml}\n${thoughtsHtml}\n${outputHtml}`);
+  mixedCodeMirrorModel = model;
+  if (reusableView) {
+    reusableView.setState(mixedCodeMirrorState(mixedCodeMirrorApi, model));
+    reusableView.scrollDOM.scrollTop = preserveScroll ? previousScroll : 0;
+    return;
+  }
+  mountMixedCodeMirror(
+    $("mixed"),
+    model,
+    generation,
+    preserveScroll ? previousScroll : 0,
+  ).catch(() => {
+    if (generation !== mixedCodeMirrorGeneration) return;
+    // Full data remains visible if CodeMirror cannot be fetched.
+    $("mixed").textContent = model.text;
+    $("mixed").classList.add("codemirror-fallback");
+  });
 }
 
 function activateTab(tab) {
@@ -2673,12 +3790,31 @@ function exactStateHtml(text, entries, focusEntry = null, anchors = null) {
   return html + escapeHtml(text.slice(cursor));
 }
 
+// The output/thoughts scope of an in-flight call, styled live (pulsing) while
+// streaming. `data-live-body` lets a delta patch the text without a full rebuild.
+function liveOutputScope(kind, bodyText, streaming) {
+  const label = kind === "thoughts" ? "Thoughts" : "Output";
+  return (
+    `<span class="state-scope trace-kind-${kind} live-output-scope${streaming ? "" : " ended"}" data-state-scope="${kind}">` +
+    `<span class="state-scope-label live-output-label">` +
+    `<span class="live-dot${streaming ? "" : " off"}"></span>${label}` +
+    (streaming ? ' <span class="live-status">streaming</span>' : "") +
+    `</span>` +
+    `<span class="state-scope-content live-output-body" data-live-body="${kind}">${escapeHtml(bodyText || "…")}</span>` +
+    `</span>`
+  );
+}
+
 function renderExact(focusEntry = null) {
   if (!state.detail) return;
   $("exact").classList.remove("empty");
   if (state.tab === "state") {
     const parts = stateDisplayParts(state.detail);
     const entries = isCheckpoint(state.detail) ? [] : updateEntries(state.detail);
+    const inheritedCheckpoint = inheritedCheckpointDetail();
+    const checkpointAttributes = scope => scopeIsInherited(
+      state.detail, scope, entries,
+    ) ? checkpointOriginAttributes(inheritedCheckpoint, scope) : "";
     const parameterHtml = exactStateHtml(
       parts.topParameterText,
       entries.filter(entry => entry.category === "parameter"),
@@ -2693,12 +3829,26 @@ function renderExact(focusEntry = null) {
         parts.contentAnchors,
       ),
     );
-    const outputHtml = exactStateHtml(
-      parts.outputText,
-      entries.filter(entry => entry.scope === "output"),
-      focusEntry,
-      parts.outputAnchors,
-    );
+    // On an empty-parse call (context-exceeded / cancelled) show the raw captured
+    // response verbatim with no diff marks, so the Output scope is never blank.
+    let outputHtml = parts.outputIsRaw
+      ? exactStateHtml(parts.rawOutputText, [])
+      : exactStateHtml(
+          parts.outputText,
+          entries.filter(entry => entry.scope === "output"),
+          focusEntry,
+          parts.outputAnchors,
+        );
+    if (
+      !parts.outputIsRaw
+      && !String(state.detail.response || "").trim()
+      && String(state.detail.thoughts || "").trim()
+    ) {
+      const reason = state.detail.status === "cancelled"
+        ? "No output content before cancellation."
+        : "No public output content; reasoning was captured in Thoughts.";
+      outputHtml = `<span class="empty-output-note">${escapeHtml(reason)}</span>`;
+    }
     const thoughtsHtml = state.detail.thoughts
       ? exactStateHtml(
           parts.thoughtsText,
@@ -2707,17 +3857,36 @@ function renderExact(focusEntry = null) {
           parts.thoughtsAnchors,
         )
       : "";
+    // An in-flight call shows its output/thoughts live-styled (and streaming from
+    // the synthetic detail); a stored call uses the normal diff-marked scopes.
+    const live = state.detail.live;
+    const streaming = state.detail.status === "streaming";
+    const thoughtsScopeHtml = live
+      ? (state.detail.thoughts ? liveOutputScope("thoughts", state.detail.thoughts, streaming) : "")
+      : (thoughtsHtml ? stateScopeHtml("thoughts", thoughtsHtml, false, checkpointAttributes("thoughts")) : "");
+    const outputScopeHtml = live
+      ? liveOutputScope("output", state.detail.response, streaming)
+      : stateScopeHtml(
+          "output",
+          outputHtml,
+          false,
+          checkpointAttributes("output"),
+          parts.outputIsRaw ? "raw · unparsed" : "",
+        );
     $("exact").innerHTML = `${
-      stateScopeHtml("input-params", parameterHtml)
+      stateScopeHtml(
+        "input-params",
+        parameterHtml,
+        false,
+        checkpointAttributes("input-params"),
+      )
     }\n${
-      stateScopeHtml("input", `input:\n${contentHtml}`)
-    }\n${
-      thoughtsHtml ? stateScopeHtml("thoughts", thoughtsHtml) : ""
-    }\n${stateScopeHtml("output", outputHtml)}`;
+      stateScopeHtml("input", `input:\n${contentHtml}`, false, checkpointAttributes("input"))
+    }\n${thoughtsScopeHtml}\n${outputScopeHtml}`;
     if (focusEntry) {
       requestAnimationFrame(() => {
         const target = $("exact").querySelector(".exact-focus");
-        focusScrollIntoView(target);
+        focusScrollIntoView(target, "start");
       });
     }
     return;
@@ -2757,6 +3926,9 @@ function renderExact(focusEntry = null) {
 // the rendered panes does not — so clearing here keeps this correct for every
 // caller, and a click on one phase never leaves the other phase's marks behind.
 function clearPaneFocus() {
+  // The next CodeMirror focus replaces the complete focused-range set, so it
+  // clears stale model marks itself. Clearing here would force an unnecessary
+  // intermediate rebuild and make repeated navigation race virtual layout.
   for (const pane of [$("mixed"), $("exact")]) {
     pane.querySelectorAll(
       ".fragment-focus, .exact-focus, .timeline-scope-focus, .checkpoint-pane-focus, .flash",
@@ -2772,10 +3944,11 @@ function clearPaneFocus() {
   }
 }
 
-function focusTimelineSelection(detail, preferredScope = "input") {
+function focusTimelineSelection(detail, preferredScope = "input", sourcePane = null) {
   clearPaneFocus();
   const panes = [$("mixed"), $("exact")];
   if (isCheckpoint(detail)) {
+    const mixedCodeMirrorFocused = focusMixedCodeMirrorScope(preferredScope);
     for (const pane of panes) {
       const targets = [...pane.querySelectorAll("[data-state-scope]")].filter(node => (
         preferredScope === "output"
@@ -2785,7 +3958,9 @@ function focusTimelineSelection(detail, preferredScope = "input") {
       targets.forEach(node => {
         node.classList.add("checkpoint-pane-focus");
       });
-      focusScrollIntoView(targets[0], "start");
+      if (pane.id !== sourcePane && (pane.id !== "mixed" || !mixedCodeMirrorFocused)) {
+        focusScrollIntoView(targets[0], "start");
+      }
     }
     return null;
   }
@@ -2800,6 +3975,12 @@ function focusTimelineSelection(detail, preferredScope = "input") {
   const primaryEntry = preferredScope === "output"
     ? scopedEntries.find(entry => entry.scope === "output") || scopedEntries[0] || null
     : scopedEntries[0] || null;
+  const mixedEntryFocused = focusMixedCodeMirrorEntries(
+    scopedEntries.map(entry => entry.entryKey),
+    primaryEntry?.entryKey || null,
+  );
+  const mixedCodeMirrorFocused = mixedEntryFocused
+    || focusMixedCodeMirrorScope(preferredScope);
   const entryPrefix = `${detail.id}:`;
   const mixedTargets = [...$("mixed").querySelectorAll("[data-update-entry]")].filter(
     node => (
@@ -2813,14 +3994,16 @@ function focusTimelineSelection(detail, preferredScope = "input") {
   const primaryMixedTarget = primaryEntry
     ? $("mixed").querySelector(`[data-update-entry="${primaryEntry.entryKey}"]`)
     : null;
-  if (primaryMixedTarget || mixedTargets[0]) {
-    focusScrollIntoView(primaryMixedTarget || mixedTargets[0]);
-  } else {
-    const scope = $("mixed").querySelector(
-      `[data-state-scope="${preferredScope}"]`,
-    );
-    scope?.classList.add("timeline-scope-focus", "flash");
-    focusScrollIntoView(scope, "start");
+  if (sourcePane !== "mixed" && !mixedCodeMirrorFocused) {
+    if (primaryMixedTarget || mixedTargets[0]) {
+      focusScrollIntoView(primaryMixedTarget || mixedTargets[0], "start");
+    } else {
+      const scope = $("mixed").querySelector(
+        `[data-state-scope="${preferredScope}"]`,
+      );
+      scope?.classList.add("timeline-scope-focus", "flash");
+      focusScrollIntoView(scope, "start");
+    }
   }
 
   const exactTargets = [...$("exact").querySelectorAll("[data-update-entry]")].filter(
@@ -2835,8 +4018,11 @@ function focusTimelineSelection(detail, preferredScope = "input") {
   const primaryExactTarget = primaryEntry
     ? $("exact").querySelector(`[data-update-entry="${primaryEntry.entryKey}"]`)
     : null;
-  if (primaryExactTarget) {
-    focusScrollIntoView(primaryExactTarget);
+  if (sourcePane === "exact") {
+    // A click inside Exact may update focus decoration, but it must never move
+    // the pane the user is currently reading.
+  } else if (primaryExactTarget) {
+    focusScrollIntoView(primaryExactTarget, "start");
   } else if (primaryEntry) {
     const stateScope = primaryEntry.category === "parameter"
       ? "input-params"
@@ -2856,7 +4042,12 @@ function focusTimelineSelection(detail, preferredScope = "input") {
   return primaryEntry?.entryKey || null;
 }
 
-function focusTimelineUpdateCard(card, entryKey = null, preferredScope = "input") {
+function focusTimelineUpdateCard(
+  card,
+  entryKey = null,
+  preferredScope = "input",
+  scrollIntoView = true,
+) {
   document.querySelectorAll(".timeline-update-focus, .timeline-update-flash").forEach(node => {
     node.classList.remove("timeline-update-focus", "timeline-update-flash");
   });
@@ -2867,10 +4058,6 @@ function focusTimelineUpdateCard(card, entryKey = null, preferredScope = "input"
   });
   if (!card) return;
   const isOutput = preferredScope === "output" || preferredScope === "thoughts";
-  const entryIndex = entryKey?.split(":").at(-1);
-  const primary = entryIndex == null
-    ? null
-    : card.querySelector(`.update-jump[data-update-index="${entryIndex}"]`);
   // A phase click focuses every change of that phase, not just the first: a call
   // that changed both its parameters and its prompt lights both. The entry's
   // data kind decides the phase it belongs to, so nested and sibling references
@@ -2894,17 +4081,17 @@ function focusTimelineUpdateCard(card, entryKey = null, preferredScope = "input"
   const marks = phaseUpdates.length
     ? phaseUpdates
     : [checkpointTarget || scopeTarget || card];
-  const scrollTarget = primary && marks.includes(primary) ? primary : marks[0];
   for (const mark of marks) {
     // Force a fresh animation frame so a second click on the same event pulses
     // the corresponding updates again.
     void mark.offsetWidth;
     mark.classList.add("timeline-update-focus", "timeline-update-flash");
   }
-  focusScrollIntoView(
-    scrollTarget,
-    phaseUpdates.length || checkpointTarget || scopeTarget ? "center" : "start",
-  );
+  // Selecting a call/phase reveals the whole update from its start: anchor the
+  // card's top (its "New current state / call #N" header) to the top of the
+  // pane. Centering a mark inside instead pushed that header off the top, so a
+  // tall card opened mid-content with no indication of which call it was.
+  if (scrollIntoView) focusScrollIntoView(card, "start");
 }
 
 function updateFragmentForIndex(button, fragmentIndex) {
@@ -2917,21 +4104,71 @@ function updateFragmentForIndex(button, fragmentIndex) {
   )) || null;
 }
 
-function markUpdateTarget(card, target, button = null) {
-  card.querySelectorAll(
-    ".update-jump.active, .fragment-change.active, .checkpoint-section.active, .update-back-focus",
+// Clear any prior update-entry focus across ALL cards, in BOTH styles — the
+// mark-click style (.active/.update-back-focus) and the timeline/scope-click
+// style (.timeline-update-focus/.flash). Clearing only within one card, or only
+// one style, leaves the previous entry (often a different scope) still lit — the
+// "second click focuses the wrong item" in the Updates pane.
+function clearUpdateEntryFocus() {
+  document.querySelectorAll(
+    ".update-jump.active, .fragment-change.active, .checkpoint-section.active, "
+    + ".update-back-focus, .timeline-update-focus, .timeline-update-flash",
   ).forEach(node => {
-    node.classList.remove("active", "update-back-focus");
+    node.classList.remove(
+      "active", "update-back-focus", "timeline-update-focus", "timeline-update-flash",
+    );
   });
+}
+
+function markUpdateTarget(card, target, button = null) {
+  clearUpdateEntryFocus();
   card.classList.add("active");
   button?.classList.add("active");
   target.classList.add("active", "update-back-focus");
-  focusScrollIntoView(target);
+  focusScrollIntoView(target, "start");
   window.setTimeout(() => target.classList.remove("update-back-focus"), 1600);
 }
 
-function focusStateUpdateEntry(entryKey, fragmentIndex = null) {
+// A removed part with a known origin shows two decorations: a strike-through
+// (its removal) and a green underline at the baseline (where it was added). A
+// click in the lower band — where the underline sits, clear of the strike line —
+// follows the addition; anywhere else on the struck text focuses the removal.
+function pointsAtAddedUnderline(event, element) {
+  if (!element || !Number.isFinite(event?.clientY)) return false;
+  const rect = [...element.getClientRects()].find(candidate => (
+    event.clientX >= candidate.left && event.clientX <= candidate.right
+    && event.clientY >= candidate.top && event.clientY <= candidate.bottom
+  ));
+  if (!rect) return false;
+  return event.clientY >= rect.top + rect.height * 0.6;
+}
+
+function mixedNavigationEntryKey(element, event) {
+  const owner = element.closest("[data-update-entry]");
+  const removalKey = owner ? owner.dataset.updateEntry : element.dataset.updateEntry || null;
+  const addedKey = owner?.dataset.addedEntry;
+  if (addedKey && pointsAtAddedUnderline(event, owner)) return addedKey;
+  return removalKey;
+}
+
+function focusStateUpdateEntry(
+  entryKey,
+  fragmentIndex = null,
+  scrollMixedIntoView = true,
+  preferredPart = null,
+  scrollExactIntoView = true,
+) {
+  const mixedCodeMirrorFocused = focusMixedCodeMirror(
+    entryKey,
+    fragmentIndex == null ? null : [fragmentIndex],
+    preferredPart,
+    scrollMixedIntoView,
+  );
   for (const pane of [$("mixed"), $("exact")]) {
+    // CodeMirror owns both decoration and navigation for Mixed. Its virtual DOM
+    // may still contain an old or different half of this update while the
+    // target scroll is pending, so a DOM fallback here would override it.
+    if (pane.id === "mixed" && mixedCodeMirrorFocused) continue;
     pane.querySelectorAll(
       ".fragment-focus, .exact-focus, .checkpoint-pane-focus, .timeline-scope-focus",
     ).forEach(node => {
@@ -2943,12 +4180,18 @@ function focusStateUpdateEntry(entryKey, fragmentIndex = null) {
         "flash",
       );
     });
-    let targets = [...pane.querySelectorAll(`[data-update-entry="${entryKey}"]`)];
+    let targets = [...pane.querySelectorAll(
+      `[data-update-entry="${entryKey}"], [data-added-entry="${entryKey}"]`,
+    )];
     if (fragmentIndex != null) {
       const fragmentTargets = targets.filter(
         node => Number(node.dataset.outputFragment) === fragmentIndex,
       );
       if (fragmentTargets.length) targets = fragmentTargets;
+    }
+    if (pane.id === "mixed" && preferredPart) {
+      const partTargets = targets.filter(node => partMatches(node, preferredPart));
+      if (partTargets.length) targets = partTargets;
     }
     targets.forEach(node => {
       // Restart the pulse when the same update is clicked repeatedly.
@@ -2958,21 +4201,97 @@ function focusStateUpdateEntry(entryKey, fragmentIndex = null) {
         "flash",
       );
     });
-    focusScrollIntoView(targets[0]);
+    const scrollPaneIntoView = pane.id === "mixed"
+      ? scrollMixedIntoView
+      : scrollExactIntoView;
+    if (scrollPaneIntoView) {
+      focusScrollIntoView(targets[0], "start");
+    }
   }
 }
 
-async function focusUpdateFromState(element) {
+async function focusStateCheckpointOrigin(element, origin, sourcePane = null) {
+  const callId = Number(origin.dataset.checkpointCall);
+  const scope = origin.dataset.checkpointScope;
+  if (!Number.isFinite(callId) || !scope) return;
+  const clickedInMixed = sourcePane === "mixed" || $("mixed").contains(element);
+  const clickedInExact = sourcePane === "exact" || $("exact").contains(element);
+  const mixedCodeMirrorFocused = focusMixedCodeMirrorCheckpointOrigin(
+    callId,
+    scope,
+    !clickedInMixed,
+  );
+  for (const pane of [$("mixed"), $("exact")]) {
+    if (pane.id === "mixed" && mixedCodeMirrorFocused) continue;
+    pane.querySelectorAll(
+      ".fragment-focus, .exact-focus, .checkpoint-pane-focus, .timeline-scope-focus, .flash",
+    ).forEach(node => {
+      node.classList.remove(
+        "fragment-focus",
+        "exact-focus",
+        "checkpoint-pane-focus",
+        "timeline-scope-focus",
+        "flash",
+      );
+    });
+    const target = pane.querySelector(
+      `[data-checkpoint-call="${callId}"][data-checkpoint-scope="${scope}"]`,
+    );
+    target?.classList.add("checkpoint-pane-focus", "flash");
+    const preserveSourcePane = pane.id === "mixed" ? clickedInMixed : clickedInExact;
+    if (!preserveSourcePane) focusScrollIntoView(target, "start");
+  }
+
+  const phase = scope === "output" || scope === "thoughts" ? "output" : "input";
+  const key = `call:${callId}`;
+  setTimelineFocus(key, phase, true);
+  const card = updateCardFor(key, phase);
+  if (!card) return;
+  await loadUpdateCard(card);
+  document.querySelectorAll(".update-card.active").forEach(node => {
+    node.classList.remove("active");
+  });
+  const section = card.querySelector(`[data-checkpoint-scope="${scope}"]`);
+  if (section) {
+    markUpdateTarget(card, section);
+  } else {
+    card.classList.add("active");
+    focusScrollIntoView(card, "start");
+  }
+}
+
+async function focusUpdateFromState(
+  element,
+  sourcePane = null,
+  navigationEntryKey = null,
+) {
   const updateElement = element.closest("[data-update-entry]");
   if (updateElement) {
-    const [rawCallId, rawEntryIndex] = updateElement.dataset.updateEntry.split(":");
+    const clickedInMixed = sourcePane === "mixed" || $("mixed").contains(updateElement);
+    const clickedInExact = sourcePane === "exact" || $("exact").contains(updateElement);
+    const preferredPart = clickedInMixed
+      ? updateElement.tagName === "DEL"
+        ? "removed"
+        : updateElement.tagName === "INS" ? "added" : null
+      // Exact reconstructs current state, so a changed range corresponds to
+      // Mixed's present/added half rather than its removed historical half.
+      : $("exact").contains(updateElement) ? "added" : null;
+    const selectedEntryKey = navigationEntryKey || updateElement.dataset.updateEntry;
+    const navigatesToAddition = selectedEntryKey !== updateElement.dataset.updateEntry;
+    const [rawCallId, rawEntryIndex] = selectedEntryKey.split(":");
     const callId = Number(rawCallId);
     const entryIndex = Number(rawEntryIndex);
     const key = `call:${callId}`;
-    const fragmentIndex = updateElement.dataset.outputFragment == null
+    const fragmentIndex = navigatesToAddition || updateElement.dataset.outputFragment == null
       ? null
       : Number(updateElement.dataset.outputFragment);
-    focusStateUpdateEntry(updateElement.dataset.updateEntry, fragmentIndex);
+    focusStateUpdateEntry(
+      selectedEntryKey,
+      fragmentIndex,
+      !clickedInMixed,
+      preferredPart,
+      !clickedInExact,
+    );
     const scope = updateElement.closest("[data-state-scope]")?.dataset.stateScope;
     const phase = scope === "output" || scope === "thoughts"
       || updateElement.classList.contains("output-update")
@@ -2991,6 +4310,14 @@ async function focusUpdateFromState(element) {
     if (!button) return;
     const fragment = updateFragmentForIndex(button, fragmentIndex);
     markUpdateTarget(card, fragment || button, button);
+    return;
+  }
+
+  const checkpointOrigin = element.closest(".state-scope-label")
+    ? null
+    : element.closest("[data-checkpoint-call][data-checkpoint-scope]");
+  if (checkpointOrigin) {
+    await focusStateCheckpointOrigin(element, checkpointOrigin, sourcePane);
     return;
   }
 
@@ -3025,9 +4352,16 @@ async function focusUpdateFromState(element) {
           ? entry.category === "parameter"
           : entry.scope === scope && entry.category !== "parameter"
       ));
+  // The pane the click came from must not move — the user is already looking at
+  // it. Only the *other* pane scrolls to the corresponding item. This runs after
+  // an awaited card load, past pinPaneScroll's short restore window, so the skip
+  // has to be explicit here rather than relying on the pin to undo it.
+  const clickedInMixed = sourcePane === "mixed" || $("mixed").contains(element);
+  const clickedInExact = sourcePane === "exact" || $("exact").contains(element);
   const entryKeys = new Set(entries.map(entry => entry.entryKey));
   let foundEntry = false;
   for (const pane of [$("mixed"), $("exact")]) {
+    const isSourcePane = pane.id === "mixed" ? clickedInMixed : clickedInExact;
     const targets = [...pane.querySelectorAll("[data-update-entry]")].filter(
       node => entryKeys.has(node.dataset.updateEntry),
     );
@@ -3039,14 +4373,14 @@ async function focusUpdateFromState(element) {
     });
     if (targets.length) {
       foundEntry = true;
-      focusScrollIntoView(targets[0]);
+      if (!isSourcePane) focusScrollIntoView(targets[0], "start");
     } else {
       const targetScope = pane.querySelector(`[data-state-scope="${scope}"]`);
       targetScope?.classList.add(
         isCheckpoint(state.detail) ? "checkpoint-pane-focus" : "timeline-scope-focus",
         "flash",
       );
-      focusScrollIntoView(targetScope, "start");
+      if (!isSourcePane) focusScrollIntoView(targetScope, "start");
     }
   }
 
@@ -3070,33 +4404,95 @@ async function focusUpdateFromState(element) {
 }
 
 function bindStateBackReferences(pane) {
+  pane.addEventListener("mousedown", event => {
+    if (event.button !== 0) return;
+    panePointerScrolls.set(pane, {
+      ...paneScrollPosition(pane),
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      // CodeMirror may replace a decoration while processing this mousedown.
+      // Retain the original semantic element so the subsequent pane-level click
+      // still knows which update/checkpoint/scope the user chose.
+      semanticTarget: event.target.closest(
+        "[data-update-entry], [data-checkpoint-call][data-checkpoint-scope], [data-state-scope]",
+      ),
+      navigationEntryKey: pane.id === "mixed"
+        ? mixedNavigationEntryKey(
+            event.target.closest("[data-update-entry]") || event.target,
+            event,
+          )
+        : null,
+    });
+  }, { capture: true });
   pane.addEventListener("click", event => {
-    if (hasTextSelectionWithin(pane)) return;
-    const updateTarget = event.target.closest("[data-update-entry]");
+    const pointerScroll = panePointerScrolls.get(pane) || null;
+    panePointerScrolls.delete(pane);
+    const pointerDistance = pointerScroll
+      ? Math.hypot(
+          event.clientX - pointerScroll.pointerX,
+          event.clientY - pointerScroll.pointerY,
+        )
+      : 0;
+    // Preserve text selection only when this gesture actually dragged. A stale
+    // selection from an earlier gesture must not consume the first normal click
+    // and force the user to click a mark twice.
+    if (pointerDistance > 4 && hasTextSelectionWithin(pane)) return;
+    const capturedTarget = pointerScroll?.semanticTarget || null;
+    const updateTarget = event.target.closest("[data-update-entry]")
+      || capturedTarget?.closest("[data-update-entry]");
     if (updateTarget) {
-      focusUpdateFromState(updateTarget);
+      // A removed part whose "where added" origin is a whole earlier call (rather
+      // than a specific change): clicking its green underline points to that call
+      // in the other panes — the timeline scrolls to and flashes it — while the
+      // Mixed pane the user clicked in stays put. The rest of the struck text
+      // focuses the removal.
+      const addedCall = updateTarget.dataset.addedCall;
+      if (addedCall && pointsAtAddedUnderline(event, updateTarget)) {
+        pinPaneScroll(pane, pointerScroll);
+        setTimelineFocus(`call:${addedCall}`, "input", true);
+        return;
+      }
+      pinPaneScroll(pane, pointerScroll);
+      focusUpdateFromState(
+        updateTarget,
+        pane.id,
+        pointerScroll?.navigationEntryKey || mixedNavigationEntryKey(updateTarget, event),
+      );
       return;
     }
-    // Plain reconstructed content is selectable state, not an update reference.
-    // Whole-scope navigation belongs to its visible label. A checkpoint is the
-    // exception because its complete snapshot scope has one owning Updates section.
-    const scopeTarget = event.target.closest(".state-scope-label")
-      ?.closest("[data-state-scope]")
-      || (isCheckpoint(state.detail)
-        ? event.target.closest("[data-state-scope]")
-        : null);
-    const target = scopeTarget;
-    if (target) focusUpdateFromState(target);
+    const checkpointOrigin = event.target.closest(
+      "[data-checkpoint-call][data-checkpoint-scope]",
+    ) || capturedTarget?.closest("[data-checkpoint-call][data-checkpoint-scope]");
+    if (checkpointOrigin && !event.target.closest(".state-scope-label")) {
+      pinPaneScroll(pane, pointerScroll);
+      focusUpdateFromState(checkpointOrigin, pane.id);
+      return;
+    }
+    // A drag remains plain text selection (handled above), while a normal click
+    // anywhere in reconstructed scope content focuses that scope's owning
+    // Timeline/Updates item. Limiting this to the label made clicks on "input:"
+    // and its plain inherited text appear to do nothing.
+    const scopeLabel = event.target.closest(".state-scope-label")
+      || capturedTarget?.closest(".state-scope-label");
+    const target = scopeLabel
+      || event.target.closest("[data-state-scope]")
+      || capturedTarget?.closest("[data-state-scope]");
+    if (target) {
+      pinPaneScroll(pane, pointerScroll);
+      focusUpdateFromState(target, pane.id);
+    }
   });
   pane.addEventListener("keydown", event => {
     if (event.key !== "Enter" && event.key !== " ") return;
     const target = event.target.closest(
-      "[data-update-entry], .state-scope-label",
+      "[data-update-entry], [data-checkpoint-call][data-checkpoint-scope], .state-scope-label",
     );
     if (!target) return;
     event.preventDefault();
+    pinPaneScroll(pane);
     focusUpdateFromState(
       target.closest("[data-update-entry], [data-state-scope]"),
+      pane.id,
     );
   });
 }
@@ -3111,13 +4507,18 @@ async function selectItem(
   element = null,
   scrollTimeline = true,
   focusSelection = element !== null,
+  sourcePane = null,
 ) {
   const key = `${type}:${id}`;
   if (state.pendingSelection?.key === key) {
     await state.pendingSelection.promise.catch(() => {});
-    return applySelection(type, id, element, scrollTimeline, focusSelection);
+    return applySelection(
+      type, id, element, scrollTimeline, focusSelection, sourcePane,
+    );
   }
-  const promise = applySelection(type, id, element, scrollTimeline, focusSelection);
+  const promise = applySelection(
+    type, id, element, scrollTimeline, focusSelection, sourcePane,
+  );
   state.pendingSelection = { key, promise };
   try {
     return await promise;
@@ -3132,12 +4533,19 @@ async function applySelection(
   element = null,
   scrollTimeline = true,
   focusSelection = element !== null,
+  sourcePane = null,
 ) {
   const button = element || document.querySelector(`.timeline-item[data-key="${type}:${id}"]`);
   const phase = button?.dataset.phase || "input";
   const key = `${type}:${id}`;
   const selectionVersion = ++state.selectionVersion;
-  setTimelineFocus(key, phase, scrollTimeline, button);
+  setTimelineFocus(
+    key,
+    phase,
+    scrollTimeline && sourcePane !== "timeline",
+    button,
+    sourcePane === "follow" ? "end" : "start",
+  );
   document.querySelectorAll(".update-card.active").forEach(node => node.classList.remove("active"));
   const updateCard = updateCardFor(key, phase);
   updateCard?.classList.add("active");
@@ -3146,12 +4554,16 @@ async function applySelection(
   // segment that costs a visible pause, and every entry click inside one card
   // would restart it — long enough for the next click to abort the previous
   // selection, so the focus it was about to apply never arrived.
+  // Compare by string so live (synthetic) string ids like "live-1" match — a
+  // Number() comparison yields NaN !== NaN and forces a full re-render on every
+  // repeat click of a streaming call, making its focus behave unlike a stored one.
   const alreadyRendered = state.selected
     && state.selected.type === type
-    && Number(state.selected.id) === Number(id)
-    && Number(state.detail?.id) === Number(id)
+    && String(state.selected.id) === String(id)
+    && String(state.detail?.id) === String(id)
     && state.mixedSegmentDetails.at(-1)?.id === state.detail?.id;
   state.selected = { type, id };
+  updateCleanHistoryControl();
   state.selectedPhase = phase;
   syncBranchGraphSelection();
   if (alreadyRendered) {
@@ -3159,8 +4571,10 @@ async function applySelection(
     if (focusSelection) {
       if (updateCard) await loadUpdateCard(updateCard);
       if (selectionVersion !== state.selectionVersion) return;
-      const renderedEntryKey = focusTimelineSelection(state.detail, phase);
-      focusTimelineUpdateCard(updateCard, renderedEntryKey, phase);
+      const renderedEntryKey = focusTimelineSelection(state.detail, phase, sourcePane);
+      focusTimelineUpdateCard(
+        updateCard, renderedEntryKey, phase, sourcePane !== "updates",
+      );
     }
     return;
   }
@@ -3177,17 +4591,38 @@ async function applySelection(
     ? `req ${state.detail.prev_req_id}`
     : state.detail.parent_source || "root";
   const reqLabel = state.detail.req_id ? `${state.detail.req_id} · ` : "";
-  $("lineage").textContent =
-    `${reqLabel}state S${state.detail.request_state_id} ← ${parentLabel}${score}`;
+  $("lineage").textContent = state.detail.live
+    ? (state.detail.status === "streaming" ? "live · streaming" : "live")
+    : `${reqLabel}state S${state.detail.request_state_id} ← ${parentLabel}${score}`;
   activateTab("state");
   renderMixed(previousDetail);
   renderExact();
   if (focusSelection) {
     if (updateCard) await loadUpdateCard(updateCard);
     if (selectionVersion !== state.selectionVersion) return;
-    const focusedEntryKey = focusTimelineSelection(state.detail, phase);
-    focusTimelineUpdateCard(updateCard, focusedEntryKey, phase);
+    const focusedEntryKey = focusTimelineSelection(state.detail, phase, sourcePane);
+    focusTimelineUpdateCard(
+      updateCard, focusedEntryKey, phase, sourcePane !== "updates",
+    );
   }
+}
+
+function renderEmptyCurrentState() {
+  state.selected = null;
+  state.timelineFocus = null;
+  updateCleanHistoryControl();
+  state.detail = null;
+  state.mixedHistoryComplete = true;
+  state.searchFocus = null;
+  destroyMixedCodeMirrorViews();
+  $("mixed-status").textContent = "Select a call";
+  $("mixed-status").className = "mixed-legend";
+  $("lineage").textContent = "Select an event";
+  $("mixed").classList.add("empty");
+  $("mixed").textContent = "No LLM calls in this session.";
+  $("exact").classList.add("empty");
+  $("exact").textContent = "No current state.";
+  $("updates").innerHTML = '<div class="empty-session">No updates in this session.</div>';
 }
 
 async function rebuildTimeline(items, previousSelected, followNewItems) {
@@ -3206,13 +4641,7 @@ async function rebuildTimeline(items, previousSelected, followNewItems) {
   restoreTimelineViewport(timelineViewport, true);
   $("updates").scrollTop = updatesScroll;
   if (!items.length) {
-    state.selected = null;
-    state.timelineFocus = null;
-    state.detail = null;
-    state.mixedHistoryTruncated = false;
-    $("mixed").textContent = "No LLM calls in this session.";
-    $("exact").textContent = "No current state.";
-    $("updates").innerHTML = '<div class="empty-session">No updates in this session.</div>';
+    renderEmptyCurrentState();
     return;
   }
   const chosen = followNewItems
@@ -3253,12 +4682,27 @@ async function refreshChangedItem(item) {
 }
 
 async function loadTimeline() {
+  const epoch = state.timelineEpoch;
   const sessionQuery = state.session ? `&session=${encodeURIComponent(state.session)}` : "";
   const records = await fetchJson(`/api/timeline?limit=1000${sessionQuery}`);
-  const items = records.filter(item => item.type === "call");
-  renderWaitingCalls(items);
+  // Do not allow a poll started before a destructive clean to restore rows that
+  // were deleted while its request was in flight.
+  if (epoch !== state.timelineEpoch) return false;
+  // A durable running row and its live side-channel record represent the same
+  // call. Keep rendering the richer live version until response persistence is
+  // confirmed, then reconcile it directly to the durable row.
+  const liveCallIds = new Set(
+    [...state.live.values()]
+      .filter(record => !record.persisted && record.call_id != null)
+      .map(record => Number(record.call_id)),
+  );
+  const items = records.filter(item => (
+    item.type === "call" && !liveCallIds.has(Number(item.id))
+  ));
+  renderWaitingCalls();
   const signature = items.map(item => (
-    `${itemKey(item)}:${item.status}:${item.branch_id}:${item.duration_ms ?? ""}`
+    `${itemKey(item)}:${item.status}:${item.branch_id}:${item.duration_ms ?? ""}:`
+    + `${item.title ?? ""}:${item.debug_label ?? ""}:${JSON.stringify(item.usage || {})}`
   )).join("|");
   if (signature === state.timelineSignature) return false;
 
@@ -3280,7 +4724,13 @@ async function loadTimeline() {
   const changed = [];
   for (const item of items) {
     const previous = previousByKey.get(itemKey(item));
-    if (previous && previous.status !== item.status) {
+    if (previous && (
+      previous.status !== item.status
+      || previous.title !== item.title
+      || previous.debug_label !== item.debug_label
+      || previous.duration_ms !== item.duration_ms
+      || JSON.stringify(previous.usage || {}) !== JSON.stringify(item.usage || {})
+    )) {
       // Apply the new status first: a completed call earns an output card, and
       // its arrival time decides where that card belongs in the sequence.
       Object.assign(previous, item);
@@ -3289,6 +4739,37 @@ async function loadTimeline() {
   }
   const appended = items.filter(item => !previousByKey.has(itemKey(item)));
   state.timelineItems = [...previousItems, ...appended];
+  // Reconcile: each newly stored call supersedes an ended synthetic live call
+  // (streams are near-sequential; match oldest-ended → each new stored call).
+  const endedLive = [...state.live.values()]
+    .filter(record => record.endedAt)
+    .sort((left, right) => left.endedAt - right.endedAt);
+  let reselectStored = null;
+  const droppedLiveKeys = new Set();
+  const unmatchedEnded = [...endedLive];
+  for (const storedItem of appended) {
+    const storedIdentity = storedItem.req_id || storedItem.request_id || null;
+    let recordIndex = storedIdentity
+      ? unmatchedEnded.findIndex(record => (
+          (record.req_id || record.request_id || null) === storedIdentity
+        ))
+      : -1;
+    // Older clients may not send a public request id. Retain the chronological
+    // fallback for those calls, while matching identified parallel calls exactly.
+    if (recordIndex < 0 && !storedIdentity) recordIndex = 0;
+    if (recordIndex < 0 || recordIndex >= unmatchedEnded.length) continue;
+    const [record] = unmatchedEnded.splice(recordIndex, 1);
+    if (isLiveSelected(record.live_id)) reselectStored = storedItem;
+    state.live.delete(record.live_id);
+    const liveKey = `call:${liveId(record.live_id)}`;
+    state.details.delete(liveKey);
+    droppedLiveKeys.add(liveKey);
+  }
+  if (droppedLiveKeys.size) {
+    state.timelineItems = state.timelineItems.filter(
+      item => !droppedLiveKeys.has(itemKey(item)),
+    );
+  }
   const updatesViewport = captureUpdatesViewport();
   renderUpdateCards(state.timelineItems);
   // Preserve the viewport immediately after the synchronous reorder. Do not
@@ -3305,11 +4786,14 @@ async function loadTimeline() {
   state.lastTimelineKey = state.timelineItems.length
     ? itemKey(state.timelineItems[state.timelineItems.length - 1])
     : null;
-  if (appended.length && followNewItems) {
-    // Follow means the newest item is the one being watched, so bring it into
-    // view even when the viewport had drifted away from the newest end.
-    const last = appended[appended.length - 1];
-    await selectItem(last.type, last.id, null, true, true);
+  if (followNewItems && (appended.length || changed.length)) {
+    // Status changes can add an output event without appending a call. Follow
+    // whichever event is now last in the same ordering rendered by Timeline.
+    await followLatestTimelineEvent();
+  } else if (reselectStored) {
+    // The live call the user was watching just became a stored call; move the
+    // selection onto it so Mixed/Updates show the real diffs.
+    await selectItem(reselectStored.type, reselectStored.id, null, false, false);
   }
   return true;
 }
@@ -3344,9 +4828,11 @@ async function loadSessions() {
     state.timelineSignature = "";
     state.timelineItems = [];
     state.mixedSegmentDetails = [];
-    state.mixedHistoryTruncated = false;
+    state.mixedHistoryComplete = true;
+    destroyMixedCodeMirrorViews();
     state.selected = null;
     state.timelineFocus = null;
+    updateCleanHistoryControl();
   }
   return true;
 }
@@ -3360,8 +4846,212 @@ async function loadStats() {
   const limit = data.max_file_bytes
     ? ` / ${(data.max_file_bytes / 1024 / 1024).toFixed(0)} MB`
     : "";
-  $("stats").textContent =
-    `${data.calls} calls · ${size}${limit} · ${saved.toFixed(0)}% blob reduction`;
+  const overLimit = data.max_file_bytes
+    && data.file_bytes > data.max_file_bytes;
+  const node = $("stats");
+  node.textContent =
+    `${data.calls} calls · DB ${size}${limit}${overLimit ? " ⚠" : ""} · ${saved.toFixed(0)}% blob reduction`;
+  node.classList.toggle("over-limit", Boolean(overLimit));
+  node.title = overLimit
+    ? `Database is ${size}, over the ${(data.max_file_bytes / 1024 / 1024).toFixed(0)} MB retention limit — `
+      + "oldest sessions are pruned, but the current session is protected and cannot shrink."
+    : `Database size: ${size}${limit ? `, retention limit ${limit.slice(3)}` : " (no retention limit set)"}`;
+}
+
+function clearDomSearchHighlights(root = document) {
+  root.querySelectorAll("mark.search-text-match").forEach(mark => {
+    mark.replaceWith(document.createTextNode(mark.textContent || ""));
+  });
+  root.normalize();
+}
+
+function highlightDomSearch(root, query, preferredSelector = null) {
+  clearDomSearchHighlights(root);
+  const needle = query.toLocaleLowerCase();
+  if (!needle) return null;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue?.toLocaleLowerCase().includes(needle)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      if (node.parentElement?.closest("script, style, mark.search-text-match")) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const textNodes = [];
+  while (walker.nextNode()) textNodes.push(walker.currentNode);
+  const matches = [];
+  for (const textNode of textNodes) {
+    const value = textNode.nodeValue || "";
+    const folded = value.toLocaleLowerCase();
+    const preferred = Boolean(
+      preferredSelector && textNode.parentElement?.closest(preferredSelector),
+    );
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+    while (cursor < value.length) {
+      const start = folded.indexOf(needle, cursor);
+      if (start < 0) break;
+      if (start > cursor) fragment.append(value.slice(cursor, start));
+      const mark = document.createElement("mark");
+      mark.className = "search-text-match";
+      mark.textContent = value.slice(start, start + query.length);
+      mark.dataset.searchPreferred = preferred ? "true" : "false";
+      fragment.append(mark);
+      matches.push(mark);
+      cursor = start + query.length;
+    }
+    if (cursor < value.length) fragment.append(value.slice(cursor));
+    textNode.replaceWith(fragment);
+  }
+  const selected = matches.find(mark => mark.dataset.searchPreferred === "true")
+    || matches[0]
+    || null;
+  selected?.classList.add("search-text-match-selected");
+  return selected;
+}
+
+function mixedSearchScope(field) {
+  return field === "thoughts" ? "thoughts" : field === "output" ? "output" : "input";
+}
+
+function highlightMixedSearch(query, field) {
+  if (!mixedCodeMirrorModel || !mixedCodeMirrorApi || !mixedCodeMirrorView) return null;
+  mixedCodeMirrorModel.marks = mixedCodeMirrorModel.marks.filter(
+    mark => !mark.classes.includes("cm-search-match"),
+  );
+  const folded = mixedCodeMirrorModel.text.toLocaleLowerCase();
+  const needle = query.toLocaleLowerCase();
+  const scope = mixedSearchScope(field);
+  const scopeRanges = mixedCodeMirrorModel.marks.filter(mark => (
+    mark.attributes["data-state-scope"] === scope
+  ));
+  const matches = [];
+  let cursor = 0;
+  while (needle && cursor < folded.length) {
+    const start = folded.indexOf(needle, cursor);
+    if (start < 0) break;
+    const end = start + query.length;
+    matches.push({
+      start,
+      end,
+      preferred: scopeRanges.some(range => start >= range.start && end <= range.end),
+    });
+    cursor = end;
+  }
+  const selected = matches.find(match => match.preferred) || matches[0] || null;
+  for (const match of matches) {
+    mixedCodeMirrorModel.marks.push({
+      start: match.start,
+      end: match.end,
+      classes: [
+        "cm-search-match",
+        match === selected ? "cm-search-match-selected" : "",
+      ].filter(Boolean),
+      attributes: {},
+      scope,
+    });
+  }
+  mixedCodeMirrorModel.marks.sort(
+    (left, right) => left.start - right.start || left.end - right.end,
+  );
+  mixedCodeMirrorView.setState(mixedCodeMirrorState(
+    mixedCodeMirrorApi,
+    mixedCodeMirrorModel,
+    mixedCodeMirrorView.state.selection,
+  ));
+  if (selected) {
+    supersedePaneScrollPreservation();
+    mixedCodeMirrorView.dispatch({
+      selection: { anchor: selected.start },
+      effects: mixedCodeMirrorApi.EditorView.scrollIntoView(
+        selected.start,
+        { y: "center" },
+      ),
+    });
+  }
+  return selected;
+}
+
+function mutatePreservingPaneScroll(action) {
+  const generation = ++paneScrollPreservationGeneration;
+  const snapshots = [$("timeline"), $("mixed"), $("exact"), $("updates")]
+    .filter(Boolean)
+    .map(paneScrollPosition);
+  for (const { scroller } of snapshots) {
+    const animation = focusScrollAnimations.get(scroller);
+    if (animation) cancelAnimationFrame(animation);
+    focusScrollAnimations.delete(scroller);
+  }
+
+  action();
+
+  let userMoved = false;
+  const stopRestoring = () => { userMoved = true; };
+  const directScrollEvents = ["wheel", "touchstart", "pointerdown", "keydown"];
+  for (const { scroller } of snapshots) {
+    for (const eventName of directScrollEvents) {
+      scroller.addEventListener(eventName, stopRestoring, { once: true, passive: true });
+    }
+  }
+  const restore = () => {
+    if (userMoved || generation !== paneScrollPreservationGeneration) return;
+    for (const { scroller, top, left } of snapshots) {
+      if (scroller.scrollTop !== top) scroller.scrollTop = top;
+      if (scroller.scrollLeft !== left) scroller.scrollLeft = left;
+    }
+  };
+  const cleanup = () => {
+    for (const { scroller } of snapshots) {
+      for (const eventName of directScrollEvents) {
+        scroller.removeEventListener(eventName, stopRestoring);
+      }
+    }
+  };
+  // Removing DOM marks can trigger scroll anchoring, and CodeMirror measures its
+  // replacement decorations on the following frame. Preserve the viewport
+  // through both without preventing a new, intentional user scroll.
+  restore();
+  requestAnimationFrame(() => {
+    restore();
+    requestAnimationFrame(restore);
+  });
+  setTimeout(restore, 50);
+  setTimeout(cleanup, 80);
+}
+
+function clearSearchHighlights() {
+  state.searchFocus = null;
+  mutatePreservingPaneScroll(() => {
+    clearDomSearchHighlights();
+    highlightMixedSearch("", "input");
+  });
+}
+
+async function focusSearchResult(result, query) {
+  state.searchFocus = { ...result, query };
+  await selectItem("call", result.owner_id, null, true, false, "search");
+  const key = `call:${result.owner_id}`;
+  const phase = result.field === "input" ? "input" : "output";
+  for (const card of document.querySelectorAll(`.update-card[data-key="${key}"]`)) {
+    await loadUpdateCard(card);
+  }
+  highlightMixedSearch(query, result.field);
+  const exactScope = mixedSearchScope(result.field);
+  const exactMatch = highlightDomSearch(
+    $("exact"), query, `[data-state-scope="${exactScope}"]`,
+  );
+  const updatesMatch = highlightDomSearch(
+    $("updates"), query, `.update-card[data-key="${key}"][data-phase="${phase}"]`,
+  );
+  const timelineMatch = highlightDomSearch(
+    $("timeline"), query, `[data-key="${key}"], [data-call-key="${key}"]`,
+  );
+  for (const match of [exactMatch, updatesMatch, timelineMatch]) {
+    if (match) focusScrollIntoView(match, "center");
+  }
 }
 
 async function runSearch(event) {
@@ -3370,12 +5060,35 @@ async function runSearch(event) {
   const box = $("search-results");
   if (!query) {
     box.classList.add("hidden");
+    clearSearchHighlights();
+    return;
+  }
+  const fields = [...document.querySelectorAll(
+    'input[name="search-field"]:checked',
+  )].map(input => input.value);
+  if (!fields.length) {
+    box.innerHTML = `
+      <div class="search-results-head">
+        <strong>Select at least one field</strong>
+        <button type="button" aria-label="Hide search results">×</button>
+      </div>`;
+    box.querySelector("button").onclick = () => box.classList.add("hidden");
+    box.classList.remove("hidden");
     return;
   }
   const sessionPart = state.session ? `&session=${encodeURIComponent(state.session)}` : "";
-  const allResults = await fetchJson(`/api/search?q=${encodeURIComponent(query)}${sessionPart}`);
+  const fieldPart = `&fields=${encodeURIComponent(fields.join(","))}`;
+  const allResults = await fetchJson(
+    `/api/search?q=${encodeURIComponent(query)}${sessionPart}${fieldPart}`,
+  );
   if ($("search").value.trim() !== query) return;
-  const results = allResults.filter(result => result.owner_type === "call");
+  // Filter locally as well so the UI remains correct while an older running
+  // proxy process is still serving the newly loaded static frontend. The
+  // backend filter remains necessary to apply the limit after field selection.
+  const selectedFields = new Set(fields);
+  const results = allResults.filter(result => (
+    result.owner_type === "call" && selectedFields.has(result.field)
+  ));
   box.innerHTML = `
     <div class="search-results-head">
       <strong>${results.length} matches</strong>
@@ -3386,9 +5099,9 @@ async function runSearch(event) {
     const node = document.createElement("div");
     node.className = "result";
     node.innerHTML = `<small>LLM call #${result.owner_id} · ${result.field}</small>${result.snippet}`;
-    node.onclick = () => {
+    node.onclick = async () => {
       box.classList.add("hidden");
-      selectItem("call", result.owner_id);
+      await focusSearchResult(result, query);
     };
     box.appendChild(node);
   }
@@ -3418,6 +5131,101 @@ $("refresh").onclick = async () => {
   await loadTimeline();
   await loadStats();
 };
+
+async function cleanHistoryFromHere() {
+  const button = $("reset-history");
+  const selected = cleanHistoryTarget();
+  if (!button || !selected) return;
+  button.dataset.busy = "true";
+  button.disabled = true;
+  const previousLabel = button.textContent;
+  button.textContent = "…";
+  try {
+    const preview = await fetchJson(
+      `/api/history/reset?call_id=${encodeURIComponent(selected.id)}`,
+    );
+    if (!preview.delete_calls) {
+      window.alert(`Call #${selected.id} has no history to remove in this session.`);
+      return;
+    }
+    if (!preview.can_reset) {
+      window.alert(
+        `Cannot clean history while older calls are running: ${
+          preview.running_call_ids.map(id => `#${id}`).join(", ")
+        }`,
+      );
+      return;
+    }
+    const confirmed = window.confirm(
+      `Clean from here: permanently delete selected call #${selected.id} and the ${
+        preview.delete_calls - 1
+      } call${preview.delete_calls - 1 === 1 ? "" : "s"} older than it (${
+        preview.delete_calls
+      } total) from session “${
+        preview.session_id
+      }”?\n\nNewer calls will remain. This cannot be undone.`,
+    );
+    if (!confirmed) return;
+    await fetchJson("/api/history/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ call_id: selected.id }),
+    });
+
+    // Invalidate any poll that began before the deletion, then remove the
+    // deleted prefix synchronously. The reconciliation fetch below should never
+    // be required just to make deleted items disappear from the screen.
+    state.timelineEpoch += 1;
+    const selectedIndex = state.timelineItems.findIndex(
+      item => itemKey(item) === selected.key,
+    );
+    const removedItems = selectedIndex >= 0
+      ? state.timelineItems.slice(0, selectedIndex + 1)
+      : state.timelineItems.filter(item => itemKey(item) === selected.key);
+    const removedKeys = new Set(removedItems.map(itemKey));
+    state.timelineItems = selectedIndex >= 0
+      ? state.timelineItems.slice(selectedIndex + 1)
+      : state.timelineItems.filter(item => itemKey(item) !== selected.key);
+    for (const key of removedKeys) state.details.delete(key);
+    renderTimelineEvents(state.timelineItems);
+    renderUpdateCards(state.timelineItems);
+
+    state.selectionVersion += 1;
+    state.pendingSelection = null;
+    state.details.clear();
+    state.detail = null;
+    state.mixedSegmentDetails = [];
+    state.mixedHistoryComplete = true;
+    state.timelineSignature = "";
+    state.lastTimelineKey = null;
+    // The selected call was deleted too; let the rebuild choose the new oldest.
+    state.timelineFocus = null;
+    state.selected = null;
+    // Clear the deleted selection before any reconciliation request. In
+    // particular, an empty server result has the same empty signature assigned
+    // above and may legitimately short-circuit loadTimeline().
+    renderEmptyCurrentState();
+    $("search-results").classList.add("hidden");
+    state.sessionsSignature = "";
+    await loadSessions();
+    await loadTimeline();
+    if (!state.selected && state.timelineItems.length) {
+      const oldestRemaining = state.timelineItems[0];
+      await selectItem(
+        oldestRemaining.type, oldestRemaining.id, null, false, true,
+      );
+    }
+    await loadStats();
+  } catch (error) {
+    window.alert(`Could not clean history: ${error.message}`);
+  } finally {
+    delete button.dataset.busy;
+    button.textContent = previousLabel;
+    updateCleanHistoryControl();
+  }
+}
+
+$("reset-history").onclick = cleanHistoryFromHere;
 function setTimelineView(view) {
   state.timelineView = FRONTEND_CONFIG.branchGraph.enabled && view === "branches"
     ? "branches"
@@ -3444,28 +5252,527 @@ function setBranchOrientation(orient) {
 $("follow-new-items").onchange = async () => {
   state.followNewItems = $("follow-new-items").checked;
   if (!state.followNewItems || !state.timelineItems.length) return;
-  const latest = state.timelineItems[state.timelineItems.length - 1];
-  await selectItem(latest.type, latest.id, null, true, true);
+  await followLatestTimelineEvent();
 };
 $("search-form").onsubmit = runSearch;
 $("search").addEventListener("input", () => {
-  if (!$("search").value.trim()) $("search-results").classList.add("hidden");
+  if (!$("search").value.trim()) {
+    $("search-results").classList.add("hidden");
+    clearSearchHighlights();
+  }
 });
 $("search").addEventListener("keydown", event => {
-  if (event.key === "Escape") $("search-results").classList.add("hidden");
+  if (event.key === "Escape") {
+    $("search-results").classList.add("hidden");
+    clearSearchHighlights();
+  }
 });
 $("session").onchange = async () => {
   state.session = $("session").value;
   state.selected = null;
+  state.timelineFocus = null;
+  updateCleanHistoryControl();
   state.detail = null;
   state.details.clear();
   state.mixedSegmentDetails = [];
-  state.mixedHistoryTruncated = false;
+  state.mixedHistoryComplete = true;
+  destroyMixedCodeMirrorViews();
   state.timelineSignature = "";
   state.timelineItems = [];
   $("search-results").classList.add("hidden");
+  startLiveStream();
   await loadTimeline();
 };
+
+// The live side-channel (SSE /api/live) shows a call's raw output while it is
+// still streaming — before the durable record exists. It is independent of the
+// timeline poll: watch-only, and cleared once the stream ends (the completed
+// call then arrives through the normal timeline/update path).
+// The server relays the upstream bytes verbatim (SSE frames), which are not
+// readable. Parse them here into the generated text — the model's content and
+// reasoning deltas — so the live card shows words, not JSON envelopes. Chunks do
+// not align to frame boundaries, so an incomplete trailing frame is held back in
+// `buffer` and completed by the next chunk.
+function mergeLiveToolCallDeltas(record, deltas) {
+  if (!Array.isArray(deltas)) return;
+  record.toolCalls ||= {};
+  deltas.forEach((delta, position) => {
+    if (!delta || typeof delta !== "object") return;
+    const index = Number.isInteger(delta.index) ? delta.index : position;
+    const call = record.toolCalls[index] ||= {
+      index,
+      id: "",
+      type: "",
+      function: {name: "", arguments: ""},
+    };
+    if (!call.id && typeof delta.id === "string") call.id = delta.id;
+    if (!call.type && typeof delta.type === "string") call.type = delta.type;
+    const fn = delta.function;
+    if (!fn || typeof fn !== "object") return;
+    if (typeof fn.name === "string") call.function.name += fn.name;
+    if (typeof fn.arguments === "string") {
+      call.function.arguments += fn.arguments;
+    }
+  });
+}
+
+function readableLiveToolCalls(record) {
+  const calls = Object.values(record.toolCalls || {})
+    .sort((left, right) => left.index - right.index)
+    .map(call => {
+      let args = call.function.arguments;
+      try {
+        args = JSON.parse(args);
+      } catch {
+        // An in-flight call may still have incomplete JSON. Keep the joined
+        // argument text readable until later deltas complete it.
+      }
+      return {
+        index: call.index,
+        ...(call.id ? {id: call.id} : {}),
+        type: call.type || "function",
+        function: {name: call.function.name, arguments: args},
+      };
+    });
+  return calls.length ? JSON.stringify(calls, null, 2) : "";
+}
+
+function refreshLiveOutput(record) {
+  const text = record.outputText || "";
+  const calls = readableLiveToolCalls(record);
+  // Common case (no tool calls) reuses the accumulated string instead of
+  // concatenating a fresh full copy every chunk (O(n^2) over a long stream).
+  record.output = calls
+    ? [text, calls].filter(Boolean).join(text.endsWith("\n") ? "" : "\n")
+    : text;
+}
+
+function liveUsage(payload) {
+  const usage = payload?.usage && typeof payload.usage === "object"
+    ? payload.usage
+    : {};
+  const timings = payload?.timings && typeof payload.timings === "object"
+    ? payload.timings
+    : {};
+  const input = Number.isInteger(usage.prompt_tokens)
+    ? usage.prompt_tokens
+    : Number.isInteger(usage.input_tokens)
+      ? usage.input_tokens
+      : Number.isInteger(timings.prompt_n) ? timings.prompt_n : null;
+  const output = Number.isInteger(usage.completion_tokens)
+    ? usage.completion_tokens
+    : Number.isInteger(usage.output_tokens)
+      ? usage.output_tokens
+      : Number.isInteger(timings.predicted_n) ? timings.predicted_n : null;
+  const total = Number.isInteger(usage.total_tokens)
+    ? usage.total_tokens
+    : input != null && output != null ? input + output : null;
+  return Object.fromEntries([
+    ["input_tokens", input],
+    ["output_tokens", output],
+    ["total_tokens", total],
+  ].filter(([, value]) => value != null));
+}
+
+function feedLive(record, chunk) {
+  record.buffer = (record.buffer || "") + (chunk || "");
+  const frames = record.buffer.split("\n\n");
+  record.buffer = frames.pop() ?? "";
+  let changed = false;
+  for (const frame of frames) {
+    for (const line of frame.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      const choice = (parsed.choices && parsed.choices[0]) || {};
+      const usage = liveUsage(parsed);
+      if (Object.keys(usage).length) {
+        record.usage = {...record.usage, ...usage};
+        // The server reports real token counts only in its final frame. Once it
+        // does, stop overriding them with the streamed estimate.
+        if (usage.output_tokens != null) record.usageIsReal = true;
+      }
+      const delta = choice.delta || choice.message || {};
+      let produced = false;
+      // Reasoning streams into the thoughts scope, content into the output scope
+      // — mirroring how a stored call splits them in the Exact pane.
+      if (typeof delta.reasoning_content === "string") {
+        record.thoughts = (record.thoughts || "") + delta.reasoning_content;
+        produced = produced || delta.reasoning_content !== "";
+      }
+      if (typeof delta.content === "string") {
+        record.outputText = (record.outputText || "") + delta.content;
+        produced = produced || delta.content !== "";
+      }
+      if (typeof choice.text === "string") {
+        record.outputText = (record.outputText || "") + choice.text;
+        produced = produced || choice.text !== "";
+      }
+      if (delta.tool_calls) {
+        mergeLiveToolCallDeltas(record, delta.tool_calls);
+        produced = true;
+      }
+      if (parsed.error) {
+        const message = parsed.error.message || JSON.stringify(parsed.error);
+        record.outputText = `${record.outputText || ""}\n\n⚠ ${message}`;
+      }
+      // Each streamed piece is ~one token; count them so the active row shows a
+      // live output-token estimate until the server sends its real count. Mark
+      // when generation actually began (first produced token) so the live speed
+      // measures decode rate, not the prompt-eval wait before it.
+      if (produced) {
+        record.streamTokens = (record.streamTokens || 0) + 1;
+        if (!record.genStartMs) record.genStartMs = Date.now();
+      }
+      changed = true;
+    }
+  }
+  // Rebuild the assembled output once per chunk, not per line: rebuilding the
+  // whole growing string on every frame is O(n^2) over a long stream.
+  if (changed) {
+    refreshLiveOutput(record);
+    if (!record.usageIsReal && record.streamTokens) {
+      const updates = { output_tokens: record.streamTokens };
+      const elapsed = record.genStartMs ? (Date.now() - record.genStartMs) / 1000 : 0;
+      if (elapsed > 0.25) updates.output_per_second = record.streamTokens / elapsed;
+      record.usage = {...record.usage, ...updates};
+    }
+  }
+}
+
+// The model reports the real prompt-token count only in its final frame, but the
+// input is fully known the moment the request is forwarded. Estimate it from the
+// request text (~2.7 chars/token for this workload) so the input row shows a
+// count during the stream; the real count replaces it when the stream ends.
+function estimateInputTokens(request) {
+  if (!request || typeof request !== "object") return null;
+  let chars = 0;
+  if (typeof request.prompt === "string") {
+    chars = request.prompt.length;
+  } else if (Array.isArray(request.messages)) {
+    for (const message of request.messages) {
+      const content = message?.content;
+      chars += typeof content === "string"
+        ? content.length
+        : content ? JSON.stringify(content).length : 0;
+    }
+  }
+  return chars > 0 ? Math.max(1, Math.round(chars / 2.7)) : null;
+}
+
+function applyLiveInputEstimate(record) {
+  if (record.usageIsReal) return;
+  const estimate = estimateInputTokens(record.request);
+  if (estimate != null) record.usage = {...record.usage, input_tokens: estimate};
+}
+
+function liveId(liveNum) {
+  return `live-${liveNum}`;
+}
+
+function isLiveSelected(liveNum) {
+  return state.selected?.type === "call"
+    && String(state.selected.id) === liveId(liveNum);
+}
+
+// A stored call's request produces exactly one timeline call. An in-flight stream
+// is the same shape — its input is fully known (the forwarded request), its
+// output arrives live — so it becomes a synthetic timeline item that flows
+// through the normal Timeline/selection/pane renderers.
+function liveTimelineItem(record) {
+  return {
+    type: "call",
+    id: liveId(record.live_id),
+    live: true,
+    live_id: record.live_id,
+    call_id: record.call_id,
+    status: record.status || "streaming",
+    created_at: new Date(record.started_ms || Date.now()).toISOString(),
+    session_id: record.session || state.session,
+    branch_id: "main",
+    debug_label: record.label || null,
+    title: record.title || null,
+    usage: record.usage || null,
+    req_id: record.req_id || null,
+    request_id: record.request_id || record.req_id || null,
+  };
+}
+
+// A stable, mutated-in-place synthetic detail (no `diff` → isCheckpoint()==true →
+// the normal renderers show it as a plain current state). Shared by reference
+// with state.detail, so delta/end just update its fields.
+function liveDetailFor(record) {
+  if (!record.detail) {
+    record.detail = {
+      id: liveId(record.live_id),
+      live: true,
+      live_id: record.live_id,
+      created_at: new Date(record.started_ms || Date.now()).toISOString(),
+      session_id: record.session || state.session,
+      parent_source: "live",
+      request_state_id: null,
+      parent_state_id: null,
+      similarity: null,
+      metadata: {
+        ...(record.request_id ? {request_id: record.request_id} : {}),
+        ...(record.title ? {title: record.title} : {}),
+        ...(record.label ? {debug_label: record.label} : {}),
+        ...(record.usage ? {usage: record.usage} : {}),
+      },
+    };
+  }
+  record.detail.request = record.request || {};
+  record.detail.response = record.output || "";
+  record.detail.thoughts = record.thoughts || "";
+  record.detail.status = record.status || "streaming";
+  if (record.title) record.detail.metadata.title = record.title;
+  if (record.usage) record.detail.metadata.usage = record.usage;
+  return record.detail;
+}
+
+function upsertLiveTimelineItem(record) {
+  const item = liveTimelineItem(record);
+  const key = itemKey(item);
+  if (record.call_id != null) {
+    // A poll may have seen start_call's durable running row just before the SSE
+    // start event. It is this same request, so replace it with the richer live
+    // representation rather than showing two timeline calls.
+    state.timelineItems = state.timelineItems.filter(existing => (
+      existing.live || Number(existing.id) !== Number(record.call_id)
+    ));
+  }
+  const index = state.timelineItems.findIndex(existing => itemKey(existing) === key);
+  if (index >= 0) state.timelineItems[index] = item;
+  else state.timelineItems.push(item);
+}
+
+// Re-render the Timeline (01) and Updates (04) panes from the current items so a
+// live call shows across both, not only in Exact.
+function renderLiveTimelinePanes() {
+  const timelineViewport = captureTimelineViewport();
+  renderTimelineEvents(state.timelineItems);
+  restoreTimelineViewport(timelineViewport);
+  renderUpdateCards(state.timelineItems);
+}
+
+function selectNewLiveItem(record) {
+  // Follow off means the current inspection is pinned. The live item should be
+  // visible in Timeline and Updates, but it must not replace the selected call
+  // (which would rebuild and scroll Mixed/Exact). An empty viewer still opens
+  // its first request so it does not remain on the empty-state placeholders.
+  if (!state.followNewItems && state.selected) return null;
+  if (state.followNewItems) return followLatestTimelineEvent(false);
+  return selectItem(
+    "call",
+    liveId(record.live_id),
+    null,
+    false,
+    false,
+    "live",
+  );
+}
+
+// A delta only touches the DOM when its own live call is the current selection;
+// otherwise it just accumulates so the output is ready when you click its item.
+// Deltas can arrive far faster than the screen refreshes. Coalesce their DOM
+// work into one animation-frame flush: patch the selected call's live output at
+// most once per frame, and rebuild the Timeline/Updates panes at most a few times
+// a second (they only show usage counts, which need not track every token).
+// Without this, a fast stream runs a full pane rebuild per delta and freezes.
+let liveFlushScheduled = false;
+let liveFlushPanesDirty = false;
+let liveLastPanesRenderMs = 0;
+function flushLiveUpdates() {
+  liveFlushScheduled = false;
+  // Patch whichever live call is currently selected — its output was just fed.
+  const id = state.selected?.type === "call" ? String(state.selected.id) : "";
+  if (id.startsWith("live-")) {
+    const record = state.live.get(Number(id.slice(5)));
+    if (record) patchLiveOutput(record);
+  }
+  if (liveFlushPanesDirty && performance.now() - liveLastPanesRenderMs > 250) {
+    liveFlushPanesDirty = false;
+    liveLastPanesRenderMs = performance.now();
+    renderLiveTimelinePanes();
+  }
+}
+function scheduleLiveFlush(panesDirty) {
+  if (panesDirty) liveFlushPanesDirty = true;
+  if (liveFlushScheduled) return;
+  liveFlushScheduled = true;
+  requestAnimationFrame(flushLiveUpdates);
+}
+
+function patchLiveOutput(record) {
+  if (!isLiveSelected(record.live_id)) return;
+  const outBody = $("exact").querySelector('[data-live-body="output"]');
+  const thoughtBody = $("exact").querySelector('[data-live-body="thoughts"]');
+  // A thoughts scope that only appeared after the first render needs a full
+  // rebuild; otherwise patch the text nodes in place to preserve input scroll.
+  if (!outBody || (record.thoughts && !thoughtBody)) {
+    renderExact();
+    return;
+  }
+  outBody.textContent = record.output || "…";
+  outBody.scrollTop = outBody.scrollHeight;
+  if (thoughtBody) thoughtBody.textContent = record.thoughts || "";
+}
+
+function startLiveStream() {
+  if (state.liveSource) state.liveSource.close();
+  state.live.clear();
+  const sessionQuery = state.session
+    ? `?session=${encodeURIComponent(state.session)}`
+    : "";
+  const source = new EventSource(`/api/live${sessionQuery}`);
+  state.liveSource = source;
+  const begin = event => {
+    const incoming = JSON.parse(event.data);
+    // A brand-new trace has no stored session for /api/sessions to return yet.
+    // Adopt the live request's session immediately so the first durable-session
+    // refresh does not treat it as a session switch and clear the live timeline.
+    if (!state.session && incoming.session) state.session = incoming.session;
+    const isNew = !state.live.has(incoming.live_id);
+    const existing = state.live.get(incoming.live_id)
+      || { output: "", outputText: "", thoughts: "", buffer: "", toolCalls: {} };
+    const hadTimelineOutput = existing.status && existing.status !== "running";
+    const record = { ...existing, ...incoming };
+    // A catch-up snapshot carries the raw bytes so far; parse them once so a
+    // viewer that joined mid-stream still sees the readable text.
+    if (incoming.text && !existing.output && !existing.thoughts) {
+      record.output = "";
+      record.outputText = "";
+      record.thoughts = "";
+      record.buffer = "";
+      record.toolCalls = {};
+      feedLive(record, incoming.text);
+    }
+    if (incoming.ended_at_ms) record.endedAt = incoming.ended_at_ms;
+    if (existing.detail) record.detail = existing.detail;  // keep the shared ref
+    applyLiveInputEstimate(record);
+    state.live.set(incoming.live_id, record);
+    upsertLiveTimelineItem(record);
+    liveDetailFor(record);
+    renderLiveTimelinePanes();
+    renderWaitingCalls();
+    if (isNew) {
+      // Follow may open the forwarded input; otherwise preserve the call the
+      // user is already inspecting.
+      selectNewLiveItem(record);
+    } else if (
+      state.followNewItems
+      && !hadTimelineOutput
+      && record.status !== "running"
+    ) {
+      // Response start adds a new output item to an existing live call.
+      followLatestTimelineEvent(false);
+    }
+  };
+  source.addEventListener("snapshot", begin);
+  source.addEventListener("start", begin);
+  source.addEventListener("update", begin);
+  source.addEventListener("title", event => {
+    const update = JSON.parse(event.data);
+    let changed = false;
+    for (const item of state.timelineItems) {
+      if (item.req_id !== update.req_id) continue;
+      item.title = update.title;
+      changed = true;
+    }
+    if (state.detail?.req_id === update.req_id) {
+      state.detail.metadata ||= {};
+      state.detail.metadata.title = update.title;
+    }
+    if (!changed) return;
+    const viewport = captureTimelineViewport();
+    renderTimelineEvents(state.timelineItems);
+    restoreTimelineViewport(viewport);
+  });
+  source.addEventListener("delta", event => {
+    const { live_id, text } = JSON.parse(event.data);
+    const record = state.live.get(live_id);
+    if (!record) return;
+    const previousUsage = JSON.stringify(record.usage || {});
+    feedLive(record, text);
+    liveDetailFor(record);
+    const usageChanged = JSON.stringify(record.usage || {}) !== previousUsage;
+    // The timeline item carries the usage the token counts are rendered from, but
+    // a delta only updates the live record. Refresh the item so the streaming
+    // output row shows the running token count, not a stale/empty one.
+    if (usageChanged) upsertLiveTimelineItem(record);
+    scheduleLiveFlush(usageChanged);
+  });
+  source.addEventListener("end", event => {
+    const { live_id, status } = JSON.parse(event.data);
+    const record = state.live.get(live_id);
+    if (!record) return;
+    record.status = status;
+    record.endedAt = Date.now();
+    liveDetailFor(record);
+    upsertLiveTimelineItem(record);  // streaming item becomes finished
+    renderLiveTimelinePanes();
+    if (isLiveSelected(live_id)) renderExact();
+    renderWaitingCalls();
+  });
+  source.addEventListener("stored", event => {
+    const { live_id, call_id } = JSON.parse(event.data);
+    reconcileStoredLive(live_id, call_id);
+  });
+  // EventSource reconnects on its own after a drop; nothing to do on error.
+}
+
+// The server commits the durable call and tells us its exact id. Reconcile the
+// synthetic live call to it. loadTimeline() swaps it via a request-id heuristic,
+// but that misses when the call sent no request id (e.g. FIT_TO_SCHEMA) — the
+// synthetic item then lingers and its stale, often empty-output DOM stays on
+// screen even though the real call is now fetchable. So finish the swap here
+// using the definitive id: drop the synthetic, drop any stale cached detail for
+// the durable id, and move a selection that was watching it onto the real call.
+async function reconcileStoredLive(live_id, call_id) {
+  const record = state.live.get(live_id);
+  if (!record) return;
+  record.persisted = true;
+  if (call_id != null) record.call_id = call_id;
+  const wasSelected = isLiveSelected(live_id);
+  // A poll may have cached a placeholder for the durable id before its output
+  // committed; drop it so the reconcile re-fetches the real, complete detail.
+  if (call_id != null) state.details.delete(`call:${call_id}`);
+  await loadTimeline();
+  if (call_id == null) return;
+  // loadTimeline's request-id heuristic may drop the synthetic without landing
+  // selection on the right stored id (or leave it lingering). Finish the swap
+  // authoritatively with the server-provided id: land a watcher on the real call
+  // and clear any synthetic that its heuristic left behind.
+  if (wasSelected && String(state.selected?.id) !== String(call_id)) {
+    await selectItem("call", call_id, null, false, false);
+  }
+  if (state.live.has(live_id)) dropLiveStream(live_id);
+}
+
+// Remove a synthetic live call (and its timeline item), moving any selection off
+// it first. With staleOnly, only drop it if it already ended.
+function dropLiveStream(liveNum, { staleOnly = false } = {}) {
+  const record = state.live.get(liveNum);
+  if (!record) return;
+  if (staleOnly && !record.endedAt) return;
+  state.live.delete(liveNum);
+  const key = `call:${liveId(liveNum)}`;
+  state.timelineItems = state.timelineItems.filter(item => itemKey(item) !== key);
+  state.details.delete(key);
+  if (isLiveSelected(liveNum)) {
+    state.selected = null;
+    state.detail = null;
+  }
+  renderLiveTimelinePanes();
+  renderWaitingCalls();
+}
 
 async function liveTick() {
   if (state.liveBusy) return;
@@ -3561,6 +5868,7 @@ async function start() {
   await loadSessions();
   await Promise.all([loadTimeline(), loadStats()]);
   applyTimelineView();
+  startLiveStream();
   setInterval(liveTick, 1000);
 }
 

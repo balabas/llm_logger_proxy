@@ -274,6 +274,13 @@ remembered across sessions:
   are laid out on a lane graph — one time axis, lanes offset for concurrent branches — with
   a node led by its **step name** so a reader identifies calls by name, not number.
 
+  A call may declare a **group** (a window, a phase — anything that is a structural unit but
+  not itself a request). The graph inserts one **synthetic grouping node** per declared group,
+  between the group's members and their shared parent, so the members hang off the group and
+  the group hangs off the root. A grouping node is not a call: it has no id, is inert (no
+  selection, no cross-pane link), and is drawn as a hollow marker with an italic group name so
+  it never reads as a request.
+
 The graph orients two ways, also remembered:
 
 - **vertical** — time grows downward, lanes across;

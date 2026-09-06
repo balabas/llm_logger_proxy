@@ -8,6 +8,10 @@
   --blue: #2d5d68;
   --green: #38755e;
   --shadow: 0 14px 40px rgba(25, 32, 29, .08);
+  /* Real monospace on every platform: Linux has neither SFMono nor Consolas, so
+     the stack must reach DejaVu/Liberation before the generic keyword, which
+     some setups otherwise resolve to a proportional face. */
+  --mono: ui-monospace, "SFMono-Regular", "DejaVu Sans Mono", "Liberation Mono", Consolas, monospace;
 }
 
 * { box-sizing: border-box; }
@@ -36,6 +40,33 @@ h1 { margin: -3px 0 0; font: 700 25px/1 Georgia, serif; }
 .eyebrow { color: var(--accent); font: 700 10px/1 monospace; letter-spacing: .18em; }
 
 form { display: flex; gap: 8px; }
+#search-form { align-items: stretch; }
+.search-fields {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 2px;
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+.search-fields label { position: relative; display: flex; cursor: pointer; }
+.search-fields input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+.search-fields span {
+  padding: 7px 6px;
+  color: var(--muted);
+  border-radius: 4px;
+  font: 700 8px/1.2 var(--mono);
+  text-transform: uppercase;
+}
+.search-fields input:checked + span { color: white; background: var(--blue); }
+.search-fields input:focus-visible + span { outline: 2px solid var(--accent); }
 input, button, select {
   border: 1px solid var(--line);
   background: var(--panel);
@@ -49,6 +80,7 @@ input:focus, select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgb
 button { cursor: pointer; }
 form button { background: var(--ink); color: white; border-color: var(--ink); }
 .stats { color: var(--muted); text-align: right; font: 12px/1.5 monospace; }
+.stats.over-limit { color: #d9822b; font-weight: 700; }
 .session-picker { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .session-picker span { color: var(--muted); font: 700 9px/1 monospace; letter-spacing: .09em; text-transform: uppercase; }
 .session-picker select { width: 100%; padding: 8px 10px; font: 11px monospace; }
@@ -121,6 +153,17 @@ body.resizing-pane {
 .pane-title span { color: var(--accent); font: 700 10px monospace; }
 h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em; }
 .quiet { padding: 5px 8px; background: transparent; color: var(--muted); font-size: 11px; }
+.quiet.danger { color: #9b3d31; }
+.quiet.danger:hover:not(:disabled),
+.quiet.danger:focus-visible:not(:disabled) {
+  color: #fff;
+  background: #a94435;
+  border-color: #a94435;
+}
+.quiet:disabled {
+  cursor: not-allowed;
+  opacity: .42;
+}
 .timeline-tools { display: flex; align-items: center; gap: 7px; }
 .follow-toggle {
   padding: 5px 6px;
@@ -165,7 +208,18 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.timeline { overflow: auto; padding: 8px; }
+/* A streaming (in-flight) output item in the Timeline. */
+.timeline-item.timeline-streaming {
+  border-color: color-mix(in srgb, #38755e 55%, transparent);
+  background: color-mix(in srgb, #4bd08a 12%, transparent);
+}
+.timeline-item.timeline-streaming .item-label .live-dot { margin-right: 5px; }
+.timeline {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+}
 .timeline.hidden { display: none; }
 
 /* View switch (List / Branches, orientation) */
@@ -220,6 +274,14 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 }
 .branch-dot.checkpoint { stroke: #ed7f4c; stroke-width: 2.5; }
 .branch-dot.running { animation: waiting-pulse 1.4s ease-in-out infinite; }
+/* A synthetic grouping node (a window) is not a request: hollow marker, muted
+   italic label, inert. */
+.branch-dot.synthetic {
+  fill: var(--panel) !important;
+  stroke: var(--muted);
+  stroke-width: 1.5;
+  stroke-dasharray: 2 2;
+}
 .branch-node {
   position: absolute;
   transform: translateY(-50%);
@@ -263,6 +325,13 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   font: 9px/1.2 monospace;
 }
 .branch-node.active .branch-node-step { color: var(--blue); }
+.branch-node.synthetic { cursor: default; }
+.branch-node.synthetic:hover { background: transparent; }
+.branch-node.synthetic .branch-node-step {
+  color: var(--muted);
+  font-style: italic;
+  font-weight: 600;
+}
 .branch-graph.has-hover .branch-edge:not(.hover-related) { opacity: .2; }
 .branch-graph.has-hover .branch-dot:not(.hover-related) { opacity: .42; }
 .branch-graph.has-hover .branch-node:not(.hover-related) { opacity: .58; }
@@ -351,8 +420,8 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   background: color-mix(in srgb, var(--trace-kind-accent) 7%, transparent);
   box-shadow: inset 3px 0 var(--trace-kind-accent);
 }
-.timeline-input .item-label,
-.timeline-output .item-label {
+.timeline-input .item-title,
+.timeline-output .item-title {
   color: color-mix(in srgb, var(--trace-kind-accent) 72%, var(--ink));
 }
 .timeline-input::before,
@@ -375,12 +444,48 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   background: color-mix(in srgb, var(--trace-kind-accent, var(--line)) 12%, #f3f1e9);
 }
 .timeline-item.active {
-  background: color-mix(in srgb, var(--trace-kind-accent, var(--line)) 18%, #f5f2e9);
+  color: #f4f7f5;
+  background: color-mix(in srgb, var(--trace-kind-accent, var(--line)) 27%, var(--ink));
   border-color: var(--trace-kind-accent, var(--line));
+  box-shadow:
+    inset 3px 0 var(--trace-kind-accent, var(--line)),
+    0 1px 4px rgba(23, 32, 29, .22);
+}
+.timeline-item.active .item-title {
+  color: color-mix(in srgb, var(--trace-kind-accent, white) 72%, white);
+}
+.timeline-item.active .item-meta {
+  color: color-mix(in srgb, var(--trace-kind-accent, white) 22%, #dce3df);
+}
+.timeline-item.active .branch {
+  color: color-mix(in srgb, var(--trace-kind-accent, white) 48%, white);
+}
+.timeline-item.timeline-focus-flash,
+.branch-node.timeline-focus-flash {
+  animation: timeline-item-focus-flash 1.15s ease-out;
+}
+@keyframes timeline-item-focus-flash {
+  0%, 28% {
+    filter: brightness(1.42);
+    outline: 3px solid #fff0a6;
+    outline-offset: -2px;
+    box-shadow:
+      inset 3px 0 var(--trace-kind-accent, #ffd85a),
+      0 0 0 5px rgba(255, 216, 90, .42),
+      0 0 18px rgba(255, 216, 90, .34);
+  }
+  100% {
+    filter: brightness(1);
+    outline-color: transparent;
+    box-shadow: none;
+  }
 }
 .timeline-item.status-running {
   background: #fff8e9;
   border-color: #d99a4b;
+}
+.timeline-item.status-running.active {
+  background: color-mix(in srgb, #e28b28 30%, var(--ink));
 }
 .timeline-item.status-running::before {
   background: #e28b28;
@@ -408,12 +513,16 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   background: color-mix(in srgb, var(--trace-kind-accent) 15%, #f8f6ef);
 }
 .timeline-item.checkpoint-call.active {
-  background: color-mix(in srgb, var(--trace-kind-accent) 21%, #f8f6ef);
+  color: #f4f7f5;
+  background: color-mix(in srgb, var(--trace-kind-accent) 27%, var(--ink));
   border-color: var(--trace-kind-accent);
 }
-.timeline-item.checkpoint-call .item-label {
+.timeline-item.checkpoint-call .item-title {
   color: color-mix(in srgb, var(--trace-kind-accent) 72%, var(--ink));
   font-weight: 750;
+}
+.timeline-item.checkpoint-call.active .item-title {
+  color: color-mix(in srgb, var(--trace-kind-accent) 72%, white);
 }
 .timeline-item.parallel-block {
   border-left: 3px solid var(--branch-color);
@@ -422,21 +531,33 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   color: var(--branch-color);
 }
 .item-head { display: flex; align-items: baseline; gap: 6px; }
-.item-label { flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis; font-weight: 650; white-space: nowrap; }
-/* The step's debug label shares the action line and truncates, so it never
-   adds a row to the item. */
-.item-debug {
-  flex: 0 1 auto;
+.item-title {
+  /* scaleX(.8) also shrinks the element's painted box. Give it the reciprocal
+     layout width so compressed text still uses the full row up to its padding. */
+  flex: 0 0 125%;
+  max-width: 125%;
   min-width: 0;
-  margin-left: auto;
+  margin-right: -25%;
   overflow: hidden;
   text-overflow: ellipsis;
+  font-size: .8em;
+  font-weight: 650;
   white-space: nowrap;
-  color: color-mix(in srgb, var(--trace-kind-accent, var(--muted)) 60%, var(--ink));
-  font: 600 10px/1.3 "SFMono-Regular", Consolas, monospace;
+  transform: scaleX(.8);
+  transform-origin: left center;
+}
+.item-label {
+  color: color-mix(in srgb, var(--trace-kind-accent, var(--muted)) 55%, var(--muted));
+  font: 600 9px/1.2 var(--mono);
+  white-space: nowrap;
+}
+.item-label::after { content: " · "; }
+.timeline-item.active .item-label {
+  color: color-mix(in srgb, var(--trace-kind-accent, white) 24%, #dce3df);
 }
 .item-meta { display: flex; justify-content: space-between; gap: 5px; margin-top: 4px; color: var(--muted); font: 10px monospace; }
 .item-meta > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item-tail { flex: 0 0 auto; white-space: nowrap; }
 .branch { color: var(--green); }
 
 .code {
@@ -447,8 +568,9 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   color: #dbe5df;
   background: #1e2724;
   /* Marked lines carry a left bar and an inset edge; a little extra leading
-     keeps stacked marks from touching top to bottom. */
-  font: 12px/1.85 "SFMono-Regular", Consolas, monospace;
+     keeps stacked marks from touching top to bottom. Regular weight, real
+     monospace (--mono) on every platform. */
+  font: 400 12px/1.85 var(--mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   tab-size: 2;
@@ -458,7 +580,15 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .tabs button { padding: 5px 7px; color: var(--muted); background: transparent; border-color: transparent; font-size: 10px; }
 .tabs button.active { color: white; background: var(--blue); }
 
-.search-results { max-height: 45%; padding: 8px; overflow: auto; border-bottom: 1px solid var(--line); }
+.search-results {
+  /* Timeline may contain thousands of intrinsic-height rows. It owns the
+     remaining space and must not squeeze search down to only its heading. */
+  flex: 0 0 auto;
+  max-height: 45%;
+  padding: 8px;
+  overflow: auto;
+  border-bottom: 1px solid var(--line);
+}
 .search-results.hidden { display: none; }
 .search-results-head {
   display: flex;
@@ -483,9 +613,135 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .result { padding: 8px; margin-bottom: 5px; border: 1px solid var(--line); border-radius: 5px; cursor: pointer; font-size: 11px; }
 .result mark { background: #ffd2a8; }
 .result small { display: block; margin-bottom: 3px; color: var(--muted); font-family: monospace; }
+.search-text-match {
+  padding: 0 1px;
+  color: #18201d;
+  background: #f4d96b;
+  border-radius: 2px;
+  box-shadow: inset 0 -1px #b98d18;
+}
+.search-text-match-selected {
+  background: #ffb84d;
+  outline: 2px solid #fff3ba;
+  outline-offset: 1px;
+}
 
 .mixed {
+  padding: 0;
+  overflow: hidden;
   overflow-anchor: none;
+  white-space: normal;
+}
+.mixed > .cm-editor {
+  height: 100%;
+}
+/* CodeMirror marks carry their kind/operation styling from the editor theme.
+   The legacy .trace-part / .inline-part rules (inherited because the mark keeps
+   the original node classes) would draw a full outline box and a left bar on
+   every wrapped line on top of that — a heavy grid between lines. Strip those
+   here; the theme's background and underline already convey the change. */
+.mixed .cm-content .trace-part,
+.mixed .cm-content .inline-part {
+  outline: none;
+  box-shadow: none;
+}
+.mixed .cm-mixed-added.fragment-focus.flash {
+  animation: mixed-added-focus-pulse 1.35s ease-out;
+}
+.mixed .cm-mixed-removed.fragment-focus.flash {
+  animation: mixed-removed-focus-pulse 1.35s ease-out;
+}
+.mixed .cm-mixed-update.fragment-focus.flash:not(.cm-mixed-added, .cm-mixed-removed) {
+  animation: mixed-focus-pulse 1.35s ease-out;
+}
+.mixed .fragment-focus {
+  /* CodeMirror splits a multiline mark into one box per visual line. Keep the
+     focus edge inside those boxes so empty and wrapped fragments do not grow
+     into large offset rectangles. */
+  outline-offset: -1px;
+}
+.mixed .checkpoint-pane-focus.flash {
+  animation: mixed-scope-focus-pulse 1.35s ease-out;
+}
+/* A focused scope spans every wrapped line, so the block-level 2px kind outline
+   from .checkpoint-pane-focus lands as a heavy box on each individual line — a
+   bold grid across the whole scope. In the Mixed editor, show scope focus as a
+   single continuous left bar over a faint wash instead; the outline is dropped
+   so lines are never individually boxed. */
+.mixed .cm-content .checkpoint-pane-focus {
+  outline: none;
+  box-shadow: inset 3px 0 var(--trace-kind-accent);
+  background: color-mix(in srgb, var(--trace-kind-accent) 11%, transparent);
+}
+@keyframes mixed-added-focus-pulse {
+  0%, 28% {
+    color: #0b2417;
+    background: #9affc1;
+    outline-color: #fff7ad;
+    box-shadow:
+      0 0 0 3px rgba(154, 255, 193, .5),
+      0 0 18px rgba(89, 201, 138, .72);
+  }
+  100% {
+    color: #bff3d3;
+    background: rgba(38, 119, 76, .48);
+    outline-color: #fff0a6;
+    box-shadow: none;
+  }
+}
+@keyframes mixed-removed-focus-pulse {
+  0%, 28% {
+    color: #351010;
+    background: #ffb2ad;
+    outline-color: #fff7ad;
+    box-shadow:
+      0 0 0 3px rgba(255, 178, 173, .48),
+      0 0 18px rgba(230, 111, 106, .72);
+  }
+  100% {
+    color: #ffd0cc;
+    background: rgba(139, 55, 51, .5);
+    outline-color: #fff0a6;
+    box-shadow: none;
+  }
+}
+@keyframes mixed-focus-pulse {
+  0%, 28% {
+    color: #17201d;
+    background: #fff0a6;
+    outline-color: #fff7cf;
+    box-shadow: 0 0 18px rgba(255, 216, 90, .72);
+  }
+  100% {
+    color: inherit;
+    background: inherit;
+    outline-color: #fff0a6;
+    box-shadow: none;
+  }
+}
+@keyframes mixed-scope-focus-pulse {
+  0%, 28% {
+    background: rgba(255, 216, 90, .35);
+    box-shadow:
+      inset 5px 0 #ffd85a,
+      0 0 16px rgba(255, 216, 90, .55);
+  }
+  100% {
+    background: transparent;
+    box-shadow: inset 2px 0 rgba(137, 183, 166, .42);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mixed .fragment-focus.flash,
+  .mixed .checkpoint-pane-focus.flash {
+    animation: none;
+  }
+}
+.mixed.codemirror-fallback {
+  overflow: auto;
+  padding: 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .updates {
   flex: 1;
@@ -494,6 +750,43 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   overflow-anchor: auto;
   padding: 10px;
   background: #e9e6dc;
+}
+/* Live streaming output, shown in the Exact pane (03) as the current call's
+   output being reconstructed in real time. Styled distinctly from a settled
+   reconstructed value: a pulsing indicator and a live accent. */
+.live-output-scope { display: block; }
+.live-output-label { position: relative; }
+.live-output-scope .live-status { margin-left: 8px; opacity: .85; }
+.live-output-scope.ended .live-output-label { color: var(--muted); }
+.live-output-body {
+  display: block;
+  min-height: 1em;
+  padding-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  animation: live-glow 1.8s ease-in-out infinite;
+}
+.live-output-scope.ended .live-output-body { animation: none; }
+@keyframes live-glow {
+  0%, 100% { color: color-mix(in srgb, #cfe9dd 85%, var(--ink)); }
+  50% { color: #e9f3ee; }
+}
+.live-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  vertical-align: middle;
+  background: #4bd08a;
+  box-shadow: 0 0 0 0 color-mix(in srgb, #4bd08a 70%, transparent);
+  animation: live-pulse 1.4s ease-out infinite;
+}
+.live-dot.off { background: var(--muted); animation: none; box-shadow: none; }
+@keyframes live-pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, #4bd08a 60%, transparent); }
+  70% { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
 }
 .update-card {
   content-visibility: auto;
@@ -545,7 +838,9 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .update-card[data-phase] > .update-card-head {
   background: var(--trace-kind-surface, #26312d);
 }
-.update-card-body { padding: 8px; }
+/* Trace content (prompt/response text) — monospace regular like every other
+   data surface, not the inherited proportional UI font. */
+.update-card-body { padding: 8px; font: 400 11px/1.6 var(--mono); }
 .checkpoint-jump {
   width: 100%;
   padding: 11px;
@@ -592,10 +887,14 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   padding: 8px;
   color: #d8eee0;
   background: #203229;
-  font: 10px/1.5 "SFMono-Regular", Consolas, monospace;
+  font: 10px/1.5 var(--mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+/* Message content in a checkpoint card is not wrapped in <pre>, so it inherits
+   no font-size and lands at the 16px browser default — far larger and heavier
+   than the 10px parameter <pre> beside it. Match it to the card's data size. */
+.checkpoint-message-list { font-size: 10px; line-height: 1.5; }
 
 /* A lane snapshot is the request itself, not a change, so it borrows the
    snapshot look without the checkpoint's own scope navigation. */
@@ -620,7 +919,7 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   padding: 8px;
   color: #d8eee0;
   background: #203229;
-  font: 10px/1.5 "SFMono-Regular", Consolas, monospace;
+  font: 10px/1.5 var(--mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -783,7 +1082,7 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .change-arrow.inline-arrow { display: inline; padding: 0 3px; }
 .change-pair,
 .single-change {
-  font: 11px/1.5 "SFMono-Regular", Consolas, monospace;
+  font: 11px/1.5 var(--mono);
   white-space: pre-wrap;
 }
 .change-pair .added-part,
@@ -799,7 +1098,7 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   background: #202925;
   border: 1px solid #394940;
   border-radius: 4px;
-  font: 10px/1.45 "SFMono-Regular", Consolas, monospace;
+  font: 10px/1.45 var(--mono);
   cursor: pointer;
 }
 .fragment-change:hover,
@@ -835,6 +1134,9 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 }
 .trace-part[data-update-entry],
 .exact-update[data-update-entry] {
+  cursor: pointer;
+}
+.state-scope.checkpoint-origin > .state-scope-content {
   cursor: pointer;
 }
 .trace-part[data-update-entry]:hover,
@@ -954,7 +1256,7 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 }
 .update-jump span {
   display: block;
-  font: 11px/1.5 "SFMono-Regular", Consolas, monospace;
+  font: 11px/1.5 var(--mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1007,7 +1309,7 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .update-unchanged-output small,
 .update-unchanged-input small {
   color: #aab8b0;
-  font: 10px/1.35 "SFMono-Regular", Consolas, monospace;
+  font: 10px/1.35 var(--mono);
 }
 /* The card navigates, so it must read as clickable everywhere, not only on
    entries that happen to be present. */
@@ -1060,8 +1362,11 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .update-jump.trace-op-added { border-left: 4px solid #59c98a; }
 .update-jump.trace-op-removed { border-left: 4px solid #e66f6a; }
 .update-jump.trace-op-changed { border-left: 4px solid #d0a550; }
+/* Every input/parameter segment carries a kind outline. At full accent strength
+   the stacked per-segment boxes read as heavy blue bounds; a translucent mix
+   keeps the kind legible without the boxes dominating the pane. */
 .trace-part[class*="trace-kind-"] {
-  outline: 1px solid var(--trace-kind-accent);
+  outline: 1px solid color-mix(in srgb, var(--trace-kind-accent) 42%, transparent);
   outline-offset: -1px;
 }
 .trace-part.trace-op-added {
@@ -1095,6 +1400,9 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .exact-update.exact-focus {
   outline: 2px solid #fff0a6;
   outline-offset: 1px;
+}
+.mixed .trace-part.fragment-focus {
+  outline-offset: -1px;
 }
 .checkpoint-section[class*="trace-kind-"] {
   border-color: var(--trace-kind-accent);
@@ -1135,12 +1443,33 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   min-height: 1em;
   white-space: pre-wrap;
 }
+.empty-output-note { color: #91a099; font-style: italic; }
+.scope-badge {
+  display: inline-block;
+  margin-left: 7px;
+  padding: 1px 6px;
+  color: #7a3b00;
+  background: color-mix(in srgb, #d98a2b 34%, transparent);
+  border: 1px solid color-mix(in srgb, #d98a2b 62%, transparent);
+  border-radius: 999px;
+  font: 700 8px/1.3 system-ui, sans-serif;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  vertical-align: middle;
+  cursor: help;
+}
+/* In the Mixed pane the badge is not nested in a scope label, so give it a
+   small gap from the "output:" text it precedes. */
+.cm-content .scope-badge,
+.mixed .scope-badge {
+  margin: 0 6px 0 0;
+}
 .state-field {
   display: block;
   margin: 2px 0;
   padding: 0 7px 7px;
   background: color-mix(in srgb, var(--trace-kind-accent) 8%, #17201d);
-  border: 1px solid color-mix(in srgb, var(--trace-kind-accent) 48%, transparent);
+  border: 1px solid color-mix(in srgb, var(--trace-kind-accent) 24%, transparent);
   border-radius: 4px;
 }
 .state-field-label {
@@ -1165,8 +1494,21 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
 .message-list {
   display: block;
   padding: 0 7px 7px;
+  /* This is serialized YAML with inline structural badges. Outside the Exact
+     <pre>, normal whitespace collapsing erased every nesting indent in Updates. */
+  white-space: pre-wrap;
+  /* Message content is trace data: monospace regular everywhere. In the Exact
+     pane it would inherit this from .code, but in the Updates/checkpoint cards
+     there is no monospace ancestor, so pin family+weight here or it falls back
+     to the proportional UI font. Size stays inherited so it matches whatever
+     surrounds it in each pane. */
+  font-family: var(--mono);
+  font-weight: 400;
+  /* Message content inherits this: keep it a legible light tone, not the muted
+     surrounding UI color, against the dark tinted panel. */
+  color: #dce9e3;
   background: color-mix(in srgb, var(--trace-kind-accent) 8%, #17201d);
-  border: 1px solid color-mix(in srgb, var(--trace-kind-accent) 48%, transparent);
+  border: 1px solid color-mix(in srgb, var(--trace-kind-accent) 24%, transparent);
   border-radius: 4px;
 }
 .message-list-label {
@@ -1182,6 +1524,12 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   letter-spacing: .08em;
   text-transform: uppercase;
   user-select: none;
+}
+.message-separator {
+  display: block;
+  height: 0;
+  margin: 7px -2px 3px;
+  border-top: 1px solid color-mix(in srgb, var(--trace-kind-accent) 32%, #718079);
 }
 .message-field-label {
   display: inline-block;
@@ -1263,7 +1611,7 @@ h2 { margin: 0; font: 600 14px/1.2 system-ui, sans-serif; letter-spacing: .02em;
   padding: 10px;
   color: #dbe5df;
   background: #1e2724;
-  font: 11px/1.55 "SFMono-Regular", Consolas, monospace;
+  font: 11px/1.55 var(--mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }

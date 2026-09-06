@@ -99,6 +99,17 @@ port = 8081
 [upstream]
 url = "http://127.0.0.1:8080"
 
+[reranker]
+enabled = false
+
+[reranker.llama_cpp]
+host = "127.0.0.1"
+port = 8082
+
+[reranker.listen]
+host = "127.0.0.1"
+port = 8083
+
 [storage]
 path = "trace.llmtrace"
 max_mb = 3
@@ -107,6 +118,13 @@ max_mb = 3
 session_id = "unassigned"
 branch_id = "main"
 ```
+
+Enable `[reranker]` to expose a second listener dedicated to `/rerank` and
+`/v1/rerank`. `[reranker.listen]` configures the logging listener and
+`[reranker.llama_cpp]` configures the actual llama.cpp reranker. It forwards while recording
+the request and response in the same trace file, session, and chronological
+Timeline as calls received by the main LLM proxy. Reranker calls receive the
+default `rerank` debug label so they remain distinguishable in the merged view.
 
 Command-line options can override the main settings. Use `--config PATH` only to load a file
 other than the default `config.toml`:
@@ -127,6 +145,17 @@ Example:
   --port 8090
 ```
 
+## What is traced
+
+Every completion or enabled reranker request routed through the proxy is recorded,
+**with or without any headers**.
+Both the OpenAI-compatible routes (`/v1/chat/completions`, `/v1/completions`) and llama.cpp's
+native `/completion` are captured, with or without a `/v1` prefix. A request that sets no
+`X-LLMTrace-*` headers is still traced — it lands in the default session (`[defaults].session_id`,
+`unassigned` unless configured). Non-completion routes (`/apply-template`, `/tokenize`,
+`/embeddings`, `/health`, …) pass through untraced. Only requests that bypass the proxy and talk
+to the upstream server directly are invisible.
+
 ## Trace headers
 
 Clients can describe exact lineage using optional request headers:
@@ -139,8 +168,30 @@ Clients can describe exact lineage using optional request headers:
 | `X-LLMTrace-Base-State` | Identifies the exact request-state parent. |
 | `X-LLMTrace-Run` | Associates calls with a larger application run. |
 | `X-LLMTrace-Debug-Label` | A per-request step label (e.g. `07-rewrite`) shown on the call's timeline and update rows. Set it per request. |
+| `X-LLMTrace-Debug-Label-Encoding` | Set to `percent` when the debug label is percent-encoded so non-ASCII step names can be transported safely in an HTTP header. |
+| `X-LLMTrace-Title` | Primary human-readable Timeline title supplied by the harness. The input/output phase remains visible as smaller secondary text. |
 | `X-LLMTrace-Req-Id` | A caller-assigned identity for this request. |
 | `X-LLMTrace-Prev-Req-Id` | The `req_id` of the request this one continues. Declares the branch tree explicitly: two requests naming the same predecessor become sibling branches. Takes the place of similarity inference; an unknown value is rejected with `400`. |
+| `X-LLMTrace-Group` | Names a structural unit the call belongs to (e.g. `window 3`). The branch view groups calls sharing a value under one synthetic grouping node — not a request — between them and their shared parent. |
+
+Dynamic callers may supply an initial `X-LLMTrace-Title`, then finalize that
+exact request during or after streaming:
+
+```http
+POST /_llmtrace/update-title
+Content-Type: application/json
+
+{"req_id":"caller-generated-id","title":"EXECUTE/find_documents:TOOL_CALLS/get_toc_headings"}
+```
+
+The command replaces only the displayed title of the call identified by
+`X-LLMTrace-Req-Id`; it does not change `X-LLMTrace-Debug-Label` or inspect the
+model response. An open viewer updates the existing Timeline item in place.
+
+When the provider reports token usage, Timeline shows input tokens on the input
+event and output plus total tokens on the output event. OpenAI-compatible
+`usage` fields and llama.cpp native `timings.prompt_n` / `timings.predicted_n`
+are supported; unavailable counts are not estimated.
 
 If no base state is supplied, Insequent chooses the best recent parent and labels the
 relationship as inferred.
@@ -276,6 +327,11 @@ After a call or application event finishes, Insequent checkpoints its SQLite dat
 the file exceeds `storage.max_mb`, it deletes complete oldest sessions and compacts the file.
 A currently streaming session is never removed mid-call, so the file can temporarily exceed
 the configured limit.
+
+The Timeline **Clean from here** control permanently deletes the focused call and every older
+call in that session. It previews the exact deletion count and requires confirmation. The next
+surviving call becomes a new snapshot boundary; newer calls and other sessions remain intact. Cleaning is
+blocked if any call that would be deleted is still running.
 
 ## Development and tests
 

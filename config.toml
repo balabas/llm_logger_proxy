@@ -5,9 +5,23 @@ port = 8081
 [upstream]
 url = "http://127.0.0.1:8080"
 
+# Optional second proxy listener for reranking requests. Calls received on
+# reranker.listen.port are forwarded to reranker.llama_cpp.port and stored in
+# the same timeline/database.
+[reranker]
+enabled = true
+
+[reranker.llama_cpp]
+host = "127.0.0.1"
+port = 8083
+
+[reranker.listen]
+host = "127.0.0.1"
+port = 8012
+
 [storage]
 path = "guided-v18.llmtrace"
-max_mb = 3
+max_mb = 200
 
 [defaults]
 # Notebook integrations override this with X-LLMTrace-Session.
